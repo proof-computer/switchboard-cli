@@ -1,0 +1,16 @@
+node_modules/
+tmp/
+coverage/
+examples/
+
+.env
+.env.*
+!.env.example
+
+.acurast/
+dist/acurast/
+.switchboard/
+.switchboard/
+.control-plane/
+.operator-host/
+*.log

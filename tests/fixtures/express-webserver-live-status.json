@@ -1,0 +1,249 @@
+{
+  "ok": true,
+  "name": "Switchboard",
+  "now": "2026-05-06T21:17:51.657Z",
+  "startedAt": "2026-05-06T20:56:38.538Z",
+  "uptimeSeconds": 1274,
+  "local": {
+    "protocol": "https",
+    "host": "0.0.0.0",
+    "port": 3443,
+    "url": "https://0.0.0.0:3443/"
+  },
+  "public": {
+    "hostname": "e-kfxhvj7hizmig4poi6cd.acurast.ingress.digital",
+    "customerHostnames": [],
+    "certificateHostnames": [
+      "e-kfxhvj7hizmig4poi6cd.acurast.ingress.digital"
+    ],
+    "url": "https://e-kfxhvj7hizmig4poi6cd.acurast.ingress.digital/",
+    "challengeUrl": "https://e-kfxhvj7hizmig4poi6cd.acurast.ingress.digital/.well-known/proofcomputer/challenge?nonce=demo"
+  },
+  "ids": {
+    "deploymentId": "{\"origin\":{\"kind\":\"Acurast\",\"source\":\"5cd81f74fbd78efad9568d2f0136ac2dc01f0f2d4ec0c9061277a3147cc7e031\"},\"id\":\"54098\"}",
+    "sessionId": "0xc622b41bbdc550f7d27675e66fdf324e95dcb5a88d053fd211a420a924c42d13",
+    "jobId": "0xfbd6883ba5e4a7fd98ea7e0ba9f4c40c129eb22f995b38b0df78a419f6db1eca",
+    "jobSigner": "0xe369836c9a54F6f444716910Af6F3a85b2e77561",
+    "signerMode": "acurast-secp256k1"
+  },
+  "routing": {
+    "relayUrl": "https://control.switchboard.proof.computer",
+    "relayHost": "control.switchboard.proof.computer",
+    "operatorId": "0x5c58c1d827db4fc0df06f17cc1e469b96dd86e17e3c2f19d8a7efec218028763",
+    "processorId": "0xb965620211a3df13dd7d9d3333487db9dce4bd7e84384e8a75342f2fffcd09f0",
+    "registryAddress": "0x65d6B76BeC50F46D198fFa3598E381a298025Da0",
+    "chainId": "420420419"
+  },
+  "registration": {
+    "state": "registered",
+    "attempt": 2,
+    "endpointHostname": "e-kfxhvj7hizmig4poi6cd.acurast.ingress.digital",
+    "relayHost": "control.switchboard.proof.computer",
+    "relayResponse": {
+      "txHash": "0xffc044d4c0e2ea527ce27f2a832fc833b85913da0f120a495e55834fac5a8227",
+      "blockNumber": 15429604,
+      "authorityLease": {
+        "name": "hub-registration-relayer",
+        "ownerId": "relay-a",
+        "token": "[redacted]",
+        "acquiredAt": "2026-05-06T20:57:14.742Z",
+        "expiresAt": "2026-05-06T20:58:14.742Z"
+      },
+      "event": {
+        "sessionId": "0xc622b41bbdc550f7d27675e66fdf324e95dcb5a88d053fd211a420a924c42d13",
+        "jobSigner": "0xe369836c9a54F6f444716910Af6F3a85b2e77561",
+        "operatorId": "0x5c58c1d827db4fc0df06f17cc1e469b96dd86e17e3c2f19d8a7efec218028763",
+        "processorId": "0xb965620211a3df13dd7d9d3333487db9dce4bd7e84384e8a75342f2fffcd09f0"
+      }
+    },
+    "registeredAt": "2026-05-06T20:57:25.609Z"
+  },
+  "certificate": {
+    "state": "issued",
+    "hostname": "e-kfxhvj7hizmig4poi6cd.acurast.ingress.digital",
+    "hostnames": [
+      "e-kfxhvj7hizmig4poi6cd.acurast.ingress.digital"
+    ],
+    "certificates": [
+      {
+        "hostname": "e-kfxhvj7hizmig4poi6cd.acurast.ingress.digital",
+        "issuer": "ZeroSSL RSA DV SSL CA 2",
+        "notAfter": "2026-08-04T23:59:59.000Z"
+      }
+    ],
+    "issuedAt": "2026-05-06T20:58:03.893Z"
+  },
+  "challenges": {
+    "count": 3,
+    "lastAt": "2026-05-06T20:58:30.528Z",
+    "last": {
+      "nonceLength": 33,
+      "userAgent": "node",
+      "remoteAddress": "192.168.3.4"
+    }
+  },
+  "relayDiagnostics": {
+    "relayHost": "control.switchboard.proof.computer",
+    "relayProtocol": "https:",
+    "healthUrl": "https://control.switchboard.proof.computer/health",
+    "dns": {
+      "ok": true,
+      "addresses": [
+        {
+          "address": "195.22.134.246",
+          "family": 4
+        }
+      ]
+    },
+    "health": {
+      "ok": true,
+      "status": 200,
+      "statusText": "OK",
+      "elapsedMs": 48,
+      "bodyPreview": "{\"ok\":true,\"chainId\":\"420420419\",\"registryAddress\":\"0x65d6B76BeC50F46D198fFa3598E381a298025Da0\",\"recorderCoordinatorAddress\":\"0xd4dFB4AD9A4a2AfF56CCBe479F661b84947287A5\",\"relayerAddress\":\"0x70c227f9f062121192F75DDAc115d40fc30F91c5\",\"authorityEligible\":true,\"certificateIssuanceEnabled\":true,\"certificateIssuerProvider\":\"zerossl-acme\",\"certificateIssuerProviders\":[\"zerossl-acme\",\"letsencrypt-production\"],\"certificateAuthorizationStoreEnabled\":true,\"logSinksEnabled\":true,\"deploymentIntentsEnabled\":t..."
+    },
+    "checkedAt": "2026-05-06T20:58:04.024Z"
+  },
+  "runtime": {
+    "nodeVersion": "v24.5.0",
+    "platform": "android",
+    "arch": "arm64",
+    "pid": 24436,
+    "uptimeSeconds": 1274,
+    "hasStd": true,
+    "hasStdEnv": true,
+    "hasStdJobGetId": true,
+    "hasStdJobGetPublicKeys": true,
+    "hasStdDeviceGetAddress": true,
+    "hasStdSignersSecp256k1": true,
+    "hasStdChains": true,
+    "hasStdNetAddAllowedHostnames": false,
+    "hasEnvironmentFunction": true,
+    "appVersion": "1.24.0"
+  },
+  "network": [
+    {
+      "name": "eth0",
+      "address": "fe80::1473:2058:312:8bc0",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "fe80::1473:2058:312:8bc0/64"
+    },
+    {
+      "name": "eth0",
+      "address": "2a07:244:37:eb03:d8cd:9f7:46bf:6a53",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "2a07:244:37:eb03:d8cd:9f7:46bf:6a53/64"
+    },
+    {
+      "name": "eth0",
+      "address": "2a07:244:37:eb03:9ea:b24d:f225:3b9a",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "2a07:244:37:eb03:9ea:b24d:f225:3b9a/64"
+    },
+    {
+      "name": "eth0",
+      "address": "2a07:244:37:eb03:c866:e289:ba95:b6c7",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "2a07:244:37:eb03:c866:e289:ba95:b6c7/64"
+    },
+    {
+      "name": "eth0",
+      "address": "2a07:244:37:eb03:ea8:5e55:fe49:1b9a",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "2a07:244:37:eb03:ea8:5e55:fe49:1b9a/64"
+    },
+    {
+      "name": "eth0",
+      "address": "2a07:244:37:eb03:1d46:c14:4904:d83c",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "2a07:244:37:eb03:1d46:c14:4904:d83c/64"
+    },
+    {
+      "name": "eth0",
+      "address": "2a07:244:37:eb03:f820:9ae2:dba7:bbdd",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "2a07:244:37:eb03:f820:9ae2:dba7:bbdd/64"
+    },
+    {
+      "name": "eth0",
+      "address": "2a07:244:37:eb03:57cf:8d78:154d:8d55",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "2a07:244:37:eb03:57cf:8d78:154d:8d55/64"
+    },
+    {
+      "name": "eth0",
+      "address": "2a07:244:37:eb03:c1c5:f958:85b2:5b39",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "2a07:244:37:eb03:c1c5:f958:85b2:5b39/64"
+    },
+    {
+      "name": "eth0",
+      "address": "192.168.3.14",
+      "family": "IPv4",
+      "internal": false,
+      "cidr": "192.168.3.14/24"
+    },
+    {
+      "name": "dummy0",
+      "address": "fe80::3053:34ff:fe5e:e02c",
+      "family": "IPv6",
+      "internal": false,
+      "cidr": "fe80::3053:34ff:fe5e:e02c/64"
+    },
+    {
+      "name": "lo",
+      "address": "::1",
+      "family": "IPv6",
+      "internal": true,
+      "cidr": "::1/128"
+    },
+    {
+      "name": "lo",
+      "address": "127.0.0.1",
+      "family": "IPv4",
+      "internal": true,
+      "cidr": "127.0.0.1/8"
+    }
+  ],
+  "envPresence": {
+    "RELAY_URL": true,
+    "CHAIN_ID": true,
+    "INGRESS_REGISTRY_ADDRESS": true,
+    "SESSION_ID": true,
+    "JOB_ID": true,
+    "OPERATOR_ID": true,
+    "PROCESSOR_ID": true,
+    "ENDPOINT_HOSTNAME": true,
+    "JOB_SIGNER_PRIVATE_KEY": false,
+    "SWITCHBOARD_LOG_URL": true,
+    "SWITCHBOARD_LOG_TOKEN": true,
+    "SWITCHBOARD_LOG_ENCRYPTION_KEY": true,
+    "SWITCHBOARD_LOG_TIMEOUT_MS": false,
+    "SWITCHBOARD_LOG_CONTEXT": true,
+    "SWITCHBOARD_CONFIG": true,
+    "SWITCHBOARD_SIGNER_SMOKE": false,
+    "SWITCHBOARD_REGISTRATION_RETRY_MS": false,
+    "SWITCHBOARD_REGISTRATION_MAX_ATTEMPTS": false,
+    "SWITCHBOARD_EXIT_AFTER_MS": false,
+    "SWITCHBOARD_TLS_CERT_PEM": false,
+    "SWITCHBOARD_TLS_CERT_PEM_BASE64": false,
+    "SWITCHBOARD_TLS_CERT_FILE": false,
+    "SWITCHBOARD_TLS_KEY_PEM": false,
+    "SWITCHBOARD_TLS_KEY_PEM_BASE64": false,
+    "SWITCHBOARD_TLS_KEY_FILE": false,
+    "SWITCHBOARD_CERTIFICATE_MODE": true,
+    "SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS": true,
+    "SWITCHBOARD_LOG_NETWORK_INTERFACES": true,
+    "SWITCHBOARD_RELAY_DIAGNOSTICS": true,
+    "SWITCHBOARD_RELAY_DIAGNOSTICS_TIMEOUT_MS": true
+  }
+}
