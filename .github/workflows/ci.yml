@@ -24,4 +24,4 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: node scripts/verify-package-artifacts.mjs
-      - run: npm pack --dry-run --json
+      - run: npm pack --dry-run --json --ignore-scripts
