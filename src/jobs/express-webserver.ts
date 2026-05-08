@@ -345,7 +345,10 @@ async function runSwitchboardIntentLoop(): Promise<void> {
           state: "ready",
           details: {
             sessionId: currentSessionId(),
-            endpointHostname: configValue("ENDPOINT_HOSTNAME")
+            endpointHostname: configValue("ENDPOINT_HOSTNAME"),
+            protocol,
+            host,
+            port
           }
         });
       }

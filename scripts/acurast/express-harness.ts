@@ -1542,7 +1542,11 @@ function runAcurastCli(config: HarnessConfig, args: string[], options: AcurastCl
   return new Promise((resolve, reject) => {
     let settled = false;
     let matchedOutput = false;
+    let timedOut = false;
+    let terminating = false;
     let killTimer: NodeJS.Timeout | undefined;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    let abandonTimer: NodeJS.Timeout | undefined;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let output = "";
 
@@ -1553,6 +1557,12 @@ function runAcurastCli(config: HarnessConfig, args: string[], options: AcurastCl
       settled = true;
       if (killTimer) {
         clearTimeout(killTimer);
+      }
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+      }
+      if (abandonTimer) {
+        clearTimeout(abandonTimer);
       }
       if (timeoutTimer) {
         clearTimeout(timeoutTimer);
@@ -1568,6 +1578,7 @@ function runAcurastCli(config: HarnessConfig, args: string[], options: AcurastCl
     const child = spawn(npx.command, [...npx.args, "-y", config.acurastCliPackage, ...args], {
       cwd: config.stageDir,
       stdio: ["inherit", "pipe", "pipe"],
+      detached: process.platform !== "win32",
       env: {
         ...sanitizeChildEnv(process.env),
         ...(config.mnemonic ? { ACURAST_MNEMONIC: config.mnemonic } : {}),
@@ -1575,6 +1586,52 @@ function runAcurastCli(config: HarnessConfig, args: string[], options: AcurastCl
         NPM_CONFIG_CACHE: config.npmCacheDir
       }
     });
+
+    const signalChildTree = (signal: NodeJS.Signals) => {
+      if (!child.pid) {
+        return;
+      }
+      try {
+        if (process.platform === "win32") {
+          child.kill(signal);
+        } else {
+          process.kill(-child.pid, signal);
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ESRCH") {
+          throw error;
+        }
+      }
+    };
+
+    const terminateChildTree = (reason: "matched_output" | "timeout") => {
+      if (terminating || settled) {
+        return;
+      }
+      terminating = true;
+      const forceKillAfterMs = numberEnv("ACURAST_CLI_TERMINATE_GRACE_MS", 5_000);
+      try {
+        signalChildTree("SIGTERM");
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      forceKillTimer = setTimeout(() => {
+        try {
+          signalChildTree("SIGKILL");
+        } catch (error) {
+          finish(error instanceof Error ? error : new Error(String(error)));
+        }
+      }, forceKillAfterMs);
+      abandonTimer = setTimeout(() => {
+        if (reason === "timeout") {
+          finish(new Error(`Acurast CLI timed out after ${options.timeoutMs}ms: ${args.join(" ")}`));
+          return;
+        }
+        finish();
+      }, forceKillAfterMs + 1_000);
+    };
 
     const handleOutput = (stream: NodeJS.WriteStream, chunk: Buffer) => {
       stream.write(chunk);
@@ -1585,8 +1642,7 @@ function runAcurastCli(config: HarnessConfig, args: string[], options: AcurastCl
 
       matchedOutput = true;
       killTimer = setTimeout(() => {
-        child.kill("SIGTERM");
-        finish();
+        terminateChildTree("matched_output");
       }, options.killAfterResolveMs ?? 0);
     };
 
@@ -1595,13 +1651,17 @@ function runAcurastCli(config: HarnessConfig, args: string[], options: AcurastCl
 
     if (options.timeoutMs) {
       timeoutTimer = setTimeout(() => {
-        child.kill("SIGTERM");
-        finish(new Error(`Acurast CLI timed out after ${options.timeoutMs}ms: ${args.join(" ")}`));
+        timedOut = true;
+        terminateChildTree("timeout");
       }, options.timeoutMs);
     }
 
     child.once("error", (error) => finish(error));
-    child.once("exit", (code) => {
+    child.once("close", (code, signal) => {
+      if (timedOut && !matchedOutput) {
+        finish(new Error(`Acurast CLI timed out after ${options.timeoutMs}ms: ${args.join(" ")}`));
+        return;
+      }
       if (code === 0) {
         finish();
         return;
@@ -1610,7 +1670,7 @@ function runAcurastCli(config: HarnessConfig, args: string[], options: AcurastCl
         finish();
         return;
       }
-      finish(new Error(`Acurast CLI exited with code ${code ?? "unknown"}`));
+      finish(new Error(`Acurast CLI exited with code ${code ?? "unknown"}${signal ? ` signal ${signal}` : ""}`));
     });
   });
 }

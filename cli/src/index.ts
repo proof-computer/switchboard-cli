@@ -1377,6 +1377,7 @@ type LaunchDemoQuotePreview =
       amount: string;
       paidSeconds: string;
       formattedAmount: string;
+      lineItemSummary?: string;
       preview: Record<string, unknown>;
     }
   | {
@@ -2245,12 +2246,15 @@ async function fetchLaunchDemoQuotePreview(input: {
     if (!preview || !amount) {
       return { ok: false, error: "relay quote preview response was missing preview.amount" };
     }
+    const lineItemSummary = formatLaunchDemoQuoteLineItems(preview, previewAsset, input.manifestConfig);
+    const formattedAmount = formatLaunchDemoQuoteAmount(amount, previewAsset, input.manifestConfig);
     return {
       ok: true,
       asset: previewAsset,
       amount,
       paidSeconds,
-      formattedAmount: formatLaunchDemoQuoteAmount(amount, previewAsset, input.manifestConfig),
+      formattedAmount: lineItemSummary ? `${formattedAmount} (${lineItemSummary})` : formattedAmount,
+      lineItemSummary,
       preview
     };
   } catch (error) {
@@ -2278,7 +2282,53 @@ function assetDisplayFromManifest(manifestConfig: CliNetworkConfig, assetAddress
   };
 }
 
-function formatLaunchDemoQuotePreview(preview: LaunchDemoQuotePreview): string {
+export function formatLaunchDemoQuoteLineItems(
+  preview: Record<string, unknown>,
+  assetAddress: string,
+  manifestConfig: CliNetworkConfig
+): string | undefined {
+  const lineItems = preview.lineItems;
+  if (!Array.isArray(lineItems)) {
+    return undefined;
+  }
+  const asset = assetDisplayFromManifest(manifestConfig, assetAddress);
+  const parts: string[] = [];
+  for (const rawItem of lineItems) {
+    if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) {
+      continue;
+    }
+    const item = rawItem as Record<string, unknown>;
+    const label = stringRecordField(item, "label") ?? labelFromLineItemCode(stringRecordField(item, "code"));
+    const amount = stringRecordField(item, "amount");
+    const detail = stringRecordField(item, "detail");
+    if (!label) {
+      continue;
+    }
+    if (item.included === true) {
+      parts.push(detail ? `${label} ${detail}` : `${label} included`);
+      continue;
+    }
+    if (!amount || amount === "0") {
+      continue;
+    }
+    const formatted = formatAssetUnits(BigInt(amount), asset) ?? `${amount} base units`;
+    parts.push(`${label} ${formatted}`);
+  }
+  return parts.length > 0 ? parts.slice(0, 4).join("; ") : undefined;
+}
+
+function labelFromLineItemCode(code: string | undefined): string | undefined {
+  switch (code) {
+    case "base_route": return "Base route";
+    case "setup_reserve": return "Setup reserve";
+    case "validation_cap": return "Validation cap";
+    case "dns_tls": return "DNS/TLS";
+    case "fair_use_bandwidth": return "Fair-use bandwidth";
+    default: return undefined;
+  }
+}
+
+export function formatLaunchDemoQuotePreview(preview: LaunchDemoQuotePreview): string {
   return preview.ok ? preview.formattedAmount : "not available";
 }
 
@@ -4230,6 +4280,7 @@ function deployOutput(
     selection?: Record<string, unknown>;
     ingressEstimate?: LaunchDemoQuotePreview;
     estimate?: Record<string, unknown> | { ok: boolean; error?: string; summary?: string; output?: unknown };
+    demoProject?: LaunchDemoProject;
   }
 ) {
   const reportHostnames = deploymentReportHostnames(report);
@@ -4315,6 +4366,7 @@ function deployOutput(
       : undefined,
     ingressEstimate: defaults.ingressEstimate,
     estimate: defaults.estimate,
+    demoProject: defaults.demoProject,
     reportPath,
     runDir: stringRecordField(report.artifacts, "runDir")
   };
