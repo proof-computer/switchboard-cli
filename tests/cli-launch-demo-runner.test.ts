@@ -25,14 +25,18 @@ describe("launch-demo runner resolution", () => {
         JSON.stringify({ scripts: { "acurast:estimate-express": "echo should-not-run" } })
       );
 
-      const runner = await resolveLaunchDemoEstimateRunner({}, { cwd: workDir, currentFile });
+      const runner = await resolveLaunchDemoEstimateRunner(
+        { ACURAST_ENTRYPOINT: "src/server.ts" },
+        { cwd: workDir, currentFile, workDir }
+      );
 
       assert.equal(runner.command, process.execPath);
       assert.deepEqual(runner.args, [acurastExpress, "estimate-fee", "--json"]);
+      assert.equal(runner.cwd, undefined);
       assert.equal(runner.env.SWITCHBOARD_WORK_DIR, workDir);
       assert.equal(runner.env.SWITCHBOARD_INTERNAL_BIN_DIR, internalDir);
       assert.equal(runner.env.SWITCHBOARD_PACKAGED_ASSETS_DIR, assetsDir);
-      assert.equal(runner.env.SWITCHBOARD_PREBUILT_JOB_BUNDLE, path.join(assetsDir, "jobs", "express-webserver", "bundle.cjs"));
+      assert.equal(runner.env.SWITCHBOARD_PREBUILT_JOB_BUNDLE, undefined);
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(workDir, { recursive: true, force: true });
@@ -50,11 +54,13 @@ describe("launch-demo runner resolution", () => {
 
       const runner = await resolveLaunchDemoEstimateRunner(
         { ACURAST_ENTRYPOINT: "src/jobs/express-webserver.ts" },
-        { cwd: root, currentFile: path.join(root, "cli", "src", "index.ts") }
+        { cwd: root, currentFile: path.join(root, "cli", "src", "index.ts"), workDir: "/tmp/demo-project" }
       );
 
       assert.equal(runner.command, "pnpm");
       assert.deepEqual(runner.args, ["--silent", "acurast:estimate-express", "--", "--json"]);
+      assert.equal(runner.cwd, root);
+      assert.equal(runner.env.SWITCHBOARD_WORK_DIR, "/tmp/demo-project");
       assert.equal(runner.env.ACURAST_ENTRYPOINT, "src/jobs/express-webserver.ts");
     } finally {
       await rm(root, { recursive: true, force: true });

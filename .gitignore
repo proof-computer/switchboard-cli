@@ -8,6 +8,8 @@ examples/
 !.env.example
 
 .acurast/
+assets/jobs/
+dist/
 dist/acurast/
 .switchboard/
 .switchboard/

@@ -13,6 +13,8 @@ import {
   privateKeyJobSigner,
   requestCertificateWithRelay,
   registerIngressWithRelay,
+  SwitchboardCertificateError,
+  type SwitchboardCertificateFailureStage,
   type SwitchboardJobSigner
 } from "../runtime/index.js";
 import { recoverRegistrationSigner } from "../registration.js";
@@ -392,32 +394,51 @@ async function runCertificateLoop(): Promise<void> {
 
   for (let attempt = 1; maxAttempts === 0 || attempt <= maxAttempts; attempt += 1) {
     try {
+      await reportCertificateIntentHealth("certificate_requesting", {
+        attempt,
+        stage: "certificate_request",
+        hostnames: certificateRequestHostnamesIfConfigured(configValue("ENDPOINT_HOSTNAME"))
+      });
       await maybeRequestManagedCertificate(attempt);
       return;
     } catch (error) {
       console.error(error);
       const willRetry = maxAttempts === 0 || attempt < maxAttempts;
+      const certificateError = asSwitchboardCertificateError(error, {
+        stage: "certificate_request"
+      });
+      const retryAfterMs = certificateRetryAfterMs(certificateError);
+      const nextRetryMs = retryAfterMs ?? retryMs;
+      const errorDetails = switchboardCertificateErrorDetails(certificateError);
       demoState.certificate = {
         ...(demoState.certificate ?? {}),
-        state: "failed",
+        state: willRetry ? "requesting" : "failed",
         attempt,
-        retryMs: willRetry ? retryMs : undefined,
-        error: safeError(error),
+        retryMs: willRetry ? nextRetryMs : undefined,
+        retryExhausted: !willRetry,
+        ...errorDetails,
         updatedAt: new Date().toISOString()
       };
       void remoteLog("certificate-request-failed", {
         attempt,
         maxAttempts,
-        retryMs: willRetry ? retryMs : undefined,
-        error: safeError(error)
+        retryMs: willRetry ? nextRetryMs : undefined,
+        retryExhausted: !willRetry,
+        ...errorDetails
+      });
+      await reportCertificateIntentHealth(willRetry ? "certificate_requesting" : "failed", {
+        attempt,
+        maxAttempts,
+        retryMs: willRetry ? nextRetryMs : undefined,
+        retryExhausted: !willRetry,
+        ...errorDetails
       });
       if (!willRetry) {
         process.exitCode = 1;
-        return;
+        throw certificateError;
       }
+      await sleep(nextRetryMs);
     }
-
-    await sleep(retryMs);
   }
 }
 
@@ -644,18 +665,33 @@ async function maybeRequestManagedCertificate(attempt?: number): Promise<void> {
       jobSigner
     });
 
-    const result = await requestCertificateWithRelay({
-      relayUrl: requiredConfig("RELAY_URL"),
-      chainId: requiredConfig("CHAIN_ID"),
-      registryAddress: requiredConfig("INGRESS_REGISTRY_ADDRESS"),
-      sessionId: requiredConfig("SESSION_ID"),
-      hostname,
-      jobSigner: signer.signer,
-      requestTimeoutMs: Number(configValue("SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS") ?? "240000")
-    });
+    let result: Awaited<ReturnType<typeof requestCertificateWithRelay>>;
+    try {
+      result = await requestCertificateWithRelay({
+        relayUrl: requiredConfig("RELAY_URL"),
+        chainId: requiredConfig("CHAIN_ID"),
+        registryAddress: requiredConfig("INGRESS_REGISTRY_ADDRESS"),
+        sessionId: requiredConfig("SESSION_ID"),
+        hostname,
+        jobSigner: signer.signer,
+        requestTimeoutMs: Number(configValue("SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS") ?? "240000")
+      });
+    } catch (error) {
+      throw asSwitchboardCertificateError(error, {
+        stage: "certificate_request",
+        hostname
+      });
+    }
     const certificatePem = result.relayResponse.certificatePem;
     if (!certificatePem || !result.privateKeyPem) {
-      throw new Error(`Relay certificate response did not include certificatePem or local privateKeyPem for ${hostname}`);
+      throw new SwitchboardCertificateError(
+        `Relay certificate response did not include certificatePem or local privateKeyPem for ${hostname}`,
+        {
+          stage: "relay_response",
+          hostname,
+          relayResponse: result.relayResponse
+        }
+      );
     }
 
     certificates.push({
@@ -1103,6 +1139,22 @@ async function reportSwitchboardIntentHealth(input: {
     message: input.message,
     details: input.details
   });
+}
+
+async function reportCertificateIntentHealth(
+  state: "certificate_requesting" | "failed",
+  details: Record<string, unknown>
+): Promise<void> {
+  if (!switchboardIntentConfigured()) {
+    return;
+  }
+  await reportSwitchboardIntentHealth({
+    relayUrl: requiredConfig("SWITCHBOARD_RELAY_URL"),
+    intentId: requiredConfig("SWITCHBOARD_INTENT_ID"),
+    intentToken: requiredConfig("SWITCHBOARD_INTENT_TOKEN"),
+    state,
+    details
+  }).catch(() => undefined);
 }
 
 async function fetchSwitchboardIntentRuntimeConfig(input: {
@@ -1561,6 +1613,79 @@ function optionalNumberConfig(name: string): number | undefined {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function asSwitchboardCertificateError(
+  error: unknown,
+  fallback: { stage: SwitchboardCertificateFailureStage; hostname?: string }
+): SwitchboardCertificateError {
+  if (error instanceof SwitchboardCertificateError) {
+    return error;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return new SwitchboardCertificateError(message, {
+    ...fallback,
+    cause: error
+  });
+}
+
+function switchboardCertificateErrorDetails(error: SwitchboardCertificateError): Record<string, unknown> {
+  const details: Record<string, unknown> = {
+    stage: error.stage,
+    error: safeCertificateError(error)
+  };
+  if (error.hostname) {
+    details.hostname = error.hostname;
+  }
+  if (error.status !== undefined) {
+    details.status = error.status;
+  }
+  const relayError = stringRecordField(error.relayResponse, "error");
+  if (relayError) {
+    details.relayError = relayError;
+  }
+  if (error.relayResponse !== undefined) {
+    details.relayResponse = sanitizeRelayResponse(error.relayResponse);
+  }
+  return details;
+}
+
+function safeCertificateError(error: SwitchboardCertificateError): Record<string, unknown> {
+  return {
+    name: error.name,
+    message: truncate(error.message),
+    stage: error.stage,
+    hostname: error.hostname,
+    status: error.status
+  };
+}
+
+function certificateRetryAfterMs(error: SwitchboardCertificateError): number | undefined {
+  const relayError = stringRecordField(error.relayResponse, "error");
+  if (relayError !== "certificate_hostname_lock_unavailable") {
+    return undefined;
+  }
+  const retryAfterMs = numberRecordField(error.relayResponse, "retryAfterMs");
+  if (retryAfterMs !== undefined && retryAfterMs >= 0) {
+    return retryAfterMs;
+  }
+  const retryAfterSeconds = numberRecordField(error.relayResponse, "retryAfterSeconds");
+  return retryAfterSeconds !== undefined && retryAfterSeconds >= 0 ? retryAfterSeconds * 1000 : undefined;
+}
+
+function numberRecordField(record: unknown, name: string): number | undefined {
+  if (!record || typeof record !== "object") {
+    return undefined;
+  }
+  const value = (record as Record<string, unknown>)[name];
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
 }
 
 async function gracefulExit(

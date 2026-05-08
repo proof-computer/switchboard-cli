@@ -88,6 +88,14 @@ export const operatorProfileSchema = z.object({
   routeIntentTokenEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/).optional(),
   maxActiveSessions: z.number().int().nonnegative().optional(),
   floorPricePerMinute: z.string().regex(/^[0-9]+$/).optional()
+}).superRefine((profile, ctx) => {
+  if (profile.status === "active" && profile.reportSigners.length === 0) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["reportSigners"],
+      message: "Active operator profiles require at least one report signer"
+    });
+  }
 });
 
 export type ProcessorScope = z.output<typeof processorScopeSchema>;
@@ -265,7 +273,7 @@ export function publicIpv4Address(value: string): boolean {
 }
 
 export function reportSignerAllowedByProfile(profile: OperatorProfile, signer: string): boolean {
-  return profile.reportSigners.length === 0 || profile.reportSigners.some((allowed) => sameSigner(allowed, signer));
+  return profile.reportSigners.length > 0 && profile.reportSigners.some((allowed) => sameSigner(allowed, signer));
 }
 
 export function operatorProfileRouteIntentUrlForGateway(profile: OperatorProfile | undefined, gatewayId: string): string | undefined {

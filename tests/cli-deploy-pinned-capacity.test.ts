@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,6 +15,46 @@ const cliPath = path.join(cliRoot, "cli/src/index.ts");
 const manifestSignerSeed = "//Alice//switchboard-network-manifest";
 
 describe("switchboard deploy pinned capacity selection", () => {
+  it("selects a route-state gateway for operator-only contexts", async () => {
+    const operatorId = hex32("aa");
+    const otherOperatorId = hex32("bb");
+    const report = capacityReport({ operatorId, gatewayId: "gateway-context", processorId: hex32("11"), routeStateAvailable: true });
+    const otherReport = capacityReport({ operatorId: otherOperatorId, gatewayId: "gateway-other", processorId: hex32("22"), routeStateAvailable: true });
+
+    await withControlPlane([otherReport, report], async ({ baseUrl, manifestSigner }) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-context-deploy-"));
+      try {
+        const entrypoint = path.join(cwd, "index.ts");
+        await writeFile(entrypoint, "console.log('hello switchboard');\n", "utf8");
+        await writeContext(cwd, {
+          manifestUrl: `${baseUrl}/v1/network-manifest`,
+          manifestSigner,
+          operatorId,
+          relayUrl: baseUrl
+        });
+        const result = await runCli(cwd, [
+          "deploy",
+          "--yes",
+          "--dry-run",
+          "--json",
+          "--entrypoint",
+          entrypoint
+        ]);
+
+        assert.equal(result.code, 0, result.stderr);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.env.OPERATOR_ID, operatorId);
+        assert.equal(output.env.SWITCHBOARD_DEPLOY_GATEWAY_ID, "gateway-context");
+        assert.equal(output.env.SWITCHBOARD_DEPLOY_CAPABILITY_REPORT_ID, "report-gateway-context");
+        assert.equal(output.env.SWITCHBOARD_DEPLOY_CAPABILITY_REPORT_EXPIRES_AT, report.report.expiresAt);
+        assert.equal(output.env.SWITCHBOARD_DEPLOY_OPERATOR_PUBLIC_ADDRESSES, JSON.stringify(["195.22.134.245"]));
+        assert.equal(output.env.SWITCHBOARD_DEPLOY_PROCESSOR, hex32("11"));
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("selects a route-state gateway for pinned operator/processor dry-runs", async () => {
     const operatorId = hex32("aa");
     const processorId = hex32("11");
@@ -133,6 +173,39 @@ describe("switchboard deploy pinned capacity selection", () => {
 
         assert.notEqual(result.code, 0);
         assert.match(result.stderr, /No route-state-capable operator capacity matched pinned operator/);
+        assert.match(result.stderr, /route-state polling unavailable/);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("fails operator-only deploys before runner execution when no route-state allocation matches", async () => {
+    const operatorId = hex32("aa");
+    const report = capacityReport({ operatorId, gatewayId: "gateway-route-less", processorId: hex32("11"), routeStateAvailable: false });
+
+    await withControlPlane([report], async ({ baseUrl, manifestSigner }) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-context-deploy-missing-"));
+      try {
+        const entrypoint = path.join(cwd, "index.ts");
+        await writeFile(entrypoint, "console.log('hello switchboard');\n", "utf8");
+        await writeContext(cwd, {
+          manifestUrl: `${baseUrl}/v1/network-manifest`,
+          manifestSigner,
+          operatorId,
+          relayUrl: baseUrl
+        });
+        const result = await runCli(cwd, [
+          "deploy",
+          "--yes",
+          "--dry-run",
+          "--json",
+          "--entrypoint",
+          entrypoint
+        ]);
+
+        assert.notEqual(result.code, 0);
+        assert.match(result.stderr, /No route-state-capable deploy capacity matched operator/);
         assert.match(result.stderr, /route-state polling unavailable/);
       } finally {
         await rm(cwd, { recursive: true, force: true });
@@ -259,6 +332,27 @@ function runCli(cwd: string, args: string[]): Promise<{ code: number | null; std
       });
     });
   });
+}
+
+async function writeContext(
+  cwd: string,
+  context: { manifestUrl: string; manifestSigner: string; operatorId: string; relayUrl: string }
+): Promise<void> {
+  const home = path.join(cwd, ".switchboard-home");
+  await mkdir(home, { recursive: true });
+  await writeFile(
+    path.join(home, "contexts.json"),
+    JSON.stringify({
+      current: "test",
+      contexts: {
+        test: {
+          target: "polkadot-hub",
+          acurastNetwork: "mainnet",
+          ...context
+        }
+      }
+    }, null, 2)
+  );
 }
 
 function sendJson(response: ServerResponse, value: unknown): void {

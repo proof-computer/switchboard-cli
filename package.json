@@ -17,7 +17,7 @@
   ],
   "scripts": {
     "build": "node scripts/build-package.mjs",
-    "prepare": "node scripts/verify-package-artifacts.mjs",
+    "prepare": "node scripts/build-package.mjs && node scripts/verify-package-artifacts.mjs",
     "test": "node --import tsx --test tests/**/*.test.ts",
     "smoke:express-local": "node --import tsx --test tests/express-webserver-local-harness.test.ts",
     "snapshot:express-demo-status": "node scripts/snapshot-express-demo-status.mjs",

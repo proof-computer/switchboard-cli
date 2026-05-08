@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ApiPromise, WsProvider } from "@polkadot/api";
@@ -120,6 +120,8 @@ const DEFAULT_LAUNCH_DEMO_DURATION_MINUTES = 10;
 const DEFAULT_LAUNCH_DEMO_START_DELAY_MS = 180_000;
 const DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION = "40000000000";
 const DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS = 900;
+const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#main";
+const LAUNCH_DEMO_ENTRYPOINT = "src/server.ts";
 const ANSI_ESCAPE_PATTERN = /\u001b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 export const PROOF_NETWORK_MANIFEST_URL = "https://control.switchboard.proof.computer/v1/network-manifest";
 export const PROOF_NETWORK_MANIFEST_SIGNER = "5EpwnRzamXpqWo3jW9h4ecSJHL9LBjR6jTMW5Wzw6p9nMTh7";
@@ -1382,6 +1384,12 @@ type LaunchDemoQuotePreview =
       error: string;
     };
 
+interface LaunchDemoProject {
+  dir: string;
+  entrypoint: string;
+  packageSpec: string;
+}
+
 async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: CliRuntime) {
   if (!boolFlag(flags, "dry-run") && !boolFlag(flags, "yes-spend")) {
     const hint = boolFlag(flags, "yes")
@@ -1439,6 +1447,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     processorCount: requestedProcessorCount,
     minReady: minReadyProcessors
   });
+  const demoProject = await createLaunchDemoProject(flags);
 
   const childArgs = [
     INTERNAL_DEPLOY_RUNNER_SCRIPT,
@@ -1511,6 +1520,8 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     ACURAST_EXECUTION_MS: String((durationMinutes + scheduleBufferMinutes) * 60_000),
     ACURAST_MAX_ALLOWED_START_DELAY_MS: String(DEFAULT_LAUNCH_DEMO_START_DELAY_MS),
     ACURAST_INSTANT_MATCH_START_DELAY_MS: String(DEFAULT_LAUNCH_DEMO_START_DELAY_MS),
+    ACURAST_ENTRYPOINT: LAUNCH_DEMO_ENTRYPOINT,
+    SWITCHBOARD_WORK_DIR: demoProject.dir,
     SWITCHBOARD_TARGET: target.name,
     SWITCHBOARD_OPERATOR_ID: selection.operatorId,
     INGRESS_REGISTRY_ADDRESS: manifestConfig.registryAddress,
@@ -1542,6 +1553,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
       maxCostPerExecution,
       ingressEstimate,
       selection: launchDemoSelectionOutput(selection),
+      demoProject,
       env: childEnv,
       note: "No Acurast deployment, Hub transaction, DNS change, or route mutation was attempted."
     };
@@ -1566,9 +1578,11 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     return;
   }
 
+  await installLaunchDemoProject(demoProject, flags);
   const estimate = await estimateLaunchDemoAcurastCost({
     runtime,
-    env: childEnv
+    env: childEnv,
+    workDir: demoProject.dir
   });
   if (!boolFlag(flags, "json")) {
     printLaunchDemoStart({
@@ -1585,12 +1599,13 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     });
   }
 
-  const deployRunner = await resolveDeployRunner(childArgs, childEnv);
+  const deployRunner = await resolveDeployRunner(childArgs, childEnv, { workDir: demoProject.dir });
   const result = await runDeployRunner(deployRunner.command, deployRunner.args, {
     env: {
       ...contextRuntimeEnv(runtime),
       ...deployRunner.env
     },
+    cwd: deployRunner.cwd,
     childStdoutToStderr: boolFlag(flags, "json"),
     action: "launch-demo",
     json: boolFlag(flags, "json")
@@ -1607,11 +1622,77 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     scheduleBufferMinutes,
     selection: launchDemoSelectionOutput(selection),
     ingressEstimate,
-    estimate
+    estimate,
+    demoProject
   });
   await saveProjectDeployment(runtime, output);
 
   writeOutput(flags, output, () => printDeployResult(output));
+}
+
+async function createLaunchDemoProject(flags: Map<string, string | boolean>): Promise<LaunchDemoProject> {
+  const packageSpec =
+    stringFlag(flags, "demo-package") ??
+    optionalEnv("SWITCHBOARD_LAUNCH_DEMO_PACKAGE_SPEC") ??
+    DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC;
+  const dir = await mkdtemp(path.join(tmpdir(), "switchboard-launch-demo-"));
+  await mkdir(path.join(dir, "src"), { recursive: true });
+  await writeFile(
+    path.join(dir, "package.json"),
+    `${JSON.stringify(
+      {
+        name: `switchboard-launch-demo-${Date.now()}`,
+        version: "0.0.0",
+        private: true,
+        type: "module",
+        scripts: {
+          start: "node --import tsx src/server.ts"
+        },
+        dependencies: {
+          "@proofcomputer/switchboard-express-demo": packageSpec
+        },
+        devDependencies: {
+          "@types/node": "^24.10.1",
+          "tsx": "^4.20.6",
+          "typescript": "^5.9.3"
+        }
+      },
+      null,
+      2
+    )}\n`
+  );
+  await writeFile(
+    path.join(dir, LAUNCH_DEMO_ENTRYPOINT),
+    `import { startSwitchboardExpressDemo } from "@proofcomputer/switchboard-express-demo";
+
+void startSwitchboardExpressDemo().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+`
+  );
+  await writeFile(path.join(dir, ".gitignore"), "node_modules/\ndist/\n.acurast/\n.switchboard/\n.env\n.env.*\n");
+  return { dir, entrypoint: LAUNCH_DEMO_ENTRYPOINT, packageSpec };
+}
+
+async function installLaunchDemoProject(project: LaunchDemoProject, flags: Map<string, string | boolean>): Promise<void> {
+  if (!boolFlag(flags, "json")) {
+    console.log(sectionTitle("Demo project"));
+    printOutputRows([
+      { label: "Project", value: project.dir },
+      { label: "Package", value: project.packageSpec }
+    ]);
+  }
+  const install = await runCliChild("npm", ["install", "--fund=false", "--audit=false"], {
+    cwd: project.dir,
+    env: {
+      npm_config_cache: optionalEnv("npm_config_cache") ?? optionalEnv("NPM_CONFIG_CACHE") ?? path.join(tmpdir(), "switchboard-launch-demo-npm-cache")
+    },
+    stream: !boolFlag(flags, "json")
+  });
+  if (install.exitCode !== 0) {
+    throw new Error(`Failed to install launch-demo project dependencies in ${project.dir}: ${install.stderr || install.stdout}`);
+  }
 }
 
 function launchDemoAcurastNetwork(flags: Map<string, string | boolean>): AcurastNetwork {
@@ -1779,6 +1860,86 @@ async function selectLaunchDemoCapacity(input: {
     throw new Error(`Only ${selectedMembers.length}/${input.minReady} launch-demo members could be selected`);
   }
   return launchDemoSelectionFromMembers(selectedMembers);
+}
+
+async function selectDeployCapacity(input: {
+  relayUrl: string;
+  operatorId?: string;
+  gatewayId?: string;
+}): Promise<LaunchDemoCapacitySelection> {
+  const requestedOperatorId = input.operatorId?.toLowerCase();
+  const reports = await readLaunchDemoCapabilityReports(input.relayUrl);
+  const errors: string[] = [];
+  const candidates: LaunchDemoMemberSelection[] = [];
+
+  for (const stored of reports) {
+    const report = stored.report;
+    if (requestedOperatorId && report.operator.operatorId.toLowerCase() !== requestedOperatorId) {
+      continue;
+    }
+    if (input.gatewayId && report.operator.gatewayId !== input.gatewayId) {
+      continue;
+    }
+    const reason = launchDemoReportEligibilityReason(report);
+    if (reason) {
+      errors.push(`${report.operator.gatewayId}: ${reason}`);
+      continue;
+    }
+
+    const processors = expandedReportProcessors(report);
+    if (processors.length === 0) {
+      errors.push(`${report.operator.gatewayId}: no processors in capability report`);
+      continue;
+    }
+    for (const processor of processors) {
+      const operatorId = report.operator.operatorId.toLowerCase();
+      const processorRef = processor.address ?? processor.processorId;
+      candidates.push({
+        memberId: `member-${candidates.length + 1}`,
+        operatorId,
+        gatewayId: report.operator.gatewayId,
+        managerId: processor.managerId,
+        processor: processorRef,
+        processorId: processor.processorId,
+        readiness: {
+          processor: processorRef,
+          heartbeatMs: Date.now(),
+          heartbeatIso: new Date().toISOString(),
+          heartbeatAgeSeconds: 0,
+          version: "capability-report"
+        },
+        reportId: report.reportId,
+        reportExpiresAt: report.expiresAt,
+        publicAddresses: report.gateway.publicAddresses,
+        activeRouteCount: report.gateway.activeRouteCount,
+        routeCapacity: report.gateway.routeCapacity,
+        allocation: launchDemoMemberAllocation({
+          operatorId,
+          gatewayId: report.operator.gatewayId,
+          managerId: processor.managerId,
+          processor: processorRef,
+          processorId: processor.processorId,
+          reportId: report.reportId,
+          reportExpiresAt: report.expiresAt,
+          publicAddresses: report.gateway.publicAddresses,
+          activeRouteCount: report.gateway.activeRouteCount,
+          routeCapacity: report.gateway.routeCapacity
+        })
+      });
+    }
+  }
+
+  candidates.sort(compareLaunchDemoMembers);
+  const selected = candidates[0];
+  if (!selected) {
+    const request = [
+      input.operatorId ? `operator ${input.operatorId}` : undefined,
+      input.gatewayId ? `gateway ${input.gatewayId}` : undefined
+    ].filter(Boolean).join(" and ") || "available operator capacity";
+    const checked = errors.length > 0 ? ` Checked: ${errors.slice(0, 5).join("; ")}` : "";
+    throw new Error(`No route-state-capable deploy capacity matched ${request}.${checked}`);
+  }
+  return launchDemoSelectionFromMembers([{ ...selected, memberId: "member-1" }]);
 }
 
 export async function selectPinnedDeployCapacity(input: {
@@ -2124,6 +2285,7 @@ function formatLaunchDemoQuotePreview(preview: LaunchDemoQuotePreview): string {
 async function estimateLaunchDemoAcurastCost(input: {
   runtime: CliRuntime;
   env: Record<string, string | undefined>;
+  workDir: string;
 }): Promise<{ ok: true; summary?: string; output?: unknown } | { ok: false; error: string }> {
   const env = {
     ...contextRuntimeEnv(input.runtime),
@@ -2131,9 +2293,10 @@ async function estimateLaunchDemoAcurastCost(input: {
   };
   let result: { stdout: string; stderr: string; exitCode: number };
   try {
-    const estimateRunner = await resolveLaunchDemoEstimateRunner(env);
+    const estimateRunner = await resolveLaunchDemoEstimateRunner(env, { workDir: input.workDir });
     result = await runCliChild(estimateRunner.command, estimateRunner.args, {
       env: estimateRunner.env,
+      cwd: estimateRunner.cwd,
       stream: false,
       allowFailure: true
     });
@@ -2156,18 +2319,23 @@ async function estimateLaunchDemoAcurastCost(input: {
 
 export async function resolveLaunchDemoEstimateRunner(
   env: Record<string, string | undefined>,
-  context: { cwd?: string; currentFile?: string } = {}
-): Promise<{ command: string; args: string[]; env: Record<string, string | undefined> }> {
-  if (await repoScriptAvailable("acurast:estimate-express", context)) {
+  context: { cwd?: string; currentFile?: string; workDir?: string } = {}
+): Promise<{ command: string; args: string[]; env: Record<string, string | undefined>; cwd?: string }> {
+  const workDir = path.resolve(context.workDir ?? context.cwd ?? process.cwd());
+  const cliRoot = cliPackageRoot(context.currentFile);
+  if (await repoScriptAvailable("acurast:estimate-express", { ...context, cwd: cliRoot })) {
     return {
       command: "pnpm",
       args: ["--silent", "acurast:estimate-express", "--", "--json"],
-      env
+      env: {
+        ...env,
+        SWITCHBOARD_WORK_DIR: workDir
+      },
+      cwd: cliRoot
     };
   }
 
   const currentFile = context.currentFile ?? fileURLToPath(import.meta.url);
-  const cwd = context.cwd ?? process.cwd();
   const distDir = path.dirname(currentFile);
   const internalDir = path.join(distDir, "internal");
   const assetsDir = path.join(distDir, "..", "assets");
@@ -2182,7 +2350,7 @@ export async function resolveLaunchDemoEstimateRunner(
     args: [acurastExpress, "estimate-fee", "--json"],
     env: {
       ...env,
-      SWITCHBOARD_WORK_DIR: cwd,
+      SWITCHBOARD_WORK_DIR: workDir,
       SWITCHBOARD_INTERNAL_BIN_DIR: internalDir,
       SWITCHBOARD_PACKAGED_ASSETS_DIR: assetsDir,
       SWITCHBOARD_PREBUILT_JOB_BUNDLE: bundleName ? path.join(assetsDir, "jobs", bundleName, "bundle.cjs") : undefined
@@ -2329,6 +2497,16 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
       operatorId: explicitOperatorId,
       processor: explicitProcessor
     });
+  } else if (routeActivationMode === "relay-reconciled" && explicitOperatorId && !explicitGatewayId) {
+    selection = await selectDeployCapacity({
+      relayUrl,
+      operatorId: explicitOperatorId
+    });
+  } else if (routeActivationMode === "relay-reconciled" && explicitGatewayId && !explicitOperatorId) {
+    selection = await selectDeployCapacity({
+      relayUrl,
+      gatewayId: explicitGatewayId
+    });
   } else if (!explicitOperatorId) {
     selection = await selectLaunchDemoCapacity({
         relayUrl,
@@ -2346,6 +2524,12 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
   const maxCostPerExecution =
     stringFlag(flags, "max-cost-per-execution") ?? optionalEnv("ACURAST_MAX_COST_PER_EXECUTION") ?? DEFAULT_MAX_COST_PER_EXECUTION;
   const certificateMode = stringFlag(flags, "certificate-mode") ?? (boolFlag(flags, "self-signed") ? "self-signed" : "job-acme");
+  const selectedGatewayId = explicitGatewayId ?? selection?.gatewayId;
+  if (routeActivationMode === "relay-reconciled" && !selectedGatewayId) {
+    throw new Error(
+      "Relay-reconciled deploys require a route-state-capable gateway allocation; pass --gateway-id or use operator capacity with route-state polling."
+    );
+  }
 
   const childArgs = [INTERNAL_DEPLOY_RUNNER_SCRIPT, "--", "--yes", "--relay-url", relayUrl, "--operator-id", operatorId];
   if (!boolFlag(flags, "no-dns")) {
@@ -2403,9 +2587,9 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
   const childEnv = {
     ...publicDeployRunnerSafetyEnv(),
     OPERATOR_ID: operatorId,
-    GATEWAY_ID: explicitGatewayId ?? selection?.gatewayId,
+    GATEWAY_ID: selectedGatewayId,
     SWITCHBOARD_DEPLOY_RELAY_URL: relayUrl,
-    SWITCHBOARD_DEPLOY_GATEWAY_ID: explicitGatewayId ?? selection?.gatewayId,
+    SWITCHBOARD_DEPLOY_GATEWAY_ID: selectedGatewayId,
     SWITCHBOARD_DEPLOY_CAPABILITY_REPORT_ID: selection?.reportId,
     SWITCHBOARD_DEPLOY_CAPABILITY_REPORT_EXPIRES_AT: selection?.reportExpiresAt,
     SWITCHBOARD_DEPLOY_OPERATOR_PUBLIC_ADDRESSES: selection ? JSON.stringify(selection.publicAddresses) : undefined,
@@ -4844,6 +5028,7 @@ async function runCliChild(
   args: string[],
   options: {
     env?: Record<string, string | undefined>;
+    cwd?: string;
     childStdoutToStderr?: boolean;
     transcriptWriter?: GroupedDeployTranscriptWriter;
     stream?: boolean;
@@ -4853,6 +5038,7 @@ async function runCliChild(
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
+      cwd: options.cwd,
       env: {
         ...process.env,
         ...Object.fromEntries(Object.entries(options.env ?? {}).filter(([, value]) => value !== undefined))
@@ -4925,6 +5111,7 @@ async function runDeployRunner(
   args: string[],
   options: {
     env?: Record<string, string | undefined>;
+    cwd?: string;
     childStdoutToStderr?: boolean;
     action: "launch-demo" | "deploy";
     json: boolean;
@@ -4938,6 +5125,7 @@ async function runDeployRunner(
     const transcriptWriter = options.json ? undefined : createGroupedDeployTranscriptWriter();
     return await runCliChild(command, args, {
       env: options.env,
+      cwd: options.cwd,
       childStdoutToStderr: options.childStdoutToStderr,
       transcriptWriter
     });
@@ -5296,18 +5484,27 @@ async function deployRunnerAvailable(): Promise<{ ok: boolean; detail: string }>
 
 async function resolveDeployRunner(
   repoChildArgs: string[],
-  childEnv: Record<string, string | undefined>
-): Promise<{ command: string; args: string[]; env: Record<string, string | undefined> }> {
-  const repoScript = (await repoScriptAvailable(INTERNAL_DEPLOY_RUNNER_SCRIPT)) ? INTERNAL_DEPLOY_RUNNER_SCRIPT : undefined;
+  childEnv: Record<string, string | undefined>,
+  context: { workDir?: string; currentFile?: string } = {}
+): Promise<{ command: string; args: string[]; env: Record<string, string | undefined>; cwd?: string }> {
+  const workDir = path.resolve(context.workDir ?? process.cwd());
+  const cliRoot = cliPackageRoot(context.currentFile);
+  const repoScript = (await repoScriptAvailable(INTERNAL_DEPLOY_RUNNER_SCRIPT, { cwd: cliRoot, currentFile: context.currentFile }))
+    ? INTERNAL_DEPLOY_RUNNER_SCRIPT
+    : undefined;
   if (repoScript) {
     return {
       command: "pnpm",
       args: ["--silent", repoScript, ...repoChildArgs.slice(1)],
-      env: childEnv
+      env: {
+        ...childEnv,
+        SWITCHBOARD_WORK_DIR: workDir
+      },
+      cwd: cliRoot
     };
   }
 
-  const currentFile = fileURLToPath(import.meta.url);
+  const currentFile = context.currentFile ?? fileURLToPath(import.meta.url);
   const distDir = path.dirname(currentFile);
   const internalDir = path.join(distDir, "internal");
   const deployRunner = path.join(internalDir, "switchboard-deploy.js");
@@ -5323,7 +5520,7 @@ async function resolveDeployRunner(
     args: [deployRunner, ...repoChildArgs.slice(2)],
     env: {
       ...childEnv,
-      SWITCHBOARD_WORK_DIR: process.cwd(),
+      SWITCHBOARD_WORK_DIR: workDir,
       SWITCHBOARD_INTERNAL_BIN_DIR: internalDir,
       SWITCHBOARD_PACKAGED_ASSETS_DIR: assetsDir
     }
@@ -5382,6 +5579,14 @@ async function repoScriptAvailable(
 
 function isSourceCliEntrypoint(currentFile: string): boolean {
   return currentFile.replace(/\\/g, "/").endsWith("/cli/src/index.ts");
+}
+
+function cliPackageRoot(currentFile: string = fileURLToPath(import.meta.url)): string {
+  const normalized = currentFile.replace(/\\/g, "/");
+  if (normalized.endsWith("/cli/src/index.ts")) {
+    return path.resolve(path.dirname(currentFile), "../..");
+  }
+  return path.resolve(path.dirname(currentFile), "..");
 }
 
 async function assertRepoScriptAvailable(scriptName: string, context: string): Promise<void> {

@@ -1,4 +1,4 @@
-import type { Request, Response, Router } from "express";
+import type { Request, Response as ExpressResponse, Router } from "express";
 import { Router as createRouter } from "express";
 import * as acme from "acme-client";
 import { ethers } from "ethers";
@@ -110,8 +110,42 @@ export interface SwitchboardCertificateResult extends SwitchboardCertificateRela
   relayResponse: {
     hostname?: string;
     certificatePem?: string;
+    issuer?: string;
+    notAfter?: string;
     [key: string]: unknown;
   };
+}
+
+export type SwitchboardCertificateFailureStage =
+  | "hostname_config"
+  | "certificate_lock"
+  | "certificate_request"
+  | "certificate_authorization"
+  | "acme_issuance"
+  | "relay_response";
+
+export interface SwitchboardCertificateErrorOptions {
+  stage: SwitchboardCertificateFailureStage;
+  hostname?: string;
+  status?: number;
+  relayResponse?: unknown;
+  cause?: unknown;
+}
+
+export class SwitchboardCertificateError extends Error {
+  readonly stage: SwitchboardCertificateFailureStage;
+  readonly hostname: string | undefined;
+  readonly status: number | undefined;
+  readonly relayResponse: unknown;
+
+  constructor(message: string, options: SwitchboardCertificateErrorOptions) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "SwitchboardCertificateError";
+    this.stage = options.stage;
+    this.hostname = options.hostname;
+    this.status = options.status;
+    this.relayResponse = options.relayResponse;
+  }
 }
 
 export interface SwitchboardLogRecord {
@@ -161,7 +195,7 @@ export type {
 export function createSwitchboardRouter(config: SwitchboardChallengeConfig): Router {
   const router = createRouter();
 
-  router.get(SWITCHBOARD_CHALLENGE_PATH, (request: Request, response: Response) => {
+  router.get(SWITCHBOARD_CHALLENGE_PATH, (request: Request, response: ExpressResponse) => {
     const result = buildSwitchboardChallengeResult(config, {
       nonce: request.query.nonce,
       path: request.path,
@@ -324,12 +358,13 @@ export async function buildIngressCertificateRequest(
 }
 
 export async function requestCertificateWithRelay(
-  config: SwitchboardCertificateConfig
+  config: SwitchboardCertificateConfig,
+  fetchImpl: typeof fetch = fetch
 ): Promise<SwitchboardCertificateResult> {
   const request = await buildIngressCertificateRequest(config);
   const abortController = new AbortController();
   const timeout = setTimeout(() => abortController.abort(), config.requestTimeoutMs ?? 120_000);
-  const response = await fetch(new URL("/v1/certificates", config.relayUrl), {
+  const response = await fetchImpl(new URL("/v1/certificates", config.relayUrl), {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -342,15 +377,64 @@ export async function requestCertificateWithRelay(
     })
   }).finally(() => clearTimeout(timeout));
 
-  const relayResponse = (await response.json()) as SwitchboardCertificateResult["relayResponse"];
+  const relayResponse = (await responseJsonOrText(response)) as SwitchboardCertificateResult["relayResponse"];
   if (!response.ok) {
-    throw new Error(`Relay certificate request failed: ${JSON.stringify(relayResponse)}`);
+    const hostname = config.hostname.trim().toLowerCase();
+    throw new SwitchboardCertificateError(
+      `Relay certificate request failed for ${hostname}: ${response.status} ${JSON.stringify(relayResponse)}`,
+      {
+        stage: certificateFailureStageForRelayResponse(response.status, relayResponse),
+        hostname,
+        status: response.status,
+        relayResponse
+      }
+    );
   }
 
   return {
     ...request,
     relayResponse
   };
+}
+
+function certificateFailureStageForRelayResponse(
+  status: number,
+  relayResponse: SwitchboardCertificateResult["relayResponse"]
+): SwitchboardCertificateFailureStage {
+  const relayError = stringRecordField(relayResponse, "error");
+  if (relayError === "certificate_hostname_lock_unavailable" || status === 423) {
+    return "certificate_lock";
+  }
+  if (relayError === "certificate_hostname_not_authorized" || relayError === "certificate_hostname_byo_tls") {
+    return "certificate_authorization";
+  }
+  if (relayError === "certificate_issuance_failed") {
+    return "acme_issuance";
+  }
+  if (status === 400 && (relayError === "invalid_hostname" || relayError === "invalid_request")) {
+    return "hostname_config";
+  }
+  return "relay_response";
+}
+
+async function responseJsonOrText(response: globalThis.Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) {
+    return {};
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return { body: text };
+  }
+}
+
+function stringRecordField(record: unknown, name: string): string | undefined {
+  if (!record || typeof record !== "object") {
+    return undefined;
+  }
+  const value = (record as Record<string, unknown>)[name];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 export function createEncryptedSwitchboardLogger(

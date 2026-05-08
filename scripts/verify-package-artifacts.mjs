@@ -20,7 +20,12 @@ const broadPackageEntries = new Set(["dist", "dist/", "dist/**"]);
 const requiredBundleMarkers = [
   {
     artifact: "dist/index.js",
-    markers: ["must declare signer or digest", "digest mismatch", "Quote expectedJobSigner"]
+    markers: [
+      "must declare signer or digest",
+      "digest mismatch",
+      "Quote expectedJobSigner",
+      "Active operator profiles require at least one report signer"
+    ]
   },
   {
     artifact: "dist/internal/route-validator.js",
@@ -115,26 +120,26 @@ if (
   const details = [];
   if (missing.length > 0) {
     details.push(
-      "Missing committed package artifacts required for GitHub npm install:",
+      "Missing generated package artifacts required for GitHub npm install:",
       ...missing.map((artifact) => `  - ${artifact}`),
-      "Run `pnpm build` and commit the regenerated artifacts."
+      "Run `npm run build` before packing or installing from GitHub."
     );
   }
   if (staleBundles.length > 0) {
     if (details.length > 0) details.push("");
     details.push(
-      "Committed package bundles are stale and do not contain the catalog trust-pinning guard.",
+      "Generated package bundles are stale and do not contain required package guards.",
       ...staleBundles.flatMap(({ artifact, missingMarkers }) => [
         `  - ${artifact}`,
         ...missingMarkers.map((marker) => `    missing marker: ${marker}`)
       ]),
-      "Run `pnpm build` and commit the regenerated artifacts."
+      "Run `npm run build` before packing or installing from GitHub."
     );
   }
   if (contaminatedBundles.length > 0) {
     if (details.length > 0) details.push("");
     details.push(
-      "Committed internal helper bundles must not include the top-level CLI help entrypoint.",
+      "Generated internal helper bundles must not include the top-level CLI help entrypoint.",
       ...contaminatedBundles.flatMap(({ artifact, presentMarkers }) => [
         `  - ${artifact}`,
         ...presentMarkers.map((marker) => `    forbidden marker: ${marker}`)
