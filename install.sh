@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SWITCHBOARD_CLI_REF="${SWITCHBOARD_CLI_REF:-main}"
+SWITCHBOARD_CLI_VERSION="${SWITCHBOARD_CLI_VERSION:-${SWITCHBOARD_CLI_REF:-latest}}"
 SWITCHBOARD_NODE_VERSION="${SWITCHBOARD_NODE_VERSION:-v22.21.1}"
 SWITCHBOARD_INSTALL_HOME="${SWITCHBOARD_INSTALL_HOME:-$HOME/.local/share/switchboard}"
 SWITCHBOARD_BIN_DIR="${SWITCHBOARD_BIN_DIR:-$HOME/.local/bin}"
 SWITCHBOARD_NPM_PREFIX="${SWITCHBOARD_NPM_PREFIX:-$SWITCHBOARD_INSTALL_HOME/npm}"
 SWITCHBOARD_NPM_CACHE="${SWITCHBOARD_NPM_CACHE:-$SWITCHBOARD_INSTALL_HOME/npm-cache}"
-SWITCHBOARD_CLI_PACKAGE_URL="${SWITCHBOARD_CLI_PACKAGE_URL:-https://github.com/proof-computer/switchboard-cli/archive/${SWITCHBOARD_CLI_REF}.tar.gz}"
+if [ -z "${SWITCHBOARD_CLI_PACKAGE_URL:-}" ]; then
+  if [ "$SWITCHBOARD_CLI_VERSION" = "latest" ]; then
+    SWITCHBOARD_CLI_PACKAGE_URL="https://github.com/proof-computer/switchboard-cli/releases/latest/download/switchboard-cli.tgz"
+  else
+    SWITCHBOARD_CLI_PACKAGE_URL="https://github.com/proof-computer/switchboard-cli/releases/download/${SWITCHBOARD_CLI_VERSION}/switchboard-cli.tgz"
+  fi
+fi
 
 log() {
   printf '%s\n' "$*" >&2
@@ -115,16 +121,19 @@ EOF
 install_cli_package() {
   local node_bin="$1"
   local npm="$2"
-  local tmp tarball
+  local tmp package_tgz
   tmp="$(mktemp -d)"
-  tarball="$tmp/switchboard-cli.tar.gz"
+  package_tgz="$tmp/switchboard-cli.tgz"
 
-  log "Downloading Switchboard CLI from $SWITCHBOARD_CLI_PACKAGE_URL"
-  curl -fsSL "$SWITCHBOARD_CLI_PACKAGE_URL" -o "$tarball"
+  log "Downloading Switchboard CLI package from $SWITCHBOARD_CLI_PACKAGE_URL"
+  curl -fsSL "$SWITCHBOARD_CLI_PACKAGE_URL" -o "$package_tgz"
+  if [ -n "${SWITCHBOARD_CLI_SHA256:-}" ]; then
+    sha256_verify "$SWITCHBOARD_CLI_SHA256" "$package_tgz"
+  fi
 
   log "Installing Switchboard CLI under $SWITCHBOARD_NPM_PREFIX"
   PATH="$node_bin:$PATH" "$npm" uninstall --global --prefix "$SWITCHBOARD_NPM_PREFIX" --cache "$SWITCHBOARD_NPM_CACHE" switchboard-cli >/dev/null 2>&1 || true
-  PATH="$node_bin:$PATH" "$npm" install --global --force --prefix "$SWITCHBOARD_NPM_PREFIX" --cache "$SWITCHBOARD_NPM_CACHE" "$tarball"
+  PATH="$node_bin:$PATH" "$npm" install --global --force --ignore-scripts --prefix "$SWITCHBOARD_NPM_PREFIX" --cache "$SWITCHBOARD_NPM_CACHE" --omit=dev --omit=optional "$package_tgz"
 
   rm -rf "$tmp"
 }

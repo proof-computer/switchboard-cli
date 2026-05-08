@@ -9,7 +9,7 @@ registry access are invite-gated.
 ## Quickstart
 
 ```bash
-curl -fsSL https://control.switchboard.proof.computer/install.sh | bash
+curl -fsSL https://github.com/proof-computer/switchboard-cli/releases/latest/download/install.sh | bash
 switchboard --help
 ```
 
@@ -42,15 +42,20 @@ quote, handles DNS/TLS/routing, and prints the URL.
 
 ## Install Details
 
-The installer uses the committed GitHub archive package, installs into
-`~/.local/share/switchboard`, and writes a `switchboard` launcher into
-`~/.local/bin`. If the host does not already have Node 22 or newer, it installs
-a private Node runtime under `~/.local/share/switchboard/node` rather than
-changing system packages.
+The installer downloads the `switchboard-cli.tgz` package from GitHub Releases,
+installs it into `~/.local/share/switchboard`, and writes a `switchboard`
+launcher into `~/.local/bin`. If the host does not already have Node 22 or
+newer, it installs a private Node runtime under
+`~/.local/share/switchboard/node` rather than changing system packages.
 
 Rerun the same command to upgrade an existing install. Each run downloads a
-fresh archive, replaces the installed `switchboard-cli` package under the
-install home, and rewrites the launcher.
+fresh release package, replaces the installed `switchboard-cli` package under
+the install home, and rewrites the launcher.
+
+Pin a release with `SWITCHBOARD_CLI_VERSION=v0.1.0`, or override the package
+URL directly with `SWITCHBOARD_CLI_PACKAGE_URL`. The control-plane installer
+mirror at `https://control.switchboard.proof.computer/install.sh` serves the
+same installer after rollout.
 
 The core CLI install does not install native Ledger HID packages. Polkadot
 Ledger signing lives under `src/ledger/` and is intended to move to a separate
@@ -73,18 +78,17 @@ pnpm switchboard --help
 ```
 
 Build output is generated into `dist/`, with packaged Acurast job bundles under
-`assets/jobs/`. The committed package surface is `dist/index.js`,
-`dist/internal/`, and `assets/jobs/`; local Acurast staging directories such as
-`dist/acurast/` are ignored and must not be packaged. Recreate committed
-artifacts with `pnpm build` whenever CLI or job source changes.
+`assets/jobs/`. These generated files are ignored by Git; local installs,
+`prepare`, and package dry-runs build them from source. Local Acurast staging
+directories such as `dist/acurast/` are ignored and must not be packaged.
 
 ## Package Shape
 
-The package includes the compiled CLI, internal runner bundles, prebuilt job
+The package includes the compiled CLI, internal runner bundles, generated job
 bundles, and operator setup assets used by `switchboard operator setup`.
-GitHub archive installs use the committed package artifacts directly; the
-package `prepare` script only verifies that those artifacts are present when
-npm uses git-dependency preparation.
+GitHub Release installs consume the generated package tarball. The package
+`prepare` script builds and verifies the generated artifacts, and
+`npm pack --dry-run --json` is the release-surface check.
 
 ## Trust Model
 
@@ -130,7 +134,7 @@ flags change the trust root for that command.
 
 This repository should not contain live credentials. Context files store env
 var names for secrets, not secret values, and local secrets live outside the
-repo under `~/.switchboard/`. Committed package artifacts are limited to the
+repo under `~/.switchboard/`. Generated package artifacts are limited to the
 public CLI bundles and public job bundles. Local Acurast stage output, `.env`
 files, `.acurast/` directories, deploy receipts, and runtime keys must stay out
 of Git and out of npm package contents.

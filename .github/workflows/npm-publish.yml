@@ -1,0 +1,37 @@
+name: npm Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to npmjs.com. Leave false for a dry run."
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.1
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --legacy-peer-deps
+      - run: npm test
+      - run: npm run build
+      - run: node scripts/verify-package-artifacts.mjs
+      - name: Publish dry run
+        if: ${{ !inputs.publish }}
+        run: npm publish --dry-run
+      - name: Publish
+        if: ${{ inputs.publish }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance
