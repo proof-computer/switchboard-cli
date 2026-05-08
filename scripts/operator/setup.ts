@@ -121,7 +121,7 @@ interface OperatorSetupReport {
 const DEFAULT_ENV_FILE = ".operator-host/operator.env";
 const DEFAULT_COMPOSE_FILE = "docker-compose.yaml";
 const DEFAULT_DISCOVERY_STATE_FILE = "~/.proof-index/operator-discovery-state.json";
-const DEFAULT_OPERATOR_IMAGE_REGISTRY = "ghcr.io/proof-computer/switchboard";
+const DEFAULT_OPERATOR_IMAGE_REGISTRY = "ghcr.io/proof-computer/switchboard-gateway";
 const DEFAULT_OPERATOR_IMAGE_TAG = "latest";
 const DEFAULT_ENVOY_IMAGE = "envoyproxy/envoy:v1.35-latest";
 const DEFAULT_VICTORIA_METRICS_IMAGE = "victoriametrics/victoria-metrics:latest";
@@ -137,6 +137,8 @@ const PACKAGED_OPERATOR_ASSET_DIR = "assets/operator";
 const WAN_IP_URL = "https://ifconfig.me/ip";
 const WAN_IP_COMMAND = ["curl", "--ipv4", WAN_IP_URL] as const;
 const REMOVED_OPERATOR_ENV_KEYS = new Set(["OPERATOR_SLUG"]);
+const LEGACY_OPERATOR_IMAGE_PATTERN = /^ghcr\.io\/(?:proof-computer|mooselabs)\/switchboard\/operator:(.+)$/;
+const LEGACY_TLS_TEST_UPSTREAM_IMAGE_PATTERN = /^ghcr\.io\/(?:proof-computer|mooselabs)\/switchboard\/tls-test-upstream:(.+)$/;
 
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
@@ -209,10 +211,12 @@ export async function runOperatorUpgrade(flags: Map<string, string | boolean>, r
   const envFile = path.resolve(projectDir, stringFlag(flags, "env-file") ?? DEFAULT_ENV_FILE);
   const dryRun = boolFlag(flags, "dry-run");
   const assumeYes = boolFlag(flags, "yes") || process.env.SWITCHBOARD_ASSUME_YES === "true";
+  const keepImageOverride = boolFlag(flags, "keep-image-override") || boolFlag(flags, "keep-image-overrides");
   const docker = await checkDocker();
   if (!docker.docker.ok || !docker.compose.ok) {
     throw new Error("Docker/Compose is not ready; run `switchboard operator setup` first.");
   }
+  const migration = await planOperatorImageMigration(envFile, keepImageOverride);
   const composeStyle = docker.composeStyle ?? "docker-compose-plugin";
   const pullCommand = composePullServicesCommand({
     envFile,
@@ -223,6 +227,9 @@ export async function runOperatorUpgrade(flags: Map<string, string | boolean>, r
   const upCommand = composeUpCommand({ envFile, composeFiles, composeStyle, build: false });
   const commands = [pullCommand, upCommand];
   if (dryRun) {
+    for (const line of migration.plannedMessages) {
+      console.log(line);
+    }
     for (const command of commands) {
       console.log(command.join(" "));
     }
@@ -231,6 +238,12 @@ export async function runOperatorUpgrade(flags: Map<string, string | boolean>, r
   if (!(await confirm(prompt, assumeYes, "Pull current operator images and recreate the operator stack?"))) {
     console.log("Operator upgrade skipped.");
     return;
+  }
+  if (migration.updates) {
+    await writeOperatorEnvFile(envFile, migration.updates, projectDir);
+    for (const line of migration.appliedMessages) {
+      console.log(line);
+    }
   }
   await runInteractive(pullCommand[0], pullCommand.slice(1), { cwd: projectDir });
   await runInteractive(upCommand[0], upCommand.slice(1), { cwd: projectDir });
@@ -498,6 +511,9 @@ Options:
   --yes                            Accept install/launch prompts
   --json                           Print JSON report
 
+Upgrade-only:
+  --keep-image-override            Do not migrate old default operator image refs to switchboard-gateway
+
 Examples:
   switchboard operator setup
   switchboard operator setup --manager-address 5... --manager-id <manager-id> --yes`);
@@ -763,7 +779,7 @@ async function resolveManagerInputs(
 
 function operatorEnvUpdates(config: OperatorSetupConfig): Record<string, string | undefined> {
   const imagePrefix = config.localBuild ? "proof" : config.imageRegistry;
-  const operatorImage = `${imagePrefix}/operator:${config.localBuild ? "dev" : config.imageTag}`;
+  const operatorImage = `${imagePrefix}/gateway:${config.localBuild ? "dev" : config.imageTag}`;
   const tlsTestUpstreamImage = `${imagePrefix}/tls-test-upstream:${config.localBuild ? "dev" : config.imageTag}`;
   const mainnet = config.network === "mainnet";
   return {
@@ -805,6 +821,61 @@ function operatorEnvUpdates(config: OperatorSetupConfig): Record<string, string 
     PROOF_NETWORK_MANIFEST_URL: mainnet ? DEFAULT_MAINNET_MANIFEST_URL : process.env.PROOF_NETWORK_MANIFEST_URL,
     PROOF_NETWORK_MANIFEST_SIGNER: mainnet ? DEFAULT_MAINNET_MANIFEST_SIGNER : process.env.PROOF_NETWORK_MANIFEST_SIGNER
   };
+}
+
+export async function planOperatorImageMigration(
+  envFile: string,
+  keepImageOverride: boolean
+): Promise<{
+  updates?: Record<string, string>;
+  plannedMessages: string[];
+  appliedMessages: string[];
+}> {
+  if (keepImageOverride) {
+    return {
+      plannedMessages: ["Keeping existing operator image overrides."],
+      appliedMessages: []
+    };
+  }
+
+  const env = await readEnvFileMap(envFile);
+  const updates: Record<string, string> = {};
+  const plannedMessages: string[] = [];
+  const appliedMessages: string[] = [];
+  for (const key of ["GATEWAY_AGENT_IMAGE", "HUB_WATCHER_IMAGE"] as const) {
+    const value = env.get(key);
+    const next = value ? migrateLegacyGatewayImage(value) : undefined;
+    if (!next || next === value) {
+      continue;
+    }
+    updates[key] = next;
+    plannedMessages.push(`would migrate ${key} from ${value} to ${next}`);
+    appliedMessages.push(`Migrated ${key} from ${value} to ${next}`);
+  }
+
+  const tlsValue = env.get("TLS_TEST_UPSTREAM_IMAGE");
+  const migratedTls = tlsValue ? migrateLegacyTlsTestUpstreamImage(tlsValue) : undefined;
+  if (migratedTls && migratedTls !== tlsValue) {
+    updates.TLS_TEST_UPSTREAM_IMAGE = migratedTls;
+    plannedMessages.push(`would migrate TLS_TEST_UPSTREAM_IMAGE from ${tlsValue} to ${migratedTls}`);
+    appliedMessages.push(`Migrated TLS_TEST_UPSTREAM_IMAGE from ${tlsValue} to ${migratedTls}`);
+  }
+
+  return {
+    updates: Object.keys(updates).length > 0 ? updates : undefined,
+    plannedMessages,
+    appliedMessages
+  };
+}
+
+export function migrateLegacyGatewayImage(value: string): string | undefined {
+  const match = value.match(LEGACY_OPERATOR_IMAGE_PATTERN);
+  return match ? `${DEFAULT_OPERATOR_IMAGE_REGISTRY}/gateway:${match[1]}` : undefined;
+}
+
+export function migrateLegacyTlsTestUpstreamImage(value: string): string | undefined {
+  const match = value.match(LEGACY_TLS_TEST_UPSTREAM_IMAGE_PATTERN);
+  return match ? `${DEFAULT_OPERATOR_IMAGE_REGISTRY}/tls-test-upstream:${match[1]}` : undefined;
 }
 
 async function checkCapabilityRegistration(

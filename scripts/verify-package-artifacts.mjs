@@ -55,7 +55,20 @@ const forbiddenBundlePatterns = [
     artifact: "dist/index.js",
     checks: [
       { label: "direct pnpm spawn", pattern: /spawn\d*\("pnpm"/ },
-      { label: "user-facing pnpm relay command", pattern: /> pnpm|pnpm acurast/ }
+      { label: "user-facing pnpm relay command", pattern: /> pnpm|pnpm acurast/ },
+      { label: "old private operator image default", pattern: /ghcr\.io\/(?:proof-computer|mooselabs)\/switchboard\/operator:/ }
+    ]
+  },
+  {
+    artifact: "assets/operator/docker-compose.yaml",
+    checks: [
+      { label: "old private operator image default", pattern: /ghcr\.io\/(?:proof-computer|mooselabs)\/switchboard\/operator:/ }
+    ]
+  },
+  {
+    artifact: "assets/operator/operator.env.example",
+    checks: [
+      { label: "old private operator image default", pattern: /ghcr\.io\/(?:proof-computer|mooselabs)\/switchboard\/operator:/ }
     ]
   }
 ];

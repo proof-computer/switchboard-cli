@@ -6510,7 +6510,7 @@ Operator setup:
   --management-address <address>   Alias for --manager-address
   --public-address <ip-or-host>    Default fetched with curl --ipv4 https://ifconfig.me/ip
   --env-file <path>                Default .operator-host/operator.env
-  --image-registry <registry/ns>   Default ghcr.io/proof-computer/switchboard
+  --image-registry <registry/ns>   Default ghcr.io/proof-computer/switchboard-gateway
   --image-tag <tag>                Default latest
   --skip-install                   Do not install Docker/Compose if missing
   --skip-compose                   Write config but do not launch compose
@@ -6540,6 +6540,7 @@ Operator status and upgrade:
   --gateway-agent-url <url>        Status check URL, default http://127.0.0.1:18080
   --capability-url <url>           Relay capability lookup URL
   --dry-run                        For upgrade, print docker compose commands only
+  --keep-image-override            For upgrade, keep old/custom image env overrides
 
 Launch demo:
   switchboard launch-demo --yes-spend

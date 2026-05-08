@@ -57,10 +57,11 @@ services:
       - operator
 
   gateway-agent:
-    image: ${GATEWAY_AGENT_IMAGE:-ghcr.io/proof-computer/switchboard/operator:latest}
+    image: ${GATEWAY_AGENT_IMAGE:-ghcr.io/proof-computer/switchboard-gateway/gateway:latest}
     command:
-      - pnpm
-      - operator:gateway-agent
+      - npm
+      - run
+      - gateway:agent
     environment:
       PROOF_API_URL: ${PROOF_API_URL:-}
       GATEWAY_ID: ${GATEWAY_ID:-}
@@ -77,6 +78,7 @@ services:
       GATEWAY_ROUTE_STATE_TOKEN: ${GATEWAY_ROUTE_STATE_TOKEN:-}
       GATEWAY_ROUTE_STATE_POLL_INTERVAL_MS: ${GATEWAY_ROUTE_STATE_POLL_INTERVAL_MS:-5000}
       GATEWAY_ROUTE_STATE_TIMEOUT_MS: ${GATEWAY_ROUTE_STATE_TIMEOUT_MS:-5000}
+      GATEWAY_ROUTE_STATE_REMOVAL_GRACE_MS: ${GATEWAY_ROUTE_STATE_REMOVAL_GRACE_MS:-15000}
       GATEWAY_ROUTE_CAPACITY: ${GATEWAY_ROUTE_CAPACITY:-500}
       OPERATOR_PUBLIC_ADDRESSES: ${OPERATOR_PUBLIC_ADDRESSES:-}
       OPERATOR_PUBLIC_ADDRESS_MODE: ${OPERATOR_PUBLIC_ADDRESS_MODE:-}
@@ -114,10 +116,11 @@ services:
       - operator
 
   hub-watcher:
-    image: ${HUB_WATCHER_IMAGE:-ghcr.io/proof-computer/switchboard/operator:latest}
+    image: ${HUB_WATCHER_IMAGE:-ghcr.io/proof-computer/switchboard-gateway/gateway:latest}
     command:
-      - pnpm
-      - operator:hub-watcher
+      - npm
+      - run
+      - gateway:hub-watcher
     environment:
       HUB_ETH_RPC_URL: ${HUB_ETH_RPC_URL:-https://services.polkadothub-rpc.com/mainnet}
       HUB_CHAIN_PROFILE: ${HUB_CHAIN_PROFILE:-polkadot-hub}
@@ -146,7 +149,7 @@ services:
       - operator
 
   tls-test-upstream:
-    image: ${TLS_TEST_UPSTREAM_IMAGE:-ghcr.io/proof-computer/switchboard/tls-test-upstream:latest}
+    image: ${TLS_TEST_UPSTREAM_IMAGE:-ghcr.io/proof-computer/switchboard-gateway/tls-test-upstream:latest}
     profiles:
       - test-upstream
     restart: unless-stopped

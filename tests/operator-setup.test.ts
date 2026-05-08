@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -9,7 +9,10 @@ import {
   composePullServicesCommand,
   composeUpCommand,
   mergeOperatorEnv,
+  migrateLegacyGatewayImage,
+  migrateLegacyTlsTestUpstreamImage,
   parseOsRelease,
+  planOperatorImageMigration,
   setupOperator,
   shouldPrompt
 } from "../scripts/operator/setup.js";
@@ -186,6 +189,8 @@ describe("operator setup helpers", () => {
     assert.match(compose, /envoyproxy\/envoy:v1\.35-latest/);
     assert.match(compose, /victoriametrics\/victoria-metrics:latest/);
     assert.match(compose, /grafana\/grafana-oss:latest/);
+    assert.match(compose, /ghcr\.io\/proof-computer\/switchboard-gateway\/gateway:latest/);
+    assert.doesNotMatch(compose, /ghcr\.io\/proof-computer\/switchboard\/operator:latest/);
     assert.match(compose, /docker\/envoy\/envoy\.yaml/);
     assert.match(compose, /docker\/victoria-metrics\/promscrape\.yml/);
     assert.match(compose, /docker\/grafana\/provisioning/);
@@ -198,10 +203,53 @@ describe("operator setup helpers", () => {
     );
 
     const env = await readFile(path.join(projectDir, ".operator-host", "operator.env"), "utf8");
+    assert.match(env, /^GATEWAY_AGENT_IMAGE=ghcr\.io\/proof-computer\/switchboard-gateway\/gateway:latest$/m);
+    assert.match(env, /^HUB_WATCHER_IMAGE=ghcr\.io\/proof-computer\/switchboard-gateway\/gateway:latest$/m);
     assert.match(env, /^OPERATOR_ID=$/m);
     assert.match(env, /^ACURAST_RPC=wss:\/\/archive\.mainnet\.acurast\.com$/m);
     assert.match(env, /^INGRESS_REGISTRY_ADDRESS=0x65d6B76BeC50F46D198fFa3598E381a298025Da0$/m);
     assert.match(env, /^PROOF_NETWORK_MANIFEST_URL=https:\/\/control\.switchboard\.proof\.computer\/v1\/network-manifest$/m);
+  });
+
+  it("migrates known old operator image defaults during upgrade planning", async () => {
+    assert.equal(
+      migrateLegacyGatewayImage("ghcr.io/proof-computer/switchboard/operator:sha-deadbee"),
+      "ghcr.io/proof-computer/switchboard-gateway/gateway:sha-deadbee"
+    );
+    assert.equal(
+      migrateLegacyGatewayImage("ghcr.io/mooselabs/switchboard/operator:latest"),
+      "ghcr.io/proof-computer/switchboard-gateway/gateway:latest"
+    );
+    assert.equal(migrateLegacyGatewayImage("ghcr.io/example/custom/operator:latest"), undefined);
+    assert.equal(
+      migrateLegacyTlsTestUpstreamImage("ghcr.io/proof-computer/switchboard/tls-test-upstream:sha-deadbee"),
+      "ghcr.io/proof-computer/switchboard-gateway/tls-test-upstream:sha-deadbee"
+    );
+
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-upgrade-"));
+    const envFile = path.join(projectDir, ".operator-host", "operator.env");
+    await mkdir(path.dirname(envFile), { recursive: true });
+    await writeFile(
+      envFile,
+      [
+        "GATEWAY_AGENT_IMAGE=ghcr.io/proof-computer/switchboard/operator:sha-old",
+        "HUB_WATCHER_IMAGE=ghcr.io/mooselabs/switchboard/operator:latest",
+        "TLS_TEST_UPSTREAM_IMAGE=ghcr.io/proof-computer/switchboard/tls-test-upstream:sha-old",
+        "ENVOY_IMAGE=envoyproxy/envoy:v1.35-latest",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    const migration = await planOperatorImageMigration(envFile, false);
+    assert.deepEqual(migration.updates, {
+      GATEWAY_AGENT_IMAGE: "ghcr.io/proof-computer/switchboard-gateway/gateway:sha-old",
+      HUB_WATCHER_IMAGE: "ghcr.io/proof-computer/switchboard-gateway/gateway:latest",
+      TLS_TEST_UPSTREAM_IMAGE: "ghcr.io/proof-computer/switchboard-gateway/tls-test-upstream:sha-old"
+    });
+
+    const kept = await planOperatorImageMigration(envFile, true);
+    assert.equal(kept.updates, undefined);
   });
 
   it("records explicit site processor includes during setup", async () => {
