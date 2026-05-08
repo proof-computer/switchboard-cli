@@ -192,6 +192,7 @@ interface DeploymentSchedule {
 
 const SWITCHBOARD_DEPLOY_PREFIX = "[switchboard-deploy]";
 const DEFAULT_JOB_CONTROL_PLANE_REGISTER_TIMEOUT_MS = 300_000;
+const DEFAULT_ROUTE_ACTIVATION_TIMEOUT_MS = 600_000;
 const JOB_CONTROL_PLANE_REGISTER_TIMEOUT_MESSAGE =
   "the job did not call the register with the control plane. Please report issues.";
 
@@ -1159,7 +1160,7 @@ function loadConfig(flags: Map<string, string | boolean>): HarnessConfig {
       numberEnv("SWITCHBOARD_DEPLOY_RUNTIME_TIMEOUT_MS", runtimeTimeoutDefaultMs)
     ),
     registrationTimeoutMs: numberFlag(flags, "registration-timeout-ms", numberEnv("SWITCHBOARD_DEPLOY_REGISTRATION_TIMEOUT_MS", 300_000)),
-    routeTimeoutMs: numberFlag(flags, "route-timeout-ms", numberEnv("SWITCHBOARD_DEPLOY_ROUTE_TIMEOUT_MS", 180_000)),
+    routeTimeoutMs: numberFlag(flags, "route-timeout-ms", numberEnv("SWITCHBOARD_DEPLOY_ROUTE_TIMEOUT_MS", DEFAULT_ROUTE_ACTIVATION_TIMEOUT_MS)),
     certificateMode,
     certificateHostnames: unique(certificateHostnames),
     publicProbeInsecure:

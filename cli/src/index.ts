@@ -5229,13 +5229,25 @@ export function deployFailureSummary(lower: string): { stage: string; impact: st
       impact: "The Acurast job was submitted and claimed, but Switchboard funding did not complete before route setup."
     };
   }
+  if (lower.includes("certificate_hostname_lock_unavailable") || lower.includes("certificate_lock")) {
+    return {
+      stage: "Issuing the job certificate",
+      impact: "The job registered, but another HA member was already issuing a certificate for the shared hostname."
+    };
+  }
   if (lower.includes("timed out waiting for public route") || lower.includes("public https route") || lower.includes("public route")) {
     return {
       stage: "Verifying the public HTTPS route",
       impact: "The route was created, but the public gateway did not become reachable before the route timeout."
     };
   }
-  if (lower.includes("canonical dns") || lower.includes("dns materialization")) {
+  if (lower.includes("route activation") || lower.includes("route reconciled") || lower.includes("activated route") || lower.includes("runtime_https_not_ready")) {
+    return {
+      stage: "Activating the public route",
+      impact: "The job registered, but Switchboard did not finish HTTPS route activation before the timeout."
+    };
+  }
+  if (lower.includes("canonical dns") || lower.includes("dns materialization") || lower.includes("dns_not_propagated")) {
     return {
       stage: "Publishing canonical DNS",
       impact: "The job was claimed, but the relay did not publish or observe the canonical DNS record in time."
@@ -5257,12 +5269,6 @@ export function deployFailureSummary(lower: string): { stage: string; impact: st
     return {
       stage: "Confirming Hub registration",
       impact: "Funding completed, but the Hub registration was not observed before the deploy runner stopped."
-    };
-  }
-  if (lower.includes("route activation") || lower.includes("route reconciled") || lower.includes("activated route")) {
-    return {
-      stage: "Activating the public route",
-      impact: "The job registered, but Switchboard did not finish route activation before the timeout."
     };
   }
   if (lower.includes("acurast")) {

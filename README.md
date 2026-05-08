@@ -52,7 +52,7 @@ Rerun the same command to upgrade an existing install. Each run downloads a
 fresh release package, replaces the installed `switchboard-cli` package under
 the install home, and rewrites the launcher.
 
-Pin a release with `SWITCHBOARD_CLI_VERSION=v0.1.0`, or override the package
+Pin a release with `SWITCHBOARD_CLI_VERSION=v0.1.1`, or override the package
 URL directly with `SWITCHBOARD_CLI_PACKAGE_URL`. The control-plane installer
 mirror at `https://control.switchboard.proof.computer/install.sh` serves the
 same installer after rollout.

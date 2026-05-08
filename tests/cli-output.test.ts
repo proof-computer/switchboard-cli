@@ -111,4 +111,28 @@ describe("switchboard CLI output helpers", () => {
     );
     assert.equal(summary.stage, "Verifying the public HTTPS route");
   });
+
+  it("reports certificate lock contention ahead of earlier DNS log lines", () => {
+    const summary = deployFailureSummary(
+      [
+        "waiting for canonical dns e.example status=written",
+        "timed out waiting for network route activation after 180000ms",
+        "reason=runtime_https_not_ready",
+        "certificate_hostname_lock_unavailable",
+        "stage=certificate_lock"
+      ].join("\n")
+    );
+    assert.equal(summary.stage, "Issuing the job certificate");
+  });
+
+  it("reports route activation ahead of earlier DNS log lines", () => {
+    const summary = deployFailureSummary(
+      [
+        "waiting for canonical dns e.example status=written",
+        "timed out waiting for network route activation after 180000ms",
+        "reason=runtime_https_not_ready"
+      ].join("\n")
+    );
+    assert.equal(summary.stage, "Activating the public route");
+  });
 });
