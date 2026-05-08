@@ -72,6 +72,7 @@ import {
 } from "./catalog/index.js";
 import { contextAddCommand } from "./context/add.js";
 import { contextDnsClearCommand, contextDnsSetCommand } from "./context/dns.js";
+import { checkMnemonicSeed, checkSeedAddressMatch } from "./preflight/mnemonic-check.js";
 import {
   compactId,
   createGroupedDeployTranscriptWriter,
@@ -1262,13 +1263,26 @@ async function preflightCommand(flags: Map<string, string | boolean>, runtime: C
   }
 
   const acurastSeed = acurastSeedFromRuntime(runtime);
-  addCheck("Acurast deploy seed", Boolean(acurastSeed), contextEnvDetail(runtime, "acurastSeedEnv", "ACURAST_MAINNET_SEED or ACURAST_SEED"));
+  const acurastSeedCheck = checkMnemonicSeed(
+    acurastSeed,
+    contextEnvDetail(runtime, "acurastSeedEnv", "ACURAST_MAINNET_SEED or ACURAST_SEED")
+  );
+  addCheck("Acurast deploy seed", acurastSeedCheck.ok, acurastSeedCheck.detail);
+  const acurastAddress = acurastAddressFromRuntime(runtime);
   addCheck(
     "Acurast deploy address",
-    Boolean(acurastAddressFromRuntime(runtime)),
+    Boolean(acurastAddress),
     contextEnvDetail(runtime, "acurastAddressEnv", "ACURAST_MAINNET_ADDRESS or ACURAST_ADDRESS"),
     false
   );
+  if (acurastSeedCheck.ok && acurastSeed && acurastAddress) {
+    const match = await checkSeedAddressMatch(
+      acurastSeed,
+      acurastAddress,
+      contextEnvDetail(runtime, "acurastAddressEnv", "ACURAST_MAINNET_ADDRESS")
+    );
+    addCheck("Acurast seed/address match", match.ok, match.detail);
+  }
 
   const paymentMode = stringFlag(flags, "payment-mode") === "public-price" ? "public-price" : "quote";
   if (paymentMode === "quote") {
@@ -1285,8 +1299,18 @@ async function preflightCommand(flags: Map<string, string | boolean>, runtime: C
         );
       }
     } else {
-      addCheck("Polkadot payment seed", Boolean(contextEnv(runtime.context?.polkadotSeedEnv) ?? optionalEnv("POLKADOT_SEED")), contextEnvDetail(runtime, "polkadotSeedEnv", "POLKADOT_SEED"));
-      addCheck("Polkadot payment address", Boolean(polkadotAddressFromRuntime(runtime)), polkadotAddressDetail(runtime), false);
+      const polkadotSeed = contextEnv(runtime.context?.polkadotSeedEnv) ?? optionalEnv("POLKADOT_SEED");
+      const polkadotSeedCheck = checkMnemonicSeed(
+        polkadotSeed,
+        contextEnvDetail(runtime, "polkadotSeedEnv", "POLKADOT_SEED")
+      );
+      addCheck("Polkadot payment seed", polkadotSeedCheck.ok, polkadotSeedCheck.detail);
+      const polkadotAddress = polkadotAddressFromRuntime(runtime);
+      addCheck("Polkadot payment address", Boolean(polkadotAddress), polkadotAddressDetail(runtime), false);
+      if (polkadotSeedCheck.ok && polkadotSeed && polkadotAddress) {
+        const match = await checkSeedAddressMatch(polkadotSeed, polkadotAddress, polkadotAddressDetail(runtime));
+        addCheck("Polkadot seed/address match", match.ok, match.detail);
+      }
     }
     addCheck(
       "payment asset",
