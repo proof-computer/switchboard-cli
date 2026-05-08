@@ -24,9 +24,13 @@ jobs:
       - name: Pack release assets
         run: |
           mkdir -p artifacts
-          npm pack --json --ignore-scripts --pack-destination artifacts > "$RUNNER_TEMP/npm-pack.json"
-          pkg_file="$(node -e "const fs = require('fs'); const p = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'))[0]; console.log(p.filename);" "$RUNNER_TEMP/npm-pack.json")"
-          cp "artifacts/$pkg_file" artifacts/switchboard-cli.tgz
+          npm_config_ignore_scripts=true npm pack --pack-destination artifacts > "$RUNNER_TEMP/npm-pack.log"
+          pkg_file="$(find artifacts -maxdepth 1 -type f -name 'switchboard-cli-*.tgz' -print -quit)"
+          if [ -z "$pkg_file" ]; then
+            cat "$RUNNER_TEMP/npm-pack.log"
+            exit 1
+          fi
+          cp "$pkg_file" artifacts/switchboard-cli.tgz
           cp install.sh artifacts/install.sh
           (
             cd artifacts
