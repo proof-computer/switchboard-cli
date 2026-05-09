@@ -1299,16 +1299,13 @@ async function preflightCommand(flags: Map<string, string | boolean>, runtime: C
         );
       }
     } else {
-      const polkadotSeed = contextEnv(runtime.context?.polkadotSeedEnv) ?? optionalEnv("POLKADOT_SEED");
-      const polkadotSeedCheck = checkMnemonicSeed(
-        polkadotSeed,
-        contextEnvDetail(runtime, "polkadotSeedEnv", "POLKADOT_SEED")
-      );
+      const polkadotSeed = stringFlag(flags, "polkadot-seed") ?? nativePaymentSeedFromRuntime(runtime);
+      const polkadotSeedCheck = checkMnemonicSeed(polkadotSeed, nativePaymentSeedDetail(flags, runtime));
       addCheck("Polkadot payment seed", polkadotSeedCheck.ok, polkadotSeedCheck.detail);
-      const polkadotAddress = polkadotAddressFromRuntime(runtime);
-      addCheck("Polkadot payment address", Boolean(polkadotAddress), polkadotAddressDetail(runtime), false);
+      const polkadotAddress = stringFlag(flags, "polkadot-address") ?? nativePaymentAddressFromRuntime(runtime);
+      addCheck("Polkadot payment address", Boolean(polkadotAddress), nativePaymentAddressDetail(flags, runtime), false);
       if (polkadotSeedCheck.ok && polkadotSeed && polkadotAddress) {
-        const match = await checkSeedAddressMatch(polkadotSeed, polkadotAddress, polkadotAddressDetail(runtime));
+        const match = await checkSeedAddressMatch(polkadotSeed, polkadotAddress, nativePaymentAddressDetail(flags, runtime));
         addCheck("Polkadot seed/address match", match.ok, match.detail);
       }
     }
@@ -1470,7 +1467,10 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     durationMinutes,
     scheduleBufferMinutes,
     processorCount: requestedProcessorCount,
-    minReady: minReadyProcessors
+    minReady: minReadyProcessors,
+    operatorId: stringFlag(flags, "operator-id"),
+    gatewayId: stringFlag(flags, "gateway-id"),
+    processor: stringFlag(flags, "processor")
   });
   const demoProject = await createLaunchDemoProject(flags);
 
@@ -1759,11 +1759,25 @@ async function selectLaunchDemoCapacity(input: {
   scheduleBufferMinutes: number;
   processorCount: number;
   minReady: number;
+  operatorId?: string;
+  gatewayId?: string;
+  processor?: string;
 }): Promise<LaunchDemoCapacitySelection> {
   const reports = await readLaunchDemoCapabilityReports(input.relayUrl);
   const errors: string[] = [];
+  const requestedOperatorId = input.operatorId?.toLowerCase();
+  const requestedProcessorId = input.processor ? processorRefToId(input.processor) : undefined;
+  if (input.processor && !requestedProcessorId) {
+    throw new Error(`Cannot normalize pinned processor ${input.processor}; expected a 32-byte hex processor ID or SS58 processor address.`);
+  }
   const eligibleReports = reports
     .filter((stored) => {
+      if (requestedOperatorId && stored.report.operator.operatorId.toLowerCase() !== requestedOperatorId) {
+        return false;
+      }
+      if (input.gatewayId && stored.report.operator.gatewayId !== input.gatewayId) {
+        return false;
+      }
       const reason = launchDemoReportEligibilityReason(stored.report);
       if (reason) {
         errors.push(`${stored.report.operator.gatewayId}: ${reason}`);
@@ -1798,6 +1812,9 @@ async function selectLaunchDemoCapacity(input: {
         const excludedIds = new Set(
           (scope.excludeProcessors ?? []).map((value) => processorRefToId(value)).filter((value): value is string => Boolean(value))
         );
+        if (requestedProcessorId) {
+          allowedIds.add(requestedProcessorId);
+        }
         const inventory = await discoverManagerProcessors({
           network: input.network,
           managerId: scope.managerId,
@@ -1810,6 +1827,9 @@ async function selectLaunchDemoCapacity(input: {
               const processorId = processorRefToId(processor);
               if (processorId && excludedIds.has(processorId)) {
                 return false;
+              }
+              if (requestedProcessorId) {
+                return processorId === requestedProcessorId;
               }
               return allowed.size === 0 || allowed.has(processor) || Boolean(processorId && allowedIds.has(processorId));
             });
@@ -1873,7 +1893,13 @@ async function selectLaunchDemoCapacity(input: {
 
   if (candidates.length < input.processorCount) {
     const reason = errors.length > 0 ? ` Checked: ${errors.slice(0, 5).join("; ")}` : "";
-    throw new Error(`Only ${candidates.length}/${input.processorCount} launch-demo processors are currently available from ${input.relayUrl}.${reason}`);
+    const pinned = [
+      input.operatorId ? `operator ${input.operatorId}` : undefined,
+      input.gatewayId ? `gateway ${input.gatewayId}` : undefined,
+      input.processor ? `processor ${input.processor}` : undefined
+    ].filter(Boolean).join(", ");
+    const scope = pinned ? ` for ${pinned}` : "";
+    throw new Error(`Only ${candidates.length}/${input.processorCount} launch-demo processors are currently available from ${input.relayUrl}${scope}.${reason}`);
   }
 
   const selectedMembers = selectLaunchDemoMembers(candidates, input.processorCount);
@@ -3428,7 +3454,8 @@ async function resolvePolkadotHubSigner(
   try {
     const ss58Format = Number(stringFlag(flags, "ss58-format") ?? optionalEnv("POLKADOT_SS58_FORMAT") ?? String(api.registry.chainSS58 ?? 0));
     const signerKind = polkadotSignerKind(flags);
-    const configuredAddress = stringFlag(flags, "polkadot-address") ?? optionalEnv("POLKADOT_ADDRESS");
+    const configuredAddress = stringFlag(flags, "polkadot-address") ?? nativePaymentAddressFromEnv();
+    const seed = stringFlag(flags, "polkadot-seed") ?? nativePaymentSeedFromEnv();
     const account = signerKind === "ledger"
       ? await ledgerAccount({
           api,
@@ -3444,10 +3471,10 @@ async function resolvePolkadotHubSigner(
           metadataChainId: stringFlag(flags, "ledger-metadata-chain-id") ?? optionalEnv("PROOF_LEDGER_METADATA_CHAIN_ID"),
           metadataUrl: stringFlag(flags, "ledger-metadata-url") ?? optionalEnv("PROOF_LEDGER_METADATA_URL")
         })
-      : await accountFromUri(requiredStringFlag(flags, "polkadot-seed", "POLKADOT_SEED"), ss58Format);
+      : await accountFromUri(requiredValue(seed, "POLKADOT_SEED or ACURAST_MAINNET_SEED"), ss58Format);
 
     if (configuredAddress && !samePolkadotAddress(configuredAddress, account.address)) {
-      throw new Error(`POLKADOT_SEED resolves to ${account.address}, not POLKADOT_ADDRESS ${configuredAddress}`);
+      throw new Error(`Configured native payment seed resolves to ${account.address}, not configured payment address ${configuredAddress}`);
     }
 
     const mappedAddress = await contractLayerAddress(api, account.address);
@@ -3658,8 +3685,12 @@ function hasPolkadotSignerConfig(flags: Map<string, string | boolean>): boolean 
   return Boolean(
     stringFlag(flags, "polkadot-seed") ||
     optionalEnv("POLKADOT_SEED") ||
+    optionalEnv("ACURAST_MAINNET_SEED") ||
+    optionalEnv("ACURAST_SEED") ||
     stringFlag(flags, "polkadot-address") ||
     optionalEnv("POLKADOT_ADDRESS") ||
+    optionalEnv("ACURAST_MAINNET_ADDRESS") ||
+    optionalEnv("ACURAST_ADDRESS") ||
     boolFlag(flags, "ledger") ||
     stringFlag(flags, "polkadot-signer") === "ledger" ||
     optionalEnv("PROOF_POLKADOT_SIGNER") === "ledger"
@@ -5833,8 +5864,8 @@ function applyRuntimeDefaults(
   setString("payment-mode", context?.paymentMode);
   setString("network", context?.acurastNetwork);
   setString("polkadot-signer", context?.polkadotSigner);
-  setString("polkadot-seed", contextEnv(context?.polkadotSeedEnv));
-  setString("polkadot-address", polkadotAddressFromRuntime(runtime));
+  setString("polkadot-seed", nativePaymentSeedFromRuntime(runtime));
+  setString("polkadot-address", nativePaymentAddressFromRuntime(runtime));
   setString("ss58-format", context?.polkadotSs58Format);
   setString("ledger-mode", context?.ledgerMode);
   setString("ledger-transport", context?.ledgerTransport);
@@ -5900,26 +5931,75 @@ function contextEnvDetail(runtime: CliRuntime, key: keyof SwitchboardContext, fa
   return typeof envName === "string" && envName.length > 0 ? `${envName} via context ${runtime.contextName}` : fallback;
 }
 
-function polkadotAddressDetail(runtime: CliRuntime): string {
+function nativePaymentSeedDetail(flags: Map<string, string | boolean>, runtime: CliRuntime): string {
+  if (stringFlag(flags, "polkadot-seed")) {
+    return "--polkadot-seed";
+  }
+  if (runtime.context?.polkadotSeedEnv) {
+    return `${runtime.context.polkadotSeedEnv} via context ${runtime.contextName}`;
+  }
+  if (optionalEnv("POLKADOT_SEED")) {
+    return "POLKADOT_SEED";
+  }
+  if (runtime.context?.acurastSeedEnv && contextEnv(runtime.context.acurastSeedEnv)) {
+    return `${runtime.context.acurastSeedEnv} via Acurast deploy context`;
+  }
+  if (optionalEnv("ACURAST_MAINNET_SEED")) {
+    return "ACURAST_MAINNET_SEED as payment fallback";
+  }
+  if (optionalEnv("ACURAST_SEED")) {
+    return "ACURAST_SEED as payment fallback";
+  }
+  return "POLKADOT_SEED or ACURAST_MAINNET_SEED";
+}
+
+function nativePaymentAddressDetail(flags: Map<string, string | boolean>, runtime: CliRuntime): string {
+  if (stringFlag(flags, "polkadot-address")) {
+    return "--polkadot-address";
+  }
   if (runtime.context?.polkadotAddressEnv) {
     return `${runtime.context.polkadotAddressEnv} via context ${runtime.contextName}`;
   }
   if (runtime.context?.polkadotAddress) {
     return `${runtime.context.polkadotAddress} via context ${runtime.contextName}`;
   }
-  return "POLKADOT_ADDRESS";
+  if (optionalEnv("POLKADOT_ADDRESS")) {
+    return "POLKADOT_ADDRESS";
+  }
+  if (runtime.context?.acurastAddressEnv && contextEnv(runtime.context.acurastAddressEnv)) {
+    return `${runtime.context.acurastAddressEnv} via Acurast deploy context`;
+  }
+  if (optionalEnv("ACURAST_MAINNET_ADDRESS")) {
+    return "ACURAST_MAINNET_ADDRESS as payment fallback";
+  }
+  if (optionalEnv("ACURAST_ADDRESS")) {
+    return "ACURAST_ADDRESS as payment fallback";
+  }
+  return "POLKADOT_ADDRESS or ACURAST_MAINNET_ADDRESS";
 }
 
-function acurastSeedFromRuntime(runtime: CliRuntime): string | undefined {
+function acurastSeedFromRuntime(runtime: Pick<CliRuntime, "context">): string | undefined {
   return contextEnv(runtime.context?.acurastSeedEnv) ?? optionalEnv("ACURAST_MAINNET_SEED") ?? optionalEnv("ACURAST_SEED");
 }
 
-function acurastAddressFromRuntime(runtime: CliRuntime): string | undefined {
+function acurastAddressFromRuntime(runtime: Pick<CliRuntime, "context">): string | undefined {
   return contextEnv(runtime.context?.acurastAddressEnv) ?? optionalEnv("ACURAST_MAINNET_ADDRESS") ?? optionalEnv("ACURAST_ADDRESS");
 }
 
-function polkadotAddressFromRuntime(runtime: CliRuntime): string | undefined {
-  return contextEnv(runtime.context?.polkadotAddressEnv) ?? runtime.context?.polkadotAddress ?? optionalEnv("POLKADOT_ADDRESS");
+export function nativePaymentSeedFromRuntime(runtime: Pick<CliRuntime, "context">): string | undefined {
+  return contextEnv(runtime.context?.polkadotSeedEnv) ?? nativePaymentSeedFromEnv() ?? acurastSeedFromRuntime(runtime);
+}
+
+export function nativePaymentAddressFromRuntime(runtime: Pick<CliRuntime, "context">): string | undefined {
+  return contextEnv(runtime.context?.polkadotAddressEnv) ?? runtime.context?.polkadotAddress ?? nativePaymentAddressFromEnv() ?? acurastAddressFromRuntime(runtime);
+}
+
+function nativePaymentSeedFromEnv(): string | undefined {
+  return optionalEnv("POLKADOT_SEED") ?? optionalEnv("ACURAST_MAINNET_SEED") ?? optionalEnv("ACURAST_SEED");
+}
+
+function nativePaymentAddressFromEnv(): string | undefined {
+  return optionalEnv("POLKADOT_ADDRESS") ?? optionalEnv("ACURAST_MAINNET_ADDRESS") ?? optionalEnv("ACURAST_ADDRESS");
 }
 
 function developerPrivateKeyFromRuntime(runtime: CliRuntime): string | undefined {
@@ -5934,8 +6014,8 @@ function contextRuntimeEnv(runtime: CliRuntime): Record<string, string | undefin
   return {
     ACURAST_MAINNET_SEED: acurastSeedFromRuntime(runtime),
     ACURAST_MAINNET_ADDRESS: acurastAddressFromRuntime(runtime),
-    POLKADOT_SEED: contextEnv(runtime.context?.polkadotSeedEnv) ?? optionalEnv("POLKADOT_SEED"),
-    POLKADOT_ADDRESS: polkadotAddressFromRuntime(runtime),
+    POLKADOT_SEED: nativePaymentSeedFromRuntime(runtime),
+    POLKADOT_ADDRESS: nativePaymentAddressFromRuntime(runtime),
     POLKADOT_SS58_FORMAT: runtime.context?.polkadotSs58Format ?? optionalEnv("POLKADOT_SS58_FORMAT"),
     PROOF_POLKADOT_SIGNER: runtime.context?.polkadotSigner ?? optionalEnv("PROOF_POLKADOT_SIGNER"),
     PROOF_LEDGER_MODE: runtime.context?.ledgerMode ?? optionalEnv("PROOF_LEDGER_MODE"),
@@ -6339,6 +6419,14 @@ function requiredStringFlag(flags: Map<string, string | boolean>, flagName: stri
   return value;
 }
 
+function requiredValue(value: string | undefined, label: string): string {
+  if (!value) {
+    throw new Error(`Missing ${label}`);
+  }
+
+  return value;
+}
+
 function optionalIntegerFlag(flags: Map<string, string | boolean>, flagName: string, envName: string): number | undefined {
   const value = stringFlag(flags, flagName) ?? optionalEnv(envName);
   return value ? parseIntegerFlagValue(flagName, value) : undefined;
@@ -6479,7 +6567,7 @@ Common flags:
   --polkadot-signer <mode>         seed (default) or ledger
   --hub-signer <mode>              evm or polkadot for claim/refund transactions
   --polkadot-address <address>     Native account used for USDC quote funding
-  --polkadot-seed <uri>            Native account seed for USDC quote funding
+  --polkadot-seed <uri>            Native account seed for USDC quote funding; defaults to the Acurast seed when unset
   --ledger                         Alias for --polkadot-signer ledger
   --ledger-mode <mode>             generic (Polkadot app) or legacy (Statemint app)
   --ledger-account <n>             Ledger account index, default 0
@@ -6531,6 +6619,7 @@ Project config:
 
 Contexts:
   switchboard context add mainnet
+  switchboard context set mainnet --use --acurast-seed-env ACURAST_MAINNET_SEED --acurast-address-env ACURAST_MAINNET_ADDRESS
   switchboard context set mainnet --use --polkadot-address-env POLKADOT_ADDRESS --polkadot-seed-env POLKADOT_SEED
   switchboard context set ledger --use --polkadot-signer ledger --polkadot-address <address> --ledger-account 0
   switchboard context use mainnet
@@ -6646,6 +6735,7 @@ Deploy defaults:
   --relay-url <url>                Default ${DEFAULT_CONTROL_PLANE_URL}
   Operator/manager/processor       Auto-selected from live operator capacity unless pinned
   --operator-id <bytes32>          Pin to one operator ID
+  --gateway-id <id>                Pin launch-demo/deploy capacity to one gateway ID
   --processor <account>            Pin to one Acurast processor
   --duration-minutes <minutes>     Default ${DEFAULT_DEPLOY_DURATION_MINUTES}; derives lease seconds and job runtime
   --lease-minutes <minutes>        Alias for --duration-minutes
