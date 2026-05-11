@@ -86,18 +86,7 @@ function mapAcurastScriptArgs(args: string[]): string[] {
   }
 }
 
-function packagedJobBundleName(entrypoint: string | undefined): "validator-job" | undefined {
-  if (!entrypoint) {
-    return undefined;
-  }
-  const normalized = entrypoint.replace(/\\/g, "/");
-  if (
-    normalized === "validator-job" ||
-    normalized === "src/jobs/validator-job.ts" ||
-    normalized.endsWith("/src/jobs/validator-job.ts")
-  ) {
-    return "validator-job";
-  }
+function packagedJobBundleName(_entrypoint: string | undefined): undefined {
   return undefined;
 }
 

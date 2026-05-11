@@ -160,6 +160,7 @@ export type CommandName =
   | "hostname-remove"
   | "hostname-status"
   | "validator-launch"
+  | "validator-script"
   | "operator-setup"
   | "operator-discover"
   | "operator-status"
@@ -496,6 +497,11 @@ async function main() {
 
   if (parsed.command === "validator-launch") {
     await validatorLaunchCommand(flags, runtime);
+    return;
+  }
+
+  if (parsed.command === "validator-script") {
+    await validatorScriptCommand(flags);
     return;
   }
 
@@ -1411,6 +1417,7 @@ interface LaunchDemoProject {
   dir: string;
   entrypoint: string;
   packageSpec: string;
+  packageVersion?: string;
 }
 
 async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: CliRuntime) {
@@ -1541,6 +1548,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     SWITCHBOARD_DEPLOY_EXPECTED_REPLICAS: groupDeployEnabled ? String(selection.members.length) : undefined,
     SWITCHBOARD_DEPLOY_MIN_READY: groupDeployEnabled ? String(minReadyProcessors) : undefined,
     SWITCHBOARD_LAUNCH_DEMO: "true",
+    SWITCHBOARD_DEMO_VERSION: demoProject.packageVersion,
     ACURAST_MAX_COST_PER_EXECUTION: maxCostPerExecution,
     ACURAST_START_DELAY_MS: String(DEFAULT_LAUNCH_DEMO_START_DELAY_MS),
     ACURAST_EXECUTION_MS: String((durationMinutes + scheduleBufferMinutes) * 60_000),
@@ -1661,6 +1669,7 @@ async function createLaunchDemoProject(flags: Map<string, string | boolean>): Pr
     stringFlag(flags, "demo-package") ??
     optionalEnv("SWITCHBOARD_LAUNCH_DEMO_PACKAGE_SPEC") ??
     DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC;
+  const packageVersion = await launchDemoPackageVersion(packageSpec);
   const dir = await mkdtemp(path.join(tmpdir(), "switchboard-launch-demo-"));
   await mkdir(path.join(dir, "src"), { recursive: true });
   await writeFile(
@@ -1698,7 +1707,22 @@ void startSwitchboardExpressDemo().catch((error) => {
 `
   );
   await writeFile(path.join(dir, ".gitignore"), "node_modules/\ndist/\n.acurast/\n.switchboard/\n.env\n.env.*\n");
-  return { dir, entrypoint: LAUNCH_DEMO_ENTRYPOINT, packageSpec };
+  return { dir, entrypoint: LAUNCH_DEMO_ENTRYPOINT, packageSpec, packageVersion };
+}
+
+async function launchDemoPackageVersion(packageSpec: string): Promise<string | undefined> {
+  if (packageSpec.startsWith("file:")) {
+    const rawPath = packageSpec.slice("file:".length);
+    const packageDir = rawPath.startsWith("/") ? rawPath : path.resolve(process.cwd(), rawPath);
+    try {
+      const parsed = JSON.parse(await readFile(path.join(packageDir, "package.json"), "utf8")) as { version?: unknown };
+      return typeof parsed.version === "string" && parsed.version.length > 0 ? parsed.version : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  const tag = packageSpec.match(/#v?([0-9]+(?:\.[0-9]+){1,2}(?:[-+][A-Za-z0-9.-]+)?)$/)?.[1];
+  return tag;
 }
 
 async function installLaunchDemoProject(project: LaunchDemoProject, flags: Map<string, string | boolean>): Promise<void> {
@@ -2470,18 +2494,7 @@ export async function resolveLaunchDemoEstimateRunner(
   };
 }
 
-function packagedJobBundleName(entrypoint: string | undefined): "validator-job" | undefined {
-  if (!entrypoint) {
-    return undefined;
-  }
-  const normalized = entrypoint.replace(/\\/g, "/");
-  if (
-    normalized === "validator-job" ||
-    normalized === "src/jobs/validator-job.ts" ||
-    normalized.endsWith("/src/jobs/validator-job.ts")
-  ) {
-    return "validator-job";
-  }
+function packagedJobBundleName(_entrypoint: string | undefined): undefined {
   return undefined;
 }
 
@@ -2806,11 +2819,23 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     nonce: randomNonce(),
     deadline: String(Math.floor(Date.now() / 1000) + 300)
   };
-  const intent = await postSignedJson(new URL("/v1/validator-launch-intents", relayUrl).toString(), intentPayload, {
-    domain: "switchboard.validator-launch-intent.v1",
-    seed,
-    ss58Format
-  });
+  let intent: unknown;
+  try {
+    intent = await postSignedJson(new URL("/v1/validator-launch-intents", relayUrl).toString(), intentPayload, {
+      domain: "switchboard.validator-launch-intent.v1",
+      seed,
+      ss58Format
+    });
+  } catch (error) {
+    const latest = await resolveValidatorScriptLookup(flags, manifestConfig);
+    if (latest?.scriptIpfs && String(error instanceof Error ? error.message : error).includes("validator_script_not_configured")) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}\n` +
+          `Latest validator script pin is ${latest.scriptIpfs}; configure the relay with PROOF_VALIDATOR_SCRIPT_MANIFEST_URL/FILE/JSON or PROOF_VALIDATOR_SCRIPT_IPFS before launch.`
+      );
+    }
+    throw error;
+  }
   const intentRecord = intent as Record<string, any>;
   const scriptIpfs = stringRecordField(intentRecord, "validatorScriptIpfs") ?? manifestConfig.manifest?.validators?.launch?.scriptIpfs;
   if (!scriptIpfs) {
@@ -2840,7 +2865,15 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     PROOF_VALIDATOR_DEPLOYER_ADDRESS: deployer.address,
     VALIDATOR_ENROLLMENT_SEED: enrollmentMnemonic,
     VALIDATOR_WORK_MODE: "poll",
-    VALIDATOR_WORK_POLL: "true"
+    VALIDATOR_WORK_POLL: "true",
+    ACURAST_INCLUDE_ENV: [
+      "PROOF_CONTROL_PLANE_URL",
+      "PROOF_VALIDATOR_LAUNCH_INTENT_ID",
+      "PROOF_VALIDATOR_DEPLOYER_ADDRESS",
+      "VALIDATOR_ENROLLMENT_SEED",
+      "VALIDATOR_WORK_MODE",
+      "VALIDATOR_WORK_POLL"
+    ].join(",")
   });
   const deployResult = await runCliChild(deployRunner.command, deployRunner.args, {
     env: {
@@ -2879,6 +2912,76 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     console.log(`Script: ${scriptIpfs}`);
     console.log(`Enrollment pubkey: ${enrollmentPubkey}`);
   });
+}
+
+async function validatorScriptCommand(flags: Map<string, string | boolean>) {
+  const manifestConfig = await resolveCliNetworkConfig(flags);
+  const resolved = await resolveValidatorScriptLookup(flags, manifestConfig);
+  if (!resolved?.scriptIpfs) {
+    throw new Error("No validator script pin found in the network manifest or validator script manifest");
+  }
+  writeOutput(flags, { ok: true, ...resolved }, () => {
+    console.log(`Validator script: ${resolved.scriptIpfs}`);
+    if (resolved.scriptHash) console.log(`Script hash: ${resolved.scriptHash}`);
+    console.log(`Source: ${resolved.source}`);
+  });
+}
+
+async function resolveValidatorScriptLookup(
+  flags: Map<string, string | boolean>,
+  manifestConfig: CliNetworkConfig
+): Promise<{ scriptIpfs: string; scriptHash?: string; source: string } | undefined> {
+  const launch = manifestConfig.manifest?.validators?.launch;
+  if (launch?.scriptIpfs) {
+    return {
+      scriptIpfs: launch.scriptIpfs,
+      scriptHash: launch.scriptHash,
+      source: manifestConfig.manifestUrl
+    };
+  }
+
+  const json = stringFlag(flags, "validator-script-manifest-json") ??
+    optionalEnv("SWITCHBOARD_VALIDATOR_SCRIPT_MANIFEST_JSON") ??
+    optionalEnv("PROOF_VALIDATOR_SCRIPT_MANIFEST_JSON");
+  const file = stringFlag(flags, "validator-script-manifest-file") ??
+    optionalEnv("SWITCHBOARD_VALIDATOR_SCRIPT_MANIFEST_FILE") ??
+    optionalEnv("PROOF_VALIDATOR_SCRIPT_MANIFEST_FILE");
+  const url = stringFlag(flags, "validator-script-manifest-url") ??
+    optionalEnv("SWITCHBOARD_VALIDATOR_SCRIPT_MANIFEST_URL") ??
+    optionalEnv("PROOF_VALIDATOR_SCRIPT_MANIFEST_URL");
+  if (!json && !file && !url) {
+    return undefined;
+  }
+
+  let raw: string;
+  let source: string;
+  if (json) {
+    raw = json;
+    source = "inline";
+  } else if (file) {
+    raw = await readFile(file, "utf8");
+    source = file;
+  } else {
+    const response = await fetch(url!, { headers: { accept: "application/json" } });
+    const body = await response.text();
+    if (!response.ok) {
+      throw new Error(`${url} failed: ${response.status} ${body.slice(0, 1000)}`);
+    }
+    raw = body;
+    source = url!;
+  }
+
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  const scriptIpfs = typeof parsed.scriptIpfs === "string" ? parsed.scriptIpfs : undefined;
+  if (!scriptIpfs?.startsWith("ipfs://")) {
+    throw new Error("Validator script manifest must include scriptIpfs as an ipfs:// URI");
+  }
+  const scriptHash = typeof parsed.scriptHash === "string"
+    ? parsed.scriptHash
+    : typeof parsed.bundleSha256 === "string"
+      ? `sha256:${parsed.bundleSha256}`
+      : undefined;
+  return { scriptIpfs, scriptHash, source };
 }
 
 async function deploymentStatusCommand(flags: Map<string, string | boolean>) {
@@ -2935,6 +3038,7 @@ async function deploymentStatusCommand(flags: Map<string, string | boolean>) {
   const controlPlaneValidationOk = latestValidatorReport?.success === true;
   const hubRegistered = session.registered === true;
   const hubFunded = session.developer.toLowerCase() !== ethers.ZeroAddress.toLowerCase();
+  const hubExpiresAt = positiveUnixSecondsField(session, "expiresAt");
   const publicOk = Boolean(publicChecks?.health.ok && publicChecks.challenge.ok && publicChecks.demoStatus.ok && publicChecks.page.ok);
   const lifecycle = deploymentLifecycleStatus({
     report,
@@ -2978,8 +3082,8 @@ async function deploymentStatusCommand(flags: Map<string, string | boolean>) {
       ok: hubFunded && hubRegistered,
       funded: hubFunded,
       registered: hubRegistered,
-      expiresAt: session.expiresAt,
-      expiresAtIso: secondsToIso(session.expiresAt),
+      expiresAt: hubExpiresAt === undefined ? undefined : String(hubExpiresAt),
+      expiresAtIso: unixSecondsToIso(hubExpiresAt),
       session
     },
     gateway: {
@@ -4072,7 +4176,8 @@ function printDeploymentStatus(output: any) {
   if (output.deploymentId) {
     console.log(`Deployment: ${output.deploymentId}`);
   }
-  console.log(`Hub: ${output.hub.ok ? "registered" : "not ready"}; expires ${output.hub.expiresAtIso ?? output.hub.expiresAt}`);
+  const hubLease = output.hub.expiresAtIso ?? output.hub.expiresAt ?? (output.hub.registered ? "pending activation" : "unknown");
+  console.log(`Hub: ${output.hub.ok ? "registered" : "not ready"}; expires ${hubLease}`);
   const route = output.gateway.route;
   console.log(`Gateway route: ${output.gateway.ok ? "active" : "missing/inactive"}`);
   if (route?.upstreamHost && route?.upstreamPort) {
@@ -4859,8 +4964,8 @@ function deploymentLifecycleStatus(input: {
   route?: Record<string, any>;
   nowSeconds: number;
 }): Record<string, unknown> {
-  const hubExpiresAt = unixSecondsField(input.session, "expiresAt");
-  const routeExpiresAt = unixSecondsField(input.route, "expiresAt");
+  const hubExpiresAt = positiveUnixSecondsField(input.session, "expiresAt");
+  const routeExpiresAt = positiveUnixSecondsField(input.route, "expiresAt");
   const schedule = deploymentSchedule(input.report);
   const scheduleStart = unixSecondsField(schedule, "startUnixSeconds");
   const scheduleEnd = unixSecondsField(schedule, "endUnixSeconds");
@@ -5124,6 +5229,11 @@ function booleanRecordField(record: unknown, name: string): boolean {
 function unixSecondsField(record: unknown, name: string): number | undefined {
   const parsed = numberRecordField(record, name);
   return parsed !== undefined && Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function positiveUnixSecondsField(record: unknown, name: string): number | undefined {
+  const parsed = unixSecondsField(record, name);
+  return parsed !== undefined && parsed > 0 ? parsed : undefined;
 }
 
 function appendForwardedStringFlags(childArgs: string[], flags: Map<string, string | boolean>, names: string[]): void {
@@ -5653,7 +5763,10 @@ async function resolveAcurastDirectDeployRunner(
     return {
       command: "pnpm",
       args: ["acurast:deploy-express:direct", "--", ...args],
-      env
+      env: {
+        ...env,
+        SWITCHBOARD_SKIP_BUNDLE_BUILD: "true"
+      }
     };
   }
 
@@ -5674,7 +5787,7 @@ async function resolveAcurastDirectDeployRunner(
       SWITCHBOARD_WORK_DIR: process.cwd(),
       SWITCHBOARD_INTERNAL_BIN_DIR: internalDir,
       SWITCHBOARD_PACKAGED_ASSETS_DIR: assetsDir,
-      SWITCHBOARD_PREBUILT_JOB_BUNDLE: path.join(assetsDir, "jobs", "validator-job", "bundle.cjs")
+      SWITCHBOARD_SKIP_BUNDLE_BUILD: "true"
     }
   };
 }
@@ -6290,6 +6403,9 @@ function normalizeCommand(positionals: string[]): CommandName {
   if (positionals.length === 2 && positionals[0] === "validator" && positionals[1] === "launch") {
     return "validator-launch";
   }
+  if (positionals.length === 2 && positionals[0] === "validator" && positionals[1] === "script") {
+    return "validator-script";
+  }
   if (positionals.length >= 2 && positionals[0] === "relay" && positionals[1] === "deploy") {
     return "relay-deploy";
   }
@@ -6492,6 +6608,9 @@ Validator commands:
   validator launch
           Request validator admission, deploy the approved Acurast validator
           script, and register the job.
+  validator script
+          Look up the approved validator IPFS script pin from the network
+          manifest or a validator script manifest URL/file.
 
 Admin catalog commands:
   catalog build|inspect|verify|set-state

@@ -6,14 +6,11 @@ import { build } from "esbuild";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const distDir = path.join(repoRoot, "dist");
 const internalDir = path.join(distDir, "internal");
-const jobAssetsDir = path.join(repoRoot, "assets", "jobs");
 const cliOutfile = path.join(distDir, "index.js");
 
 await rm(distDir, { recursive: true, force: true });
 await mkdir(distDir, { recursive: true });
 await mkdir(internalDir, { recursive: true });
-await rm(jobAssetsDir, { recursive: true, force: true });
-await mkdir(jobAssetsDir, { recursive: true });
 
 const nodeBundle = {
   bundle: true,
@@ -59,31 +56,5 @@ for (const [name, entrypoint] of Object.entries(internalEntrypoints)) {
     ...nodeBundle
   });
   await chmod(outfile, 0o755);
-  console.log(`Built ${outfile}`);
-}
-
-const jobBundles = {
-  "validator-job": "src/jobs/validator-job.ts"
-};
-
-for (const [name, entrypoint] of Object.entries(jobBundles)) {
-  const outfile = path.join(jobAssetsDir, name, "bundle.cjs");
-  await mkdir(path.dirname(outfile), { recursive: true });
-  await build({
-    entryPoints: [path.join(repoRoot, entrypoint)],
-    outfile,
-    bundle: true,
-    platform: "node",
-    target: "node20",
-    format: "cjs",
-    sourcemap: false,
-    minify: true,
-    legalComments: "none",
-    define: {
-      __SWITCHBOARD_BUILD_CONFIG__: "process.env.SWITCHBOARD_BUILD_CONFIG"
-    },
-    logLevel: "info"
-  });
-  await chmod(outfile, 0o644);
   console.log(`Built ${outfile}`);
 }

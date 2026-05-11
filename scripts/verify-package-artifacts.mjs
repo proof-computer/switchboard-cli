@@ -12,8 +12,7 @@ const requiredArtifacts = [
   "dist/internal/hub-fund-evm-session.js",
   "dist/internal/hub-fund-native-asset-quote.js",
   "dist/internal/hub-read-session.js",
-  "dist/internal/route-validator.js",
-  "assets/jobs/validator-job/bundle.cjs"
+  "dist/internal/route-validator.js"
 ];
 const broadPackageEntries = new Set(["dist", "dist/", "dist/**"]);
 const requiredBundleMarkers = [

@@ -11,7 +11,7 @@ import type { KeyringPair } from "@polkadot/keyring/types";
 import { cryptoWaitReady, decodeAddress, encodeAddress, mnemonicValidate } from "@polkadot/util-crypto";
 import { build } from "esbuild";
 
-type Command = "prepare" | "estimate-fee" | "deploy-dry-run" | "deploy" | "deploy-direct" | "update-env" | "status" | "inspect";
+type Command = "prepare" | "upload-script" | "estimate-fee" | "deploy-dry-run" | "deploy" | "deploy-direct" | "update-env" | "status" | "inspect";
 type DeploymentProfileName = "default" | "smoke";
 
 interface ParsedArgs {
@@ -165,6 +165,34 @@ async function main() {
     return;
   }
 
+  if (parsed.command === "upload-script") {
+    const scriptIpfs = await resolveDirectScriptIpfs(config, parsed.flags);
+    const bundleSha256 = await fileSha256(prepared.bundlePath);
+    const output = {
+      version: 1,
+      kind: "switchboard-validator-script",
+      scriptIpfs,
+      scriptHash: `sha256:${bundleSha256}`,
+      bundleSha256,
+      gitSha: process.env.GITHUB_SHA ?? process.env.SWITCHBOARD_GIT_SHA,
+      generatedAt: new Date().toISOString(),
+      source: {
+        repository: process.env.GITHUB_REPOSITORY,
+        workflow: process.env.GITHUB_WORKFLOW,
+        runId: process.env.GITHUB_RUN_ID,
+        runAttempt: process.env.GITHUB_RUN_ATTEMPT
+      }
+    };
+    const manifestPath = path.join(config.stageDir, "validator-script-manifest.json");
+    await writeFile(manifestPath, `${JSON.stringify(output, null, 2)}\n`);
+    writeOutput(parsed.flags, { ok: true, manifestPath, ...output }, () => {
+      console.log(`Validator script: ${scriptIpfs}`);
+      console.log(`Bundle sha256: ${bundleSha256}`);
+      console.log(`Manifest: ${manifestPath}`);
+    });
+    return;
+  }
+
   if (!config.mnemonic) {
     throw new Error(
       `${credentialEnvNames(config.network).seed.join(" or ")} is required for estimate-fee, deploy-dry-run, and deploy`
@@ -303,11 +331,15 @@ async function prepareAcurastProject(config: HarnessConfig) {
   const bundlePath = path.join(config.stageDir, "dist/bundle.cjs");
   const acurastConfigPath = path.join(config.stageDir, "acurast.json");
   const switchboardBuildConfig = await readSwitchboardBuildConfig();
+  const skipBundleBuild = process.env.SWITCHBOARD_SKIP_BUNDLE_BUILD === "true";
   await rm(path.join(config.stageDir, "dist"), { recursive: true, force: true });
   await rm(path.join(config.stageDir, ".acurast"), { recursive: true, force: true });
   await mkdir(path.dirname(bundlePath), { recursive: true });
 
-  if (prebuiltBundle) {
+  if (skipBundleBuild) {
+    // Validator launches deploy a control-plane-approved ipfs:// script. The
+    // public CLI intentionally does not ship the private validator bundle.
+  } else if (prebuiltBundle) {
     assertPrebuiltRuntimeBootstrapEnv(switchboardBuildConfig);
     await copyFile(prebuiltBundle, bundlePath);
   } else {
@@ -339,10 +371,10 @@ async function prepareAcurastProject(config: HarnessConfig) {
 
   await writeAcurastConfig(config);
   auditProjectEnvForRuntime();
-  await assertNoSecretValuesInUploadArtifacts([bundlePath, acurastConfigPath]);
+  await assertNoSecretValuesInUploadArtifacts([...(skipBundleBuild ? [] : [bundlePath]), acurastConfigPath]);
 
   const envPath = path.join(config.stageDir, ".env");
-  if (config.mnemonic) {
+  if (config.mnemonic || process.env.ACURAST_IPFS_URL || process.env.ACURAST_IPFS_API_KEY) {
     await writeFile(envPath, buildAcurastEnv(config));
   }
 
@@ -350,11 +382,16 @@ async function prepareAcurastProject(config: HarnessConfig) {
     stageDir: config.stageDir,
     bundlePath,
     acurastConfigPath,
-    envPath: config.mnemonic ? envPath : undefined,
+    envPath: config.mnemonic || process.env.ACURAST_IPFS_URL || process.env.ACURAST_IPFS_API_KEY ? envPath : undefined,
     projectName: config.projectName,
     network: config.network,
     profile: config.profile.name
   };
+}
+
+async function fileSha256(filePath: string): Promise<string> {
+  const { createHash } = await import("node:crypto");
+  return createHash("sha256").update(await readFile(filePath)).digest("hex");
 }
 
 async function assertNoSecretValuesInUploadArtifacts(paths: string[]): Promise<void> {
@@ -1752,6 +1789,7 @@ function parseArgs(args: string[]): ParsedArgs {
 function normalizeCommand(value: string): Command {
   if (
     value === "prepare" ||
+    value === "upload-script" ||
     value === "estimate-fee" ||
     value === "deploy-dry-run" ||
     value === "deploy" ||

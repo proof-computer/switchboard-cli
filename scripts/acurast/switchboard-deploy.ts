@@ -110,6 +110,7 @@ interface AcurastJobConfigFile {
   SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS: string;
   SWITCHBOARD_RELAY_DIAGNOSTICS: string;
   SWITCHBOARD_RELAY_DIAGNOSTICS_TIMEOUT_MS: string;
+  SWITCHBOARD_DEMO_VERSION?: string;
   SWITCHBOARD_TLS_CERT_PEM_BASE64?: string;
   SWITCHBOARD_TLS_KEY_PEM_BASE64?: string;
   SWITCHBOARD_CERTIFICATE_MODE?: string;
@@ -345,6 +346,7 @@ async function main(): Promise<void> {
     SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS: String(numberEnv("SWITCHBOARD_DEPLOY_INTENT_REQUEST_TIMEOUT_MS", 60_000)),
     SWITCHBOARD_RELAY_DIAGNOSTICS: "true",
     SWITCHBOARD_RELAY_DIAGNOSTICS_TIMEOUT_MS: String(numberEnv("SWITCHBOARD_DEPLOY_RELAY_DIAGNOSTICS_TIMEOUT_MS", 10_000)),
+    SWITCHBOARD_DEMO_VERSION: stringEnv("SWITCHBOARD_DEMO_VERSION"),
     ...(tls
       ? {
           SWITCHBOARD_TLS_CERT_PEM_BASE64: tls.certBase64,
@@ -2029,6 +2031,7 @@ function consumerJobRuntimeEnvironment(
       SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS: jobConfig.SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS,
       SWITCHBOARD_RELAY_DIAGNOSTICS: jobConfig.SWITCHBOARD_RELAY_DIAGNOSTICS,
       SWITCHBOARD_RELAY_DIAGNOSTICS_TIMEOUT_MS: jobConfig.SWITCHBOARD_RELAY_DIAGNOSTICS_TIMEOUT_MS,
+      SWITCHBOARD_DEMO_VERSION: jobConfig.SWITCHBOARD_DEMO_VERSION,
       ...(process.env.SWITCHBOARD_DEPLOY_ENABLE_JOB_CONTROL === "true"
         ? { SWITCHBOARD_CONTROL_TOKEN: config.jobControlToken }
         : {})
@@ -3010,10 +3013,18 @@ async function runAcurastValidator(
         `${compactId(validatorProcessor)} validator=${slot}/${targetCount} candidate=${index + 1}/${validatorProcessors.length}`
       )
     );
+    const validatorScriptIpfs = stringEnv("SWITCHBOARD_VALIDATOR_SCRIPT_IPFS") ?? stringEnv("PROOF_VALIDATOR_SCRIPT_IPFS");
+    if (!validatorScriptIpfs) {
+      throw new Error(
+        "Real validator deployment now requires SWITCHBOARD_VALIDATOR_SCRIPT_IPFS/PROOF_VALIDATOR_SCRIPT_IPFS from the private switchboard-validator pin workflow."
+      );
+    }
     const result = await run("pnpm", ["--silent", "acurast:deploy-express:direct", "--", "--yes"], {
       env: {
         ...acurastEnv(config),
-        ACURAST_ENTRYPOINT: "src/jobs/validator-job.ts",
+        ACURAST_ENTRYPOINT: "validator-job",
+        ACURAST_SCRIPT_IPFS: validatorScriptIpfs,
+        SWITCHBOARD_SKIP_BUNDLE_BUILD: "true",
         ACURAST_STAGE_DIR: path.join(rootDir, "dist/acurast/route-validator"),
         ACURAST_PROJECT_NAME: "switchboard-validator",
         ACURAST_DEPLOYMENT_PROFILE: "smoke",
@@ -4147,18 +4158,7 @@ function mapSourcePnpmScript(
   };
 }
 
-function packagedJobBundleName(entrypoint: string | undefined): "validator-job" | undefined {
-  if (!entrypoint) {
-    return undefined;
-  }
-  const normalized = entrypoint.replace(/\\/g, "/");
-  if (
-    normalized === "validator-job" ||
-    normalized === "src/jobs/validator-job.ts" ||
-    normalized.endsWith("/src/jobs/validator-job.ts")
-  ) {
-    return "validator-job";
-  }
+function packagedJobBundleName(_entrypoint: string | undefined): undefined {
   return undefined;
 }
 
