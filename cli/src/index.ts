@@ -23,7 +23,8 @@ import {
 import {
   expandedReportProcessors,
   processorRefToId,
-  type GatewayCapabilityReport
+  type GatewayCapabilityReport,
+  type ProcessorScope
 } from "../../src/operator-capability.js";
 import { printOperatorDiscoverUsage, runOperatorDiscover } from "../../scripts/operator/discover.js";
 import { printOperatorSetupUsage, runOperatorSetup, runOperatorStatus, runOperatorUpgrade } from "../../scripts/operator/setup.js";
@@ -1805,7 +1806,11 @@ async function selectLaunchDemoCapacity(input: {
         continue;
       }
       try {
-        const allowedProcessors = scope.processors ?? scope.includeProcessors ?? [];
+        const allowedProcessors = launchDemoManagerScopeProcessors(scope);
+        if (allowedProcessors.length === 0) {
+          errors.push(`${report.operator.gatewayId}/${scope.managerId}: capability report listed no gateway-local processors`);
+          continue;
+        }
         const allowedIds = new Set(
           allowedProcessors.map((value) => processorRefToId(value)).filter((value): value is string => Boolean(value))
         );
@@ -1911,6 +1916,13 @@ async function selectLaunchDemoCapacity(input: {
     throw new Error(`Only ${selectedMembers.length}/${input.minReady} launch-demo members could be selected`);
   }
   return launchDemoSelectionFromMembers(selectedMembers);
+}
+
+export function launchDemoManagerScopeProcessors(scope: ProcessorScope): string[] {
+  if (scope.kind !== "manager") {
+    return [];
+  }
+  return [...new Set([...(scope.processors ?? []), ...(scope.includeProcessors ?? [])].filter((value) => value.length > 0))];
 }
 
 async function selectDeployCapacity(input: {

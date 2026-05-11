@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { launchDemoReportEligibilityReason, selectLaunchDemoMembers } from "../cli/src/index.js";
+import { launchDemoManagerScopeProcessors, launchDemoReportEligibilityReason, selectLaunchDemoMembers } from "../cli/src/index.js";
 
 describe("launch-demo HA member selection", () => {
   it("prefers one member per gateway, then fills by lowest active route count", () => {
@@ -83,6 +83,25 @@ describe("launch-demo HA member selection", () => {
         processorScopes: []
       } as any),
       undefined
+    );
+  });
+
+  it("does not treat an empty manager scope as all manager processors", () => {
+    assert.deepEqual(
+      launchDemoManagerScopeProcessors({
+        kind: "manager",
+        managerId: "9470"
+      }),
+      []
+    );
+    assert.deepEqual(
+      launchDemoManagerScopeProcessors({
+        kind: "manager",
+        managerId: "9470",
+        processors: ["5LocalProcessor"],
+        includeProcessors: ["5LocalProcessor", "5OtherLocalProcessor"]
+      }),
+      ["5LocalProcessor", "5OtherLocalProcessor"]
     );
   });
 });
