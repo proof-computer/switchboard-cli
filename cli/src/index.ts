@@ -121,7 +121,7 @@ const DEFAULT_LAUNCH_DEMO_DURATION_MINUTES = 10;
 const DEFAULT_LAUNCH_DEMO_START_DELAY_MS = 180_000;
 const DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION = "40000000000";
 const DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS = 900;
-const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.1";
+const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.2";
 const LAUNCH_DEMO_ENTRYPOINT = "src/server.ts";
 const ANSI_ESCAPE_PATTERN = /\u001b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 export const PROOF_NETWORK_MANIFEST_URL = "https://control.switchboard.proof.computer/v1/network-manifest";
@@ -2458,18 +2458,11 @@ export async function resolveLaunchDemoEstimateRunner(
   };
 }
 
-function packagedJobBundleName(entrypoint: string | undefined): "express-webserver" | "validator-job" | undefined {
+function packagedJobBundleName(entrypoint: string | undefined): "validator-job" | undefined {
   if (!entrypoint) {
-    return "express-webserver";
+    return undefined;
   }
   const normalized = entrypoint.replace(/\\/g, "/");
-  if (
-    normalized === "express-webserver" ||
-    normalized === "src/jobs/express-webserver.ts" ||
-    normalized.endsWith("/src/jobs/express-webserver.ts")
-  ) {
-    return "express-webserver";
-  }
   if (
     normalized === "validator-job" ||
     normalized === "src/jobs/validator-job.ts" ||
@@ -6723,6 +6716,7 @@ Launch demo:
   --ha                             Request a 3-processor HA endpoint group
   --processor-count <n>            Number of processors to launch for HA, default 1 or 3 with --ha
   --min-ready <n>                  Minimum successful replicas required, default processor-count
+  --demo-package <spec>            Demo package spec; use file:/path/to/switchboard-express-demo for local clones
   Ingress estimate                 Previewed before Acurast deploy/funding
   Acurast start delay              Fixed 3 minutes
   --max-cost-per-execution <n>     Default ${DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION}

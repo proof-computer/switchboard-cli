@@ -86,18 +86,11 @@ function mapAcurastScriptArgs(args: string[]): string[] {
   }
 }
 
-function packagedJobBundleName(entrypoint: string | undefined): "express-webserver" | "validator-job" | undefined {
+function packagedJobBundleName(entrypoint: string | undefined): "validator-job" | undefined {
   if (!entrypoint) {
-    return "express-webserver";
+    return undefined;
   }
   const normalized = entrypoint.replace(/\\/g, "/");
-  if (
-    normalized === "express-webserver" ||
-    normalized === "src/jobs/express-webserver.ts" ||
-    normalized.endsWith("/src/jobs/express-webserver.ts")
-  ) {
-    return "express-webserver";
-  }
   if (
     normalized === "validator-job" ||
     normalized === "src/jobs/validator-job.ts" ||

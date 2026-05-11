@@ -1,6 +1,6 @@
 {
   "name": "switchboard-cli",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Switchboard CLI for deploying and operating Acurast ingress workloads.",
   "private": false,
   "type": "module",
@@ -20,9 +20,6 @@
     "prepare": "node scripts/build-package.mjs && node scripts/verify-package-artifacts.mjs",
     "test": "node --import tsx --test tests/**/*.test.ts",
     "smoke:express-local": "node --import tsx --test tests/express-webserver-local-harness.test.ts",
-    "snapshot:express-demo-status": "node scripts/snapshot-express-demo-status.mjs",
-    "preview:express-demo": "tsx scripts/preview-express-demo.ts",
-    "visual:express-demo": "tsx scripts/visual-express-demo.ts",
     "typecheck": "tsc --noEmit",
     "example:express-webserver": "tsx examples/express-webserver/src/index.ts",
     "switchboard": "tsx cli/src/index.ts",

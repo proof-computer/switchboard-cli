@@ -1,7 +1,7 @@
 # Switchboard CLI
 
-Install Switchboard, launch the built-in Acurast demo, and get a public HTTPS
-URL.
+Install Switchboard, launch the Switchboard Express demo, and get a public
+HTTPS URL.
 
 Switchboard is in private beta. The CLI is public, while hosted capacity and
 registry access are invite-gated.
@@ -37,8 +37,11 @@ switchboard status
 You need ACU on Acurast mainnet for the demo job, Hub USDC for the Switchboard
 quote, and a small Hub native balance for the payment transactions.
 
-Switchboard selects live capacity, deploys the bundled demo, funds the Hub
-quote, handles DNS/TLS/routing, and prints the URL.
+Switchboard selects live capacity, creates a temporary project that depends on
+`@proofcomputer/switchboard-express-demo`, funds the Hub quote, handles
+DNS/TLS/routing, and prints the URL. Demo page/template development lives in
+the `switchboard-express-demo` repository; the CLI does not carry a copied
+demo renderer.
 
 ## Install Details
 
@@ -52,7 +55,7 @@ Rerun the same command to upgrade an existing install. Each run downloads a
 fresh release package, replaces the installed `switchboard-cli` package under
 the install home, and rewrites the launcher.
 
-Pin a release with `SWITCHBOARD_CLI_VERSION=v0.1.4`, or override the package
+Pin a release with `SWITCHBOARD_CLI_VERSION=v0.1.5`, or override the package
 URL directly with `SWITCHBOARD_CLI_PACKAGE_URL`. The control-plane installer
 mirror at `https://control.switchboard.proof.computer/install.sh` serves the
 same installer after rollout.
@@ -77,17 +80,18 @@ Run the CLI from source:
 pnpm switchboard --help
 ```
 
-Build output is generated into `dist/`, with packaged Acurast job bundles under
-`assets/jobs/`. These generated files are ignored by Git; local installs,
+Build output is generated into `dist/`, with packaged validator job bundles
+under `assets/jobs/`. These generated files are ignored by Git; local installs,
 `prepare`, and package dry-runs build them from source. Local Acurast staging
 directories such as `dist/acurast/` are ignored and must not be packaged.
 
 ## Package Shape
 
-The package includes the compiled CLI, internal runner bundles, generated job
-bundles, and operator setup assets used by `switchboard operator setup`.
-GitHub Release installs consume the generated package tarball. The package
-`prepare` script builds and verifies the generated artifacts, and
+The package includes the compiled CLI, internal runner bundles, generated
+validator job bundles, and operator setup assets used by
+`switchboard operator setup`. GitHub Release installs consume the generated
+package tarball. The package `prepare` script builds and verifies the
+generated artifacts, and
 `npm pack --dry-run --json` is the release-surface check.
 
 ## Trust Model

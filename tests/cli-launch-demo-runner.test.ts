@@ -53,7 +53,7 @@ describe("launch-demo runner resolution", () => {
       );
 
       const runner = await resolveLaunchDemoEstimateRunner(
-        { ACURAST_ENTRYPOINT: "src/jobs/express-webserver.ts" },
+        { ACURAST_ENTRYPOINT: "src/server.ts" },
         { cwd: root, currentFile: path.join(root, "cli", "src", "index.ts"), workDir: "/tmp/demo-project" }
       );
 
@@ -61,7 +61,7 @@ describe("launch-demo runner resolution", () => {
       assert.deepEqual(runner.args, ["--silent", "acurast:estimate-express", "--", "--json"]);
       assert.equal(runner.cwd, root);
       assert.equal(runner.env.SWITCHBOARD_WORK_DIR, "/tmp/demo-project");
-      assert.equal(runner.env.ACURAST_ENTRYPOINT, "src/jobs/express-webserver.ts");
+      assert.equal(runner.env.ACURAST_ENTRYPOINT, "src/server.ts");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

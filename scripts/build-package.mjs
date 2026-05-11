@@ -63,7 +63,6 @@ for (const [name, entrypoint] of Object.entries(internalEntrypoints)) {
 }
 
 const jobBundles = {
-  "express-webserver": "src/jobs/express-webserver.ts",
   "validator-job": "src/jobs/validator-job.ts"
 };
 

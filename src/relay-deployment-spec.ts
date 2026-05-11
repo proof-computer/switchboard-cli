@@ -78,7 +78,7 @@ const acurastTargetSchema = z
     deployerAddress: z.string().min(1).optional(),
     projectName: z.string().min(1),
     stageDir: z.string().min(1),
-    entrypoint: z.string().min(1).default("src/jobs/express-webserver.ts"),
+    entrypoint: z.string().min(1).default("src/server.ts"),
     deploymentProfile: z.string().min(1).default("default"),
     executionMs: z.number().int().positive().default(3_600_000),
     maxCostPerExecution: z

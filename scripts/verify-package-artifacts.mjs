@@ -13,7 +13,6 @@ const requiredArtifacts = [
   "dist/internal/hub-fund-native-asset-quote.js",
   "dist/internal/hub-read-session.js",
   "dist/internal/route-validator.js",
-  "assets/jobs/express-webserver/bundle.cjs",
   "assets/jobs/validator-job/bundle.cjs"
 ];
 const broadPackageEntries = new Set(["dist", "dist/", "dist/**"]);

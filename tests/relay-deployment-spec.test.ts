@@ -44,7 +44,7 @@ describe("relay deployment spec", () => {
     assert.equal(spec.relayId, "relay-d");
     assert.equal(spec.target, "acurast");
     assert.equal(spec.catalogState, "candidate");
-    assert.equal(spec.acurast?.entrypoint, "src/jobs/express-webserver.ts");
+    assert.equal(spec.acurast?.entrypoint, "src/server.ts");
     assert.equal(spec.acurast?.executionMs, 3_600_000);
     assert.equal(spec.acurast?.maxCostPerExecution, "40000000000");
     assert.equal(spec.relay.authorityProfile, "durable-relay");

@@ -23,7 +23,7 @@ describe("relay Acurast helper runner resolution", () => {
 
       const runner = resolveAcurastScriptRunner(
         ["acurast:deploy-express:direct", "--", "--yes"],
-        { ACURAST_ENTRYPOINT: "src/jobs/express-webserver.ts" },
+        { ACURAST_ENTRYPOINT: "src/server.ts" },
         workDir,
         { currentFile }
       );
@@ -34,7 +34,7 @@ describe("relay Acurast helper runner resolution", () => {
       assert.equal(runner.env.SWITCHBOARD_WORK_DIR, workDir);
       assert.equal(runner.env.SWITCHBOARD_INTERNAL_BIN_DIR, internalDir);
       assert.equal(runner.env.SWITCHBOARD_PACKAGED_ASSETS_DIR, assetsDir);
-      assert.equal(runner.env.SWITCHBOARD_PREBUILT_JOB_BUNDLE, path.join(assetsDir, "jobs", "express-webserver", "bundle.cjs"));
+      assert.equal(runner.env.SWITCHBOARD_PREBUILT_JOB_BUNDLE, undefined);
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(workDir, { recursive: true, force: true });

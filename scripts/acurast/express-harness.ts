@@ -313,7 +313,7 @@ async function prepareAcurastProject(config: HarnessConfig) {
   } else {
     try {
       await build({
-        entryPoints: [path.resolve(config.rootDir, process.env.ACURAST_ENTRYPOINT ?? "src/jobs/express-webserver.ts")],
+        entryPoints: [path.resolve(config.rootDir, process.env.ACURAST_ENTRYPOINT ?? "src/server.ts")],
         outfile: bundlePath,
         bundle: true,
         platform: "node",

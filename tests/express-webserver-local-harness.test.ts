@@ -6,112 +6,21 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
-import { build } from "esbuild";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const jobPrivateKey = `0x${"00".repeat(31)}01`;
 
 describe("express-webserver local Acurast harness", () => {
-  it("runs the packaged bundle against a fake relay and observes intent and health", async () => {
-    const workDir = await mkdtemp(path.join(tmpdir(), "switchboard-express-local-"));
-    const relay = new FakeRelay();
-
-    try {
-      await relay.start();
-      const bundlePath = await buildPackagedExpressBundle(workDir);
-      const preloadPath = await writeAcurastPreload(workDir);
-      const jobPort = await reservePort();
-      const child = spawnPackagedJob(bundlePath, preloadPath, relay.runtimeEnv(jobPort));
-
-      await waitFor(
-        () =>
-          relay.claims.length > 0 &&
-          relay.health.some((body) => body.state === "waiting_funding"),
-        6_000,
-        () => childOutput(child)
-      );
-
-      const page = await fetchText(`http://127.0.0.1:${jobPort}/`);
-      assert.match(page, /proof-wordmark">PROOF<span class="dot">\.<\/span>/);
-      assert.match(page, /Switchboard · Acurast webserver/);
-      assert.match(page, /Running on <span class="acurast-accent">Acurast,/);
-      assert.match(page, /TLS Certificate/);
-      assert.match(page, /Hub Registration/);
-      assert.match(page, /Acurast Runtime/);
-      assert.doesNotMatch(page, /Live proof/);
-      assert.doesNotMatch(page, /Challenge served/);
-
-      const exit = await waitForExit(child, 3_000);
-      if (!exit) {
-        child.process.kill("SIGTERM");
-        await waitForExit(child, 1_000);
-      } else {
-        assert.equal(exit.code, 0, childOutput(child));
-      }
-
-      assert.equal(relay.claims[0]?.acurastJobId, "local-acurast-job-123");
-      assert.equal(relay.claims[0]?.signerMode, "private-key");
-      assert.match(String(relay.claims[0]?.runtimeSigner), /^0x[0-9a-fA-F]{40}$/);
-      assert.ok(Array.isArray(relay.claims[0]?.upstreamIps));
-    } finally {
-      await relay.close();
-      await rm(workDir, { recursive: true, force: true });
-    }
-  });
-
-  it("refuses prebuilt prepare when intent build config is not mirrored into runtime env", async () => {
-    const workDir = await mkdtemp(path.join(tmpdir(), "switchboard-express-prepare-"));
-
-    try {
-      const bundlePath = await buildPackagedExpressBundle(workDir);
-      const configPath = path.join(workDir, "acurast-config.json");
-      const stageDir = path.join(workDir, "stage");
-      await writeFile(
-        configPath,
-        `${JSON.stringify(
-          {
-            PORT: "3443",
-            SWITCHBOARD_HOST: "0.0.0.0",
-            SWITCHBOARD_RELAY_URL: "https://relay-a.switchboard.proof.computer",
-            SWITCHBOARD_INTENT_ID: "di_local"
-          },
-          null,
-          2
-        )}\n`
-      );
-
-      const run = spawnNode([
-        "--import",
-        "tsx",
-        path.join(repoRoot, "scripts/acurast/express-harness.ts"),
-        "prepare",
-        "--stage-dir",
-        stageDir
-      ], {
-        ACURAST_COMPACT_ENV: "true",
-        SWITCHBOARD_BUILD_CONFIG_FILE: configPath,
-        SWITCHBOARD_PREBUILT_JOB_BUNDLE: bundlePath,
-        SWITCHBOARD_WORK_DIR: repoRoot
-      });
-      const exit = await run.exit;
-
-      assert.notEqual(exit.code, 0, childOutput(run));
-      assert.match(childOutput(run), /Prebuilt Acurast job bundles cannot read SWITCHBOARD_BUILD_CONFIG_FILE at runtime/);
-    } finally {
-      await rm(workDir, { recursive: true, force: true });
-    }
-  });
-
   it("builds the configured project entrypoint when packaged assets are present", async () => {
     const workDir = await mkdtemp(path.join(tmpdir(), "switchboard-express-custom-entrypoint-"));
 
     try {
       const assetsDir = path.join(workDir, "assets");
       const stageDir = path.join(workDir, "stage");
-      await mkdir(path.join(assetsDir, "jobs", "express-webserver"), { recursive: true });
+      await mkdir(path.join(assetsDir, "jobs", "validator-job"), { recursive: true });
       await mkdir(path.join(workDir, "src"), { recursive: true });
       await writeFile(
-        path.join(assetsDir, "jobs", "express-webserver", "bundle.cjs"),
+        path.join(assetsDir, "jobs", "validator-job", "bundle.cjs"),
         "console.log('BUILT_IN_PACKAGE_SENTINEL');\n"
       );
       await writeFile(
@@ -352,26 +261,6 @@ async function fetchText(url: string): Promise<string> {
   const response = await fetch(url);
   assert.equal(response.status, 200);
   return response.text();
-}
-
-async function buildPackagedExpressBundle(workDir: string): Promise<string> {
-  const outfile = path.join(workDir, "bundle.cjs");
-  await build({
-    entryPoints: [path.join(repoRoot, "src/jobs/express-webserver.ts")],
-    outfile,
-    bundle: true,
-    platform: "node",
-    target: "node20",
-    format: "cjs",
-    sourcemap: false,
-    minify: true,
-    legalComments: "none",
-    define: {
-      __SWITCHBOARD_BUILD_CONFIG__: "process.env.SWITCHBOARD_BUILD_CONFIG"
-    },
-    logLevel: "silent"
-  });
-  return outfile;
 }
 
 async function writeAcurastPreload(workDir: string): Promise<string> {
