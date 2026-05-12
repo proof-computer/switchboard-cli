@@ -56,6 +56,28 @@ const gatewayRouteMetricsSchema = z.object({
   }).default({})
 });
 
+const gatewayRouteStateStatusSchema = z.object({
+  enabled: z.boolean(),
+  url: z.string().url().optional(),
+  lastCheckedAt: z.string().min(1).optional(),
+  lastAppliedAt: z.string().min(1).optional(),
+  lastSuccessAt: z.string().min(1).optional(),
+  lastCompletedAt: z.string().min(1).optional(),
+  lastError: z.string().min(1).optional(),
+  polledRouteCount: z.number().int().nonnegative().optional(),
+  desiredRouteCount: z.number().int().nonnegative().optional(),
+  lastAppliedRouteIds: z.array(z.string().min(1)).max(500).optional(),
+  lastRemovedRouteIds: z.array(z.string().min(1)).max(500).optional(),
+  lastRemovalReason: z.string().min(1).optional(),
+  configVersion: z.string().min(1).optional(),
+  consecutiveFailures: z.number().int().nonnegative().optional(),
+  inFlightStartedAt: z.string().min(1).optional(),
+  inFlightAgeMs: z.number().int().nonnegative().optional(),
+  watchdogAbortCount: z.number().int().nonnegative().optional(),
+  healthy: z.boolean().optional(),
+  staleAfterMs: z.number().int().nonnegative().optional()
+});
+
 export const gatewayCapabilityReportSchema = z.object({
   version: z.literal(1),
   kind: z.literal("switchboard.operator.capability"),
@@ -76,11 +98,14 @@ export const gatewayCapabilityReportSchema = z.object({
     publicAddressProbeError: z.string().min(1).optional(),
     validationHostname: z.string().min(1).max(253).optional(),
     routeStateUrl: z.string().url().optional(),
+    routeStateHealthy: z.boolean().optional(),
+    routeStateLastSuccessAt: z.string().min(1).optional(),
     routeIntentUrl: z.string().url().optional(),
     activeRouteCount: z.number().int().nonnegative(),
     routeCapacity: z.number().int().nonnegative(),
     softwareVersion: z.string().min(1).optional(),
     supportedClasses: z.array(z.string().min(1)).default([]),
+    routeState: gatewayRouteStateStatusSchema.optional(),
     routeMetrics: z.array(gatewayRouteMetricsSchema).max(500).optional()
   }),
   processorScopes: z.array(processorScopeSchema).default([]),
@@ -328,6 +353,10 @@ export function operatorCapabilityRouteStateUrl(
   return report.gateway.routeStateUrl ?? operatorProfileRouteStateUrlForGateway(profile, report.operator.gatewayId);
 }
 
+export function operatorCapabilityRouteStateHealthy(report: GatewayCapabilityReport): boolean {
+  return report.gateway.routeStateHealthy !== false;
+}
+
 export function selectOperatorCapabilityCandidate(
   input: SelectOperatorCapabilityCandidateInput
 ): OperatorCapabilityCandidate | undefined {
@@ -361,6 +390,9 @@ export function selectOperatorCapabilityCandidate(
     }
     const routeStateUrl = operatorCapabilityRouteStateUrl(profile, report);
     if (input.requireRouteStateUrl && !routeStateUrl) {
+      continue;
+    }
+    if (input.requireRouteStateUrl && !operatorCapabilityRouteStateHealthy(report)) {
       continue;
     }
     const routeIntentUrl = operatorCapabilityRouteIntentUrl(profile, report);

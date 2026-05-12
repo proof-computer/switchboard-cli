@@ -2846,21 +2846,30 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
   const enrollmentAccount = await accountFromUri(enrollmentMnemonic, ss58Format);
   const enrollmentPubkey = enrollmentAccount.address;
 
-  if (boolFlag(flags, "dry-run")) {
-    writeOutput(flags, { ok: true, intent, scriptIpfs, enrollmentPubkey }, () => {
-      console.log("Validator launch dry run");
-      console.log(`Intent: ${stringRecordField(intentRecord, "intentId")}`);
-      console.log(`Script: ${scriptIpfs}`);
-      console.log(`Enrollment pubkey: ${enrollmentPubkey}`);
-    });
-    return;
-  }
-
   const durationMinutes = optionalIntegerFlag(flags, "duration-minutes", "SWITCHBOARD_DEPLOY_DURATION_MINUTES");
   const scheduleBufferMinutes = optionalIntegerFlag(flags, "schedule-buffer-minutes", "SWITCHBOARD_DEPLOY_SCHEDULE_BUFFER_MINUTES") ?? 0;
   const validatorExecutionMs = durationMinutes === undefined
     ? optionalEnv("ACURAST_EXECUTION_MS")
     : String((durationMinutes + scheduleBufferMinutes) * 60_000);
+  const validatorStartDelayMs = numberFlag(flags, "start-delay-ms", "ACURAST_START_DELAY_MS", 120_000);
+  const validatorProcessors = await resolveValidatorLaunchProcessorSelection({
+    flags,
+    targetNetwork: targetNetwork === "canary" ? "canary" : "mainnet",
+    requestedCount: Number(intentPayload.requestedCount),
+    durationMs: validatorExecutionMs ? Number(validatorExecutionMs) : 300_000,
+    startDelayMs: validatorStartDelayMs
+  });
+
+  if (boolFlag(flags, "dry-run")) {
+    writeOutput(flags, { ok: true, intent, scriptIpfs, enrollmentPubkey, processorSelection: validatorProcessors }, () => {
+      console.log("Validator launch dry run");
+      console.log(`Intent: ${stringRecordField(intentRecord, "intentId")}`);
+      console.log(`Script: ${scriptIpfs}`);
+      console.log(`Enrollment pubkey: ${enrollmentPubkey}`);
+      if (validatorProcessors.processors) console.log(`Processors: ${validatorProcessors.processors}`);
+    });
+    return;
+  }
   const validatorEnvKeys = [
     "PROOF_CONTROL_PLANE_URL",
     "PROOF_VALIDATOR_LAUNCH_INTENT_ID",
@@ -2886,11 +2895,11 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     ACURAST_SCRIPT_IPFS: scriptIpfs,
     ACURAST_ENTRYPOINT: "validator-job",
     ACURAST_NETWORK: targetNetwork,
-    ACURAST_RPC: optionalEnv("ACURAST_RPC"),
-    ACURAST_MANAGER_ID: optionalEnv("ACURAST_MANAGER_ID"),
-    ACURAST_INSTANT_MATCH_PROCESSORS: optionalEnv("ACURAST_INSTANT_MATCH_PROCESSORS"),
+    ACURAST_RPC: stringFlag(flags, "acurast-rpc") ?? optionalEnv("ACURAST_RPC"),
+    ACURAST_MANAGER_ID: validatorProcessors.managerId,
+    ACURAST_INSTANT_MATCH_PROCESSORS: validatorProcessors.processors,
     ACURAST_EXECUTION_MS: validatorExecutionMs,
-    ACURAST_START_DELAY_MS: optionalEnv("ACURAST_START_DELAY_MS"),
+    ACURAST_START_DELAY_MS: String(validatorStartDelayMs),
     ACURAST_MAX_ALLOWED_START_DELAY_MS: optionalEnv("ACURAST_MAX_ALLOWED_START_DELAY_MS"),
     ACURAST_INSTANT_MATCH_START_DELAY_MS: optionalEnv("ACURAST_INSTANT_MATCH_START_DELAY_MS"),
     ACURAST_MAX_COST_PER_EXECUTION: stringFlag(flags, "max-cost-per-execution") ?? optionalEnv("ACURAST_MAX_COST_PER_EXECUTION"),
@@ -2962,6 +2971,86 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     console.log(`Script: ${scriptIpfs}`);
     console.log(`Enrollment pubkey: ${enrollmentPubkey}`);
   });
+}
+
+export function selectValidatorLaunchProcessorsFromInventory(
+  processors: ProcessorInfo[],
+  input: { requestedCount: number; maxAgeSeconds?: number }
+): string[] {
+  if (!Number.isInteger(input.requestedCount) || input.requestedCount <= 0) {
+    throw new Error("validator launch count must be a positive integer");
+  }
+  const selected = selectReadyProcessors(processors.filter((processor) => processor.availability?.conflicts === 0), {
+    maxAgeSeconds: input.maxAgeSeconds ?? DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS,
+    requireAvailability: true,
+    limit: input.requestedCount
+  });
+  if (selected.length !== input.requestedCount) {
+    throw new Error(
+      `Insufficient fresh available validator processor capacity: requested ${input.requestedCount}, selected ${selected.length}`
+    );
+  }
+  return selected.map((processor) => processor.processor);
+}
+
+async function resolveValidatorLaunchProcessorSelection(input: {
+  flags: Map<string, string | boolean>;
+  targetNetwork: AcurastNetwork;
+  requestedCount: number;
+  durationMs: number;
+  startDelayMs: number;
+}): Promise<{ managerId?: string; processors?: string; source: string; inventory?: Record<string, unknown> }> {
+  const explicitProcessors =
+    stringFlag(input.flags, "processors") ??
+    stringFlag(input.flags, "processor") ??
+    optionalEnv("ACURAST_INSTANT_MATCH_PROCESSORS") ??
+    optionalEnv("SWITCHBOARD_VALIDATOR_PROCESSORS") ??
+    optionalEnv("SWITCHBOARD_VALIDATOR_PROCESSOR");
+  const managerId = stringFlag(input.flags, "manager-id") ?? optionalEnv("ACURAST_MANAGER_ID");
+  if (explicitProcessors) {
+    const processors = splitCsv(explicitProcessors);
+    if (processors.length !== input.requestedCount) {
+      throw new Error(`Validator launch requires exactly ${input.requestedCount} processor(s), got ${processors.length}`);
+    }
+    return {
+      managerId,
+      processors: processors.join(","),
+      source: "explicit"
+    };
+  }
+  if (!managerId) {
+    throw new Error("Missing --manager-id or ACURAST_MANAGER_ID for validator processor auto-selection");
+  }
+  if (!Number.isFinite(input.durationMs) || input.durationMs <= 0) {
+    throw new Error("validator launch duration must resolve to a positive millisecond value");
+  }
+  const inventory = await discoverManagerProcessors({
+    network: input.targetNetwork,
+    managerId,
+    rpcUrl: stringFlag(input.flags, "acurast-rpc") ?? optionalEnv("ACURAST_RPC"),
+    checkAvailability: true,
+    startDelayMs: input.startDelayMs,
+    durationMs: input.durationMs
+  });
+  const processors = selectValidatorLaunchProcessorsFromInventory(inventory.processors, {
+    requestedCount: input.requestedCount
+  });
+  return {
+    managerId,
+    processors: processors.join(","),
+    source: "manager-auto",
+    inventory: {
+      network: inventory.network,
+      managerId: inventory.managerId,
+      rpcUrl: inventory.rpcUrl,
+      chainTimestampIso: inventory.chainTimestampIso,
+      totalProcessors: inventory.totalProcessors,
+      recentProcessors: inventory.recentProcessors,
+      availableProcessors: inventory.availableProcessors,
+      recentAvailableProcessors: inventory.recentAvailableProcessors,
+      availabilityWindow: inventory.availabilityWindow
+    }
+  };
 }
 
 async function validatorScriptCommand(flags: Map<string, string | boolean>) {
@@ -6581,6 +6670,10 @@ export function optionalEnv(name: string): string | undefined {
   return value && value.length > 0 ? value : undefined;
 }
 
+function splitCsv(value: string): string[] {
+  return value.split(",").map((item) => item.trim()).filter((item) => item.length > 0);
+}
+
 function positionalAfterCommand(positionals: string[]): string | undefined {
   return positionals.length > 2 ? positionals[2] : undefined;
 }
@@ -6673,7 +6766,9 @@ PROOF ops commands:
 Validator commands:
   validator launch
           Request validator admission, deploy the approved Acurast validator
-          script, and register the job.
+          script, and register the job. Auto-selects exact fresh manager
+          processor capacity unless --processor/--processors is provided.
+          --manager-id <id> is required when ACURAST_MANAGER_ID is not set.
   validator script
           Look up the approved validator IPFS script pin from the network
           manifest or a validator script manifest URL/file.

@@ -2445,7 +2445,7 @@ async function fundQuotedSession(
       "1"
     ];
     if (config.expectedQuoteAmount) {
-      args.push("--max-amount", config.expectedQuoteAmount);
+      args.push("--quote-cap-amount", config.expectedQuoteAmount);
     }
     if (input.deploymentIntent.groupId) {
       args.push("--deployment-intent-group-id", input.deploymentIntent.groupId);
@@ -2462,7 +2462,7 @@ async function fundQuotedSession(
         OPERATOR_ID: input.operatorId ?? config.operatorId,
         PROCESSOR_ID: input.processorId,
         PAID_SECONDS: String(config.leaseSeconds ?? 3600),
-        SWITCHBOARD_QUOTE_MAX_AMOUNT: config.expectedQuoteAmount
+        SWITCHBOARD_QUOTE_CAP_AMOUNT: config.expectedQuoteAmount
       },
       stream: false
     });

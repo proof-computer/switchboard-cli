@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { classifyProcessorReadiness, selectReadyProcessors, type ProcessorInfo } from "../src/acurast-manager.js";
+import { selectValidatorLaunchProcessorsFromInventory } from "../cli/src/index.js";
 
 function processor(overrides: Partial<ProcessorInfo>): ProcessorInfo {
   return {
@@ -82,6 +83,57 @@ describe("acurast manager processor readiness", () => {
         includeProcessors: ["5Onboarded", "5NotInManager"]
       }).map((item) => item.processor),
       ["5Onboarded"]
+    );
+  });
+
+  it("selects exact fresh validator launch processor capacity", () => {
+    const readyA = processor({
+      processor: "5ReadyA",
+      heartbeatMs: 100,
+      heartbeatAgeSeconds: 60,
+      availability: {
+        proposedStartIso: "2026-04-29T00:00:00.000Z",
+        proposedEndIso: "2026-04-29T00:05:00.000Z",
+        matches: 0,
+        conflicts: 0,
+        conflictingJobs: []
+      }
+    });
+    const readyB = processor({
+      processor: "5ReadyB",
+      heartbeatMs: 200,
+      heartbeatAgeSeconds: 50,
+      availability: {
+        proposedStartIso: "2026-04-29T00:00:00.000Z",
+        proposedEndIso: "2026-04-29T00:05:00.000Z",
+        matches: 0,
+        conflicts: 0,
+        conflictingJobs: []
+      }
+    });
+    const stale = processor({
+      processor: "5Stale",
+      heartbeatAgeSeconds: 2_000,
+      availability: {
+        proposedStartIso: "2026-04-29T00:00:00.000Z",
+        proposedEndIso: "2026-04-29T00:05:00.000Z",
+        matches: 0,
+        conflicts: 0,
+        conflictingJobs: []
+      }
+    });
+
+    assert.deepEqual(
+      selectValidatorLaunchProcessorsFromInventory([stale, readyA, readyB], { requestedCount: 2 }),
+      ["5ReadyB", "5ReadyA"]
+    );
+    assert.throws(
+      () => selectValidatorLaunchProcessorsFromInventory([readyA], { requestedCount: 2 }),
+      /Insufficient fresh available validator processor capacity/
+    );
+    assert.throws(
+      () => selectValidatorLaunchProcessorsFromInventory([readyA, processor({ processor: "5NoAvailability" })], { requestedCount: 2 }),
+      /Insufficient fresh available validator processor capacity/
     );
   });
 });

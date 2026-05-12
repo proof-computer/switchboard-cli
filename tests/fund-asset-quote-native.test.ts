@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  assertQuoteWithinCap,
   quoteResponseFromDeploymentIntentStatus,
   requestDeploymentIntentGroupMemberQuoteOrResume,
   requestDeploymentIntentQuoteOrResume
@@ -297,6 +298,15 @@ describe("deployment-intent native quote recovery", () => {
       undefined
     );
   });
+
+  it("accepts cheaper funding-time quotes under a preview cap and rejects increases", () => {
+    assert.doesNotThrow(() => assertQuoteWithinCap(normalizedQuote({ ...quote, amount: "119999", maxAmount: "119999" }), "120000"));
+    assert.doesNotThrow(() => assertQuoteWithinCap(normalizedQuote(quote), "120000"));
+    assert.throws(
+      () => assertQuoteWithinCap(normalizedQuote({ ...quote, amount: "120001", maxAmount: "120001" }), "120000"),
+      /exceeds preview cap/
+    );
+  });
 });
 
 function jsonResponse(body: unknown): Response {
@@ -304,4 +314,18 @@ function jsonResponse(body: unknown): Response {
     status: 200,
     headers: { "content-type": "application/json" }
   });
+}
+
+function normalizedQuote(input: Record<string, unknown>): Parameters<typeof assertQuoteWithinCap>[0] {
+  return {
+    ...input,
+    amount: BigInt(input.amount as string),
+    minAmount: BigInt(input.minAmount as string),
+    maxAmount: BigInt(input.maxAmount as string),
+    paidSeconds: BigInt(input.paidSeconds as string),
+    serviceAmount: BigInt(input.serviceAmount as string),
+    setupFee: BigInt(input.setupFee as string),
+    validationFeeCap: BigInt(input.validationFeeCap as string),
+    deadline: BigInt(input.deadline as string)
+  } as Parameters<typeof assertQuoteWithinCap>[0];
 }

@@ -132,6 +132,13 @@ async function main() {
     const requestedEndpointHash = stringFlag(flags, "endpoint-hash") ?? process.env.ENDPOINT_HASH;
     const requestedSalt = stringFlag(flags, "session-salt") ?? process.env.SESSION_SALT;
     const requestedMaxAmount = stringFlag(flags, "max-amount") ?? process.env.SWITCHBOARD_QUOTE_MAX_AMOUNT ?? process.env.MAX_AMOUNT;
+    const quoteCapAmount =
+      stringFlag(flags, "quote-cap-amount") ??
+      process.env.SWITCHBOARD_QUOTE_CAP_AMOUNT ??
+      process.env.SWITCHBOARD_DEPLOY_EXPECTED_QUOTE_AMOUNT;
+    if (requestedMaxAmount && quoteCapAmount) {
+      throw new Error("Use either --max-amount for exact quote binding or --quote-cap-amount for preview-cap funding, not both");
+    }
     const quoteRequest = compactObject({
       developer: developerContractAddress,
       asset,
@@ -190,6 +197,7 @@ async function main() {
       endpointHostname: requestedEndpointHostname,
       salt: requestedSalt
     });
+    assertQuoteWithinCap(quote, quoteCapAmount);
 
     const token = new ethers.Contract(asset, erc20Abi, provider);
     const registry = new ethers.Contract(registryAddress, INGRESS_REGISTRY_ABI, provider);
@@ -266,6 +274,7 @@ async function main() {
         firstApprovalMinimum: approveMinimum?.toString()
       },
       intentRequest: quoteBindingRequest,
+      quoteCapAmount,
       endpointHostname: quoteResponse.endpointHostname,
       policy: quoteResponse.policy,
       allocation: quoteResponse.allocation
@@ -723,6 +732,19 @@ export function quoteResponseFromDeploymentIntentStatus(
     policy: envelope.policy,
     allocation: intent.allocation
   };
+}
+
+export function assertQuoteWithinCap(quote: ReturnType<typeof normalizeQuote>, capAmount: string | undefined): void {
+  if (!capAmount) {
+    return;
+  }
+  if (!/^[0-9]+$/.test(capAmount)) {
+    throw new Error("quote cap amount must be a non-negative integer string");
+  }
+  const cap = BigInt(capAmount);
+  if (quote.amount > cap) {
+    throw new Error(`Current quote amount ${quote.amount.toString()} exceeds preview cap ${cap.toString()}`);
+  }
 }
 
 async function readQuoteResponseFile(file: string): Promise<QuoteResponse> {
