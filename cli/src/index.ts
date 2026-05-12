@@ -2870,6 +2870,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     });
     return;
   }
+  const validatorWorkRunMs = optionalEnv("VALIDATOR_WORK_RUN_MS");
   const validatorEnvKeys = [
     "PROOF_CONTROL_PLANE_URL",
     "PROOF_VALIDATOR_LAUNCH_INTENT_ID",
@@ -2877,7 +2878,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     "VALIDATOR_ENROLLMENT_SEED",
     "VALIDATOR_WORK_MODE",
     "VALIDATOR_WORK_POLL",
-    "VALIDATOR_WORK_RUN_MS",
+    ...(validatorWorkRunMs ? ["VALIDATOR_WORK_RUN_MS"] : []),
     "VALIDATOR_DEPLOYMENT_ID",
     "VALIDATOR_ACURAST_JOB_ID"
   ];
@@ -2915,7 +2916,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     VALIDATOR_ENROLLMENT_SEED: enrollmentMnemonic,
     VALIDATOR_WORK_MODE: "poll",
     VALIDATOR_WORK_POLL: "true",
-    VALIDATOR_WORK_RUN_MS: optionalEnv("VALIDATOR_WORK_RUN_MS"),
+    VALIDATOR_WORK_RUN_MS: validatorWorkRunMs,
     VALIDATOR_DEPLOYMENT_ID: pendingDeploymentId,
     VALIDATOR_ACURAST_JOB_ID: pendingAcurastJobId,
     ACURAST_INCLUDE_ENV: validatorEnvKeys.join(",")
