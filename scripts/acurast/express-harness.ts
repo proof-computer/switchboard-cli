@@ -145,6 +145,26 @@ const DIRECT_SCHEDULE_END_ENV = "ACURAST_SCHEDULE_END_MS";
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   const config = await loadHarnessConfig(parsed.flags);
+  if (parsed.command === "update-env") {
+    if (!config.mnemonic) {
+      throw new Error(`${credentialEnvNames(config.network).seed.join(" or ")} is required for update-env`);
+    }
+    await validateAcurastAccount(config);
+    const deploymentId = stringFlag(parsed.flags, "deployment-id") ?? process.env.ACURAST_DEPLOYMENT_ID;
+    if (!deploymentId) {
+      throw new Error("Missing --deployment-id or ACURAST_DEPLOYMENT_ID for update-env");
+    }
+    await mkdir(config.stageDir, { recursive: true });
+    await writeAcurastConfig(config);
+    await writeFile(path.join(config.stageDir, ".env"), buildAcurastEnv(config));
+    await auditDeploymentEnvForRuntime(config, deploymentId);
+    await runAcurastCli(config, ["deployments", deploymentId, "--network", config.network, "--update-env-vars"], {
+      resolveOnOutput: /(?:environment variables set|Transaction ID:)/,
+      killAfterResolveMs: 2_000,
+      timeoutMs: numberEnv("ACURAST_SET_ENV_TIMEOUT_MS", 120_000)
+    });
+    return;
+  }
   const prepared = await prepareAcurastProject(config);
 
   if (parsed.command === "prepare") {
@@ -224,20 +244,6 @@ async function main() {
     }
 
     await deployDirect(config, parsed.flags);
-    return;
-  }
-
-  if (parsed.command === "update-env") {
-    const deploymentId = stringFlag(parsed.flags, "deployment-id") ?? process.env.ACURAST_DEPLOYMENT_ID;
-    if (!deploymentId) {
-      throw new Error("Missing --deployment-id or ACURAST_DEPLOYMENT_ID for update-env");
-    }
-    await auditDeploymentEnvForRuntime(config, deploymentId);
-    await runAcurastCli(config, ["deployments", deploymentId, "--network", config.network, "--update-env-vars"], {
-      resolveOnOutput: /(?:environment variables set|Transaction ID:)/,
-      killAfterResolveMs: 2_000,
-      timeoutMs: numberEnv("ACURAST_SET_ENV_TIMEOUT_MS", 120_000)
-    });
     return;
   }
 
@@ -585,7 +591,7 @@ async function deployDirect(config: HarnessConfig, flags: Map<string, string | b
     await storeDirectDeployment(config, deploymentTime, registration, result.jobId);
     console.log(`Direct deploy registered: deploymentId=${result.deploymentId} tx=${result.txHash}`);
 
-    if (!boolFlag(flags, "skip-env") && projectEnvKeys().length > 0) {
+    if (projectEnvKeys().length > 0) {
       await waitForProcessorAcknowledgement(
         api,
         result.jobId,
@@ -593,6 +599,8 @@ async function deployDirect(config: HarnessConfig, flags: Map<string, string | b
         numberFlag(flags, "ack-timeout-ms", numberEnv("ACURAST_ACK_TIMEOUT_MS", 240_000)),
         numberFlag(flags, "ack-interval-ms", numberEnv("ACURAST_ACK_INTERVAL_MS", 10_000))
       );
+    }
+    if (!boolFlag(flags, "skip-env") && projectEnvKeys().length > 0) {
       await auditDeploymentEnvForRuntime(config, result.deploymentId);
       await runAcurastCli(config, ["deployments", result.deploymentId, "--network", config.network, "--update-env-vars"], {
         resolveOnOutput: /(?:environment variables set|Transaction ID:)/,
@@ -672,6 +680,7 @@ async function latestStagedScriptIpfs(config: HarnessConfig): Promise<string | u
 }
 
 async function writeAcurastConfig(config: HarnessConfig): Promise<void> {
+  await mkdir(config.stageDir, { recursive: true });
   await writeFile(path.join(config.stageDir, "acurast.json"), `${JSON.stringify(buildAcurastConfig(config), null, 2)}\n`);
 }
 
@@ -1021,6 +1030,15 @@ function buildAcurastEnv(config: HarnessConfig): string {
 function projectEnvKeys(): string[] {
   const compactEnv = process.env.ACURAST_COMPACT_ENV === "true";
   const buildConfig = Boolean(process.env.SWITCHBOARD_BUILD_CONFIG || process.env.SWITCHBOARD_BUILD_CONFIG_FILE);
+  const explicitKeys = listEnv("ACURAST_INCLUDE_ENV").map((key) => {
+    if (!process.env[key]) {
+      throw new Error(`${key} is listed in ACURAST_INCLUDE_ENV but is not set`);
+    }
+    return key;
+  });
+  if (process.env.ACURAST_EXPLICIT_ENV_ONLY === "true") {
+    return unique(explicitKeys);
+  }
   const baseKeys = [];
   if (process.env.SWITCHBOARD_AUTO_REGISTER || !compactEnv || !buildConfig) {
     baseKeys.push("SWITCHBOARD_AUTO_REGISTER");
@@ -1073,13 +1091,6 @@ function projectEnvKeys(): string[] {
     "SWITCHBOARD_CONTROL_TOKEN",
     DIRECT_SCHEDULE_END_ENV
   ].filter((key) => process.env[key]);
-  const explicitKeys = listEnv("ACURAST_INCLUDE_ENV").map((key) => {
-    if (!process.env[key]) {
-      throw new Error(`${key} is listed in ACURAST_INCLUDE_ENV but is not set`);
-    }
-    return key;
-  });
-
   return unique([
     ...baseKeys,
     ...optionalKeys,

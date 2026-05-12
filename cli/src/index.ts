@@ -2812,10 +2812,11 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
   }
   const ss58Format = numberFlag(flags, "ss58-format", "VALIDATOR_REPORT_SS58_FORMAT", 42);
   const deployer = await accountFromUri(seed, ss58Format);
+  const targetNetwork = stringFlag(flags, "acurast-network") ?? runtime.context?.acurastNetwork ?? "mainnet";
   const intentPayload = {
     deployerAddress: deployer.address,
     requestedCount: numberFlag(flags, "count", "PROOF_VALIDATOR_LAUNCH_COUNT", 1),
-    targetNetwork: stringFlag(flags, "acurast-network") ?? runtime.context?.acurastNetwork ?? "mainnet",
+    targetNetwork,
     nonce: randomNonce(),
     deadline: String(Math.floor(Date.now() / 1000) + 300)
   };
@@ -2855,25 +2856,60 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     return;
   }
 
-  const deployRunner = await resolveAcurastDirectDeployRunner(["--script-ipfs", scriptIpfs], {
+  const durationMinutes = optionalIntegerFlag(flags, "duration-minutes", "SWITCHBOARD_DEPLOY_DURATION_MINUTES");
+  const scheduleBufferMinutes = optionalIntegerFlag(flags, "schedule-buffer-minutes", "SWITCHBOARD_DEPLOY_SCHEDULE_BUFFER_MINUTES") ?? 0;
+  const validatorExecutionMs = durationMinutes === undefined
+    ? optionalEnv("ACURAST_EXECUTION_MS")
+    : String((durationMinutes + scheduleBufferMinutes) * 60_000);
+  const validatorEnvKeys = [
+    "PROOF_CONTROL_PLANE_URL",
+    "PROOF_VALIDATOR_LAUNCH_INTENT_ID",
+    "PROOF_VALIDATOR_DEPLOYER_ADDRESS",
+    "VALIDATOR_ENROLLMENT_SEED",
+    "VALIDATOR_WORK_MODE",
+    "VALIDATOR_WORK_POLL",
+    "VALIDATOR_WORK_RUN_MS",
+    "VALIDATOR_DEPLOYMENT_ID",
+    "VALIDATOR_ACURAST_JOB_ID"
+  ];
+  const pendingDeploymentId = "__SWITCHBOARD_PENDING_VALIDATOR_DEPLOYMENT_ID__";
+  const pendingAcurastJobId = "__SWITCHBOARD_PENDING_VALIDATOR_ACURAST_JOB_ID__";
+
+  const deployRunner = await resolveAcurastDirectDeployRunner(["--script-ipfs", scriptIpfs, "--skip-env"], {
     ...contextRuntimeEnv(runtime),
     ACURAST_MAINNET_SEED: seed,
+    ACURAST_SEED: optionalEnv("ACURAST_SEED") ?? seed,
+    ACURAST_CANARY_SEED: optionalEnv("ACURAST_CANARY_SEED"),
+    ACURAST_ASSUME_YES: boolFlag(flags, "yes") ? "true" : optionalEnv("ACURAST_ASSUME_YES"),
+    ACURAST_COMPACT_ENV: "true",
+    ACURAST_EXPLICIT_ENV_ONLY: "true",
     ACURAST_SCRIPT_IPFS: scriptIpfs,
     ACURAST_ENTRYPOINT: "validator-job",
+    ACURAST_NETWORK: targetNetwork,
+    ACURAST_RPC: optionalEnv("ACURAST_RPC"),
+    ACURAST_MANAGER_ID: optionalEnv("ACURAST_MANAGER_ID"),
+    ACURAST_INSTANT_MATCH_PROCESSORS: optionalEnv("ACURAST_INSTANT_MATCH_PROCESSORS"),
+    ACURAST_EXECUTION_MS: validatorExecutionMs,
+    ACURAST_START_DELAY_MS: optionalEnv("ACURAST_START_DELAY_MS"),
+    ACURAST_MAX_ALLOWED_START_DELAY_MS: optionalEnv("ACURAST_MAX_ALLOWED_START_DELAY_MS"),
+    ACURAST_INSTANT_MATCH_START_DELAY_MS: optionalEnv("ACURAST_INSTANT_MATCH_START_DELAY_MS"),
+    ACURAST_MAX_COST_PER_EXECUTION: stringFlag(flags, "max-cost-per-execution") ?? optionalEnv("ACURAST_MAX_COST_PER_EXECUTION"),
+    ACURAST_ACK_TIMEOUT_MS: optionalEnv("ACURAST_ACK_TIMEOUT_MS"),
+    ACURAST_ACK_INTERVAL_MS: optionalEnv("ACURAST_ACK_INTERVAL_MS"),
+    ACURAST_SET_ENV_TIMEOUT_MS: optionalEnv("ACURAST_SET_ENV_TIMEOUT_MS"),
+    SWITCHBOARD_DEPLOY_PROCESSOR: optionalEnv("SWITCHBOARD_DEPLOY_PROCESSOR"),
+    SWITCHBOARD_DEPLOY_DURATION_MINUTES: durationMinutes === undefined ? optionalEnv("SWITCHBOARD_DEPLOY_DURATION_MINUTES") : String(durationMinutes),
+    SWITCHBOARD_DEPLOY_SCHEDULE_BUFFER_MINUTES: String(scheduleBufferMinutes),
     PROOF_CONTROL_PLANE_URL: relayUrl,
     PROOF_VALIDATOR_LAUNCH_INTENT_ID: stringRecordField(intentRecord, "intentId"),
     PROOF_VALIDATOR_DEPLOYER_ADDRESS: deployer.address,
     VALIDATOR_ENROLLMENT_SEED: enrollmentMnemonic,
     VALIDATOR_WORK_MODE: "poll",
     VALIDATOR_WORK_POLL: "true",
-    ACURAST_INCLUDE_ENV: [
-      "PROOF_CONTROL_PLANE_URL",
-      "PROOF_VALIDATOR_LAUNCH_INTENT_ID",
-      "PROOF_VALIDATOR_DEPLOYER_ADDRESS",
-      "VALIDATOR_ENROLLMENT_SEED",
-      "VALIDATOR_WORK_MODE",
-      "VALIDATOR_WORK_POLL"
-    ].join(",")
+    VALIDATOR_WORK_RUN_MS: optionalEnv("VALIDATOR_WORK_RUN_MS"),
+    VALIDATOR_DEPLOYMENT_ID: pendingDeploymentId,
+    VALIDATOR_ACURAST_JOB_ID: pendingAcurastJobId,
+    ACURAST_INCLUDE_ENV: validatorEnvKeys.join(",")
   });
   const deployResult = await runCliChild(deployRunner.command, deployRunner.args, {
     env: {
@@ -2885,10 +2921,24 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
   if (!deploymentId) {
     throw new Error("Acurast deployment completed but did not print deploymentId=<id>");
   }
+  const acurastJobId = JSON.stringify([{ acurast: deployer.address }, deploymentId]);
+  const updateEnvRunner = await resolveAcurastUpdateEnvRunner(["--deployment-id", deploymentId], {
+    ...deployRunner.env,
+    VALIDATOR_DEPLOYMENT_ID: deploymentId,
+    VALIDATOR_ACURAST_JOB_ID: acurastJobId,
+    ACURAST_DEPLOYMENT_ID: deploymentId
+  });
+  await runCliChild(updateEnvRunner.command, updateEnvRunner.args, {
+    env: {
+      ...updateEnvRunner.env
+    },
+    childStdoutToStderr: boolFlag(flags, "json")
+  });
 
   const registrationPayload = {
+    intentId: requiredStringRecordField(intentRecord, "intentId"),
     deployerAddress: deployer.address,
-    acurastJobId: JSON.stringify([{ acurast: deployer.address }, deploymentId]),
+    acurastJobId,
     acurastDeploymentId: deploymentId,
     scriptIpfs,
     scriptHash: stringRecordField(intentRecord, "validatorScriptHash"),
@@ -5759,10 +5809,26 @@ async function resolveAcurastDirectDeployRunner(
   args: string[],
   env: Record<string, string | undefined>
 ): Promise<{ command: string; args: string[]; env: Record<string, string | undefined> }> {
-  if (await repoScriptAvailable("acurast:deploy-express:direct")) {
+  return resolveAcurastExpressRunner("deploy-direct", "acurast:deploy-express:direct", args, env);
+}
+
+async function resolveAcurastUpdateEnvRunner(
+  args: string[],
+  env: Record<string, string | undefined>
+): Promise<{ command: string; args: string[]; env: Record<string, string | undefined> }> {
+  return resolveAcurastExpressRunner("update-env", "acurast:update-env-express", args, env);
+}
+
+async function resolveAcurastExpressRunner(
+  commandName: "deploy-direct" | "update-env",
+  repoScriptName: string,
+  args: string[],
+  env: Record<string, string | undefined>
+): Promise<{ command: string; args: string[]; env: Record<string, string | undefined> }> {
+  if (await repoScriptAvailable(repoScriptName)) {
     return {
       command: "pnpm",
-      args: ["acurast:deploy-express:direct", "--", ...args],
+      args: [repoScriptName, "--", ...args],
       env: {
         ...env,
         SWITCHBOARD_SKIP_BUNDLE_BUILD: "true"
@@ -5781,7 +5847,7 @@ async function resolveAcurastDirectDeployRunner(
 
   return {
     command: process.execPath,
-    args: [acurastExpress, "deploy-direct", ...args],
+    args: [acurastExpress, commandName, ...args],
     env: {
       ...env,
       SWITCHBOARD_WORK_DIR: process.cwd(),

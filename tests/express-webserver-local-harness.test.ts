@@ -124,7 +124,11 @@ setInterval(() => {}, 1000);
         FAKE_NPX_GRANDCHILD_PID: grandchildPidPath,
         NPX_BINARY: fakeNpx,
         SWITCHBOARD_PREBUILT_JOB_BUNDLE: bundlePath,
-        SWITCHBOARD_WORK_DIR: repoRoot
+        SWITCHBOARD_WORK_DIR: repoRoot,
+        ACURAST_EXPLICIT_ENV_ONLY: "true",
+        ACURAST_INCLUDE_ENV: "VALIDATOR_DEPLOYMENT_ID,VALIDATOR_ACURAST_JOB_ID",
+        VALIDATOR_DEPLOYMENT_ID: "123",
+        VALIDATOR_ACURAST_JOB_ID: "job-123"
       });
       const currentRun = run;
       const exit = await waitForExit(currentRun, 12_000);
@@ -132,6 +136,9 @@ setInterval(() => {}, 1000);
       assert.ok(exit, childOutput(currentRun));
       assert.equal(exit.code, 0, childOutput(currentRun));
       assert.match(childOutput(currentRun), /environment variables set/);
+      const stagedEnv = await readFile(path.join(stageDir, ".env"), "utf8");
+      assert.match(stagedEnv, /^VALIDATOR_DEPLOYMENT_ID="123"$/m);
+      assert.match(stagedEnv, /^VALIDATOR_ACURAST_JOB_ID="job-123"$/m);
 
       const grandchildPid = Number((await readFile(grandchildPidPath, "utf8")).trim());
       await waitFor(async () => !processAlive(grandchildPid), 3_000, () => childOutput(currentRun));

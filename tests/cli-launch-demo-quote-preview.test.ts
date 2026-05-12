@@ -21,26 +21,26 @@ describe("launch-demo quote preview formatting", () => {
       formatLaunchDemoQuotePreview({
         ok: true,
         asset: "0x0000000000000000000000000000000000001337",
-        amount: "4032000",
+        amount: "3024000",
         paidSeconds: "2419200",
-        formattedAmount: "4.032 USDC",
+        formattedAmount: "3.024 USDC",
         preview: {
-          amount: "4032000",
+          amount: "3024000",
           asset: "0x0000000000000000000000000000000000001337",
           paidSeconds: "2419200"
         }
       } as any),
-      "4.032 USDC"
+      "3.024 USDC"
     );
   });
 
   it("formats additive line-item metadata when a relay returns it", () => {
     const lineItemSummary = formatLaunchDemoQuoteLineItems(
       {
-        amount: "4032000",
+        amount: "3024000",
         asset: "0x0000000000000000000000000000000000001337",
         lineItems: [
-          { code: "base_route", label: "Base route", amount: "4032000", unit: "asset_base_units" },
+          { code: "base_route", label: "Base route", amount: "3024000", unit: "asset_base_units" },
           { code: "setup_reserve", label: "Setup reserve", amount: "0", unit: "asset_base_units" },
           { code: "validation_cap", label: "Validation cap", amount: "0", unit: "asset_base_units" },
           { code: "dns_tls", label: "DNS/TLS", amount: "0", unit: "asset_base_units", detail: "included", included: true },
@@ -58,18 +58,18 @@ describe("launch-demo quote preview formatting", () => {
       manifestConfig
     );
 
-    assert.equal(lineItemSummary, "Base route 4.032 USDC; DNS/TLS included; Fair-use bandwidth standard");
+    assert.equal(lineItemSummary, "Base route 3.024 USDC; DNS/TLS included; Fair-use bandwidth standard");
     assert.equal(
       formatLaunchDemoQuotePreview({
         ok: true,
         asset: "0x0000000000000000000000000000000000001337",
-        amount: "4032000",
+        amount: "3024000",
         paidSeconds: "2419200",
-        formattedAmount: `4.032 USDC (${lineItemSummary})`,
+        formattedAmount: `3.024 USDC (${lineItemSummary})`,
         lineItemSummary,
         preview: {}
       } as any),
-      "4.032 USDC (Base route 4.032 USDC; DNS/TLS included; Fair-use bandwidth standard)"
+      "3.024 USDC (Base route 3.024 USDC; DNS/TLS included; Fair-use bandwidth standard)"
     );
   });
 });
