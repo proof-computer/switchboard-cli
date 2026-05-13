@@ -47,6 +47,7 @@ interface HarnessConfig {
   hostname: string;
   endpointHostnameExplicit: boolean;
   validationHostname: string;
+  validationHostnameExplicit: boolean;
   port: number;
   durationMinutes?: number;
   leaseSeconds?: number;
@@ -522,6 +523,10 @@ async function main(): Promise<void> {
     const fundedHostname = stringField(funding, "endpointHostname");
     if (fundedHostname) {
       config.hostname = normalizeDnsHostname(fundedHostname);
+      const fundedValidationHostname = stringField(funding, "validationHostname");
+      if (fundedValidationHostname || !config.validationHostnameExplicit) {
+        config.validationHostname = normalizeDnsHostname(fundedValidationHostname || fundedHostname);
+      }
       config.certificateHostnames = [config.hostname];
       if (!config.dns.publicProbeModeExplicit && isCanonicalConsumerIngressHostname(config.hostname)) {
         config.dns.publicProbeMode = "dns";
@@ -832,6 +837,10 @@ async function runDeploymentIntentGroup(
       const endpointHostname = stringField(funding, "endpointHostname");
       if (endpointHostname) {
         config.hostname = normalizeDnsHostname(endpointHostname);
+        const validationHostname = stringField(funding, "validationHostname");
+        if (validationHostname || !config.validationHostnameExplicit) {
+          config.validationHostname = normalizeDnsHostname(validationHostname || endpointHostname);
+        }
         config.certificateHostnames = [config.hostname];
         if (!config.dns.publicProbeModeExplicit && isCanonicalConsumerIngressHostname(config.hostname)) {
           config.dns.publicProbeMode = "dns";
@@ -1037,11 +1046,12 @@ function loadConfig(flags: Map<string, string | boolean>): HarnessConfig {
     stringEnv("SWITCHBOARD_DEPLOY_ENDPOINT_HOSTNAME") ??
     stringFlag(flags, "hostname") ??
     stringEnv("SWITCHBOARD_DEPLOY_HOSTNAME");
+  const explicitValidationHostname =
+    stringFlag(flags, "validation-hostname") ??
+    stringEnv("SWITCHBOARD_DEPLOY_VALIDATION_HOSTNAME");
   const hostname = normalizeDnsHostname(explicitEndpointHostname ?? `switchboard-${runId}.${hostnameSuffix}`);
   const validationHostname = normalizeDnsHostname(
-    stringFlag(flags, "validation-hostname") ??
-    stringEnv("SWITCHBOARD_DEPLOY_VALIDATION_HOSTNAME") ??
-    `switchboard-${runId}-validation.${hostnameSuffix}`
+    explicitValidationHostname ?? `switchboard-${runId}-validation.${hostnameSuffix}`
   );
   const defaultCertificateHostnames = hostname;
   const certificateHostnames = splitCsv(
@@ -1148,6 +1158,7 @@ function loadConfig(flags: Map<string, string | boolean>): HarnessConfig {
     managerId: managerId ?? "",
     hostname: normalizeDnsHostname(hostname),
     endpointHostnameExplicit: Boolean(explicitEndpointHostname),
+    validationHostnameExplicit: Boolean(explicitValidationHostname),
     validationHostname: normalizeDnsHostname(validationHostname),
     port: numberFlag(flags, "port", numberEnv("SWITCHBOARD_DEPLOY_PORT", 3443)),
     durationMinutes,
@@ -1509,6 +1520,7 @@ export function buildDeploymentIntentCreateBody(
     jobId: input.jobId,
     operatorId: config.operatorId,
     processorId: input.processorId,
+    ...(config.gatewayId ? { gatewayId: config.gatewayId } : {}),
     source: {
       mode: "switchboard-deploy",
       runId: config.runId,
@@ -2466,6 +2478,7 @@ async function fundQuotedSession(
     action: "fund-quoted-session",
     sessionId,
     endpointHostname: stringField(funded, "endpointHostname"),
+    validationHostname: stringField(funded, "validationHostname"),
     paymentAmount: requiredStringField(quote, "amount"),
     txHash: stringField(fundingTx, "txHash"),
     fundingTxHash: stringField(fundingTx, "txHash")

@@ -31,6 +31,7 @@ export interface QuoteResponse {
   quote: Record<string, unknown>;
   signature: string;
   endpointHostname?: string;
+  validationHostname?: string;
   policy?: unknown;
   allocation?: unknown;
 }
@@ -276,6 +277,7 @@ async function main() {
       intentRequest: quoteBindingRequest,
       quoteCapAmount,
       endpointHostname: quoteResponse.endpointHostname,
+      validationHostname: quoteResponse.validationHostname ?? stringField(objectField(quoteResponse, "intent"), "validationHostname"),
       policy: quoteResponse.policy,
       allocation: quoteResponse.allocation
     };
@@ -729,6 +731,7 @@ export function quoteResponseFromDeploymentIntentStatus(
     quote,
     signature,
     endpointHostname: stringField(intent, "endpointHostname"),
+    validationHostname: stringField(intent, "validationHostname"),
     policy: envelope.policy,
     allocation: intent.allocation
   };

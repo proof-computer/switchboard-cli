@@ -67,6 +67,7 @@ describe("switchboard deploy helper script resolution", () => {
       assert.equal("validationHostname" in single, false);
       assert.equal("preferredDomain" in single, false);
       assert.equal("allocation" in single, false);
+      assert.equal(single.gatewayId, "gateway-a");
 
       const group = mod.buildDeploymentIntentGroupCreateBody({
         ...config,
