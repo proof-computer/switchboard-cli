@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { encodeAddress } from "@polkadot/util-crypto";
 
+import { readLaunchDemoCapabilityReports } from "../cli/src/index.js";
 import { signNetworkManifest, type NetworkManifest } from "../src/network-manifest.js";
 
 const cliRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -15,6 +16,38 @@ const cliPath = path.join(cliRoot, "cli/src/index.ts");
 const manifestSignerSeed = "//Alice//switchboard-network-manifest";
 
 describe("switchboard deploy pinned capacity selection", () => {
+  it("reads launch capacity from another catalog relay when one relay is stale", async () => {
+    const operatorId = hex32("aa");
+    const report = capacityReport({ operatorId, gatewayId: "gateway-fresh", processorId: hex32("11"), routeStateAvailable: true });
+    const stale = await startJsonServer((_url, response) => {
+      response.statusCode = 503;
+      sendJson(response, {
+        error: "stale_read_model",
+        retryable: true,
+        mutationApplied: false,
+        dataSet: "operatorCapacity",
+        staleReason: "no_local_operator_capability_reports_after_dns_fanout"
+      });
+    });
+    const fresh = await startJsonServer((url, response) => {
+      if (url.pathname === "/v1/operator-capacity") {
+        sendJson(response, { ok: true, latest: [report] });
+        return;
+      }
+      response.statusCode = 404;
+      sendJson(response, { error: "not_found" });
+    });
+    try {
+      const reports = await readLaunchDemoCapabilityReports([stale.baseUrl, fresh.baseUrl]);
+      assert.equal(reports.length, 1);
+      assert.equal(reports[0].report.operator.gatewayId, "gateway-fresh");
+      assert.equal(reports[0].sourceRelayUrl, fresh.baseUrl);
+    } finally {
+      await stale.close();
+      await fresh.close();
+    }
+  });
+
   it("selects a route-state gateway for operator-only contexts", async () => {
     const operatorId = hex32("aa");
     const otherOperatorId = hex32("bb");
@@ -332,6 +365,23 @@ function runCli(cwd: string, args: string[]): Promise<{ code: number | null; std
       });
     });
   });
+}
+
+async function startJsonServer(
+  handler: (url: URL, response: ServerResponse, request: IncomingMessage) => void
+): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+    const baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    handler(new URL(request.url ?? "/", baseUrl), response, request);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.listen(0, "127.0.0.1", () => resolve());
+    server.once("error", reject);
+  });
+  return {
+    baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+  };
 }
 
 async function writeContext(

@@ -211,6 +211,7 @@ export interface CliNetworkConfig {
   chainId?: string;
   registryAddress?: string;
   relayUrl?: string;
+  controlApiUrls?: string[];
   ethRpcUrl?: string;
   substrateWsUrl?: string;
   defaultAssetAddress?: string;
@@ -1366,6 +1367,7 @@ interface LaunchDemoCapacitySelection {
   activeRouteCount: number;
   routeCapacity: number;
   readiness: ProcessorInfo;
+  sourceRelayUrl?: string;
 }
 
 interface LaunchDemoProcessorSelection {
@@ -1384,6 +1386,7 @@ interface LaunchDemoMemberSelection extends LaunchDemoProcessorSelection {
   publicAddresses: string[];
   activeRouteCount: number;
   routeCapacity: number;
+  sourceRelayUrl?: string;
 }
 
 type LaunchDemoGatewayCapabilityReport = GatewayCapabilityReport & {
@@ -1395,6 +1398,7 @@ type LaunchDemoGatewayCapabilityReport = GatewayCapabilityReport & {
 interface LaunchDemoCapacityReport {
   receivedAt?: string;
   report: LaunchDemoGatewayCapabilityReport;
+  sourceRelayUrl?: string;
 }
 
 type LaunchDemoQuotePreview =
@@ -1440,6 +1444,9 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     optionalEnv("SWITCHBOARD_LAUNCH_DEMO_RELAY_URL") ??
     manifestConfig.relayUrl ??
     DEFAULT_CONTROL_PLANE_URL;
+  const relayUrls = controlRelayCandidateUrls(relayUrl, manifestConfig, {
+    pinned: relayUrlPinnedByUser(flags, ["SWITCHBOARD_LAUNCH_DEMO_RELAY_URL"])
+  });
   const target = targetFromFlags(flags, manifestConfig);
   const acurastNetwork = launchDemoAcurastNetwork(flags);
   const durationMinutes = numberFlag(
@@ -1459,20 +1466,9 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     stringFlag(flags, "max-cost-per-execution") ??
     optionalEnv("ACURAST_MAX_COST_PER_EXECUTION") ??
     DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION;
-  const ingressEstimate = await fetchLaunchDemoQuotePreview({
-    relayUrl,
-    assetAddress: manifestConfig.defaultAssetAddress,
-    paidSeconds,
-    manifestConfig,
-    timeoutMs: numberFlag(flags, "quote-preview-timeout-ms", "SWITCHBOARD_LAUNCH_DEMO_QUOTE_PREVIEW_TIMEOUT_MS", 15_000)
-  });
-  launchDemoDebug(`quote preview ${ingressEstimate.ok ? "ok" : "unavailable"}`);
-  if (!boolFlag(flags, "dry-run") && !ingressEstimate.ok) {
-    throw new Error(`Ingress quote preview unavailable: ${ingressEstimate.error}`);
-  }
-
   const selection = await selectLaunchDemoCapacity({
     relayUrl,
+    relayUrls,
     network: acurastNetwork,
     durationMinutes,
     scheduleBufferMinutes,
@@ -1483,6 +1479,18 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     processor: stringFlag(flags, "processor")
   });
   launchDemoDebug(`selected ${selection.processors.length} processor candidate(s)`);
+  const operationRelayUrl = selection.sourceRelayUrl ?? relayUrl;
+  const ingressEstimate = await fetchLaunchDemoQuotePreview({
+    relayUrl: operationRelayUrl,
+    assetAddress: manifestConfig.defaultAssetAddress,
+    paidSeconds,
+    manifestConfig,
+    timeoutMs: numberFlag(flags, "quote-preview-timeout-ms", "SWITCHBOARD_LAUNCH_DEMO_QUOTE_PREVIEW_TIMEOUT_MS", 15_000)
+  });
+  launchDemoDebug(`quote preview ${ingressEstimate.ok ? "ok" : "unavailable"}`);
+  if (!boolFlag(flags, "dry-run") && !ingressEstimate.ok) {
+    throw new Error(`Ingress quote preview unavailable: ${ingressEstimate.error}`);
+  }
   const demoProject = await createLaunchDemoProject(flags);
   launchDemoDebug("created demo project");
 
@@ -1491,7 +1499,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     "--",
     "--yes",
     "--relay-url",
-    relayUrl,
+    operationRelayUrl,
     "--operator-id",
     selection.operatorId,
     "--dns",
@@ -1523,7 +1531,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
   if (selection.managerId) {
     childArgs.push("--manager-id", selection.managerId);
   }
-  if (boolFlag(flags, "allow-local-relay") || isPrivateOrLocalUrl(relayUrl)) {
+  if (boolFlag(flags, "allow-local-relay") || isPrivateOrLocalUrl(operationRelayUrl)) {
     childArgs.push("--allow-local-relay");
   }
   if (boolFlag(flags, "public-probe-insecure")) {
@@ -1542,7 +1550,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     SWITCHBOARD_DEPLOY_OPERATOR_PUBLIC_ADDRESSES: JSON.stringify(selection.publicAddresses),
     ACURAST_INSTANT_MATCH_PROCESSORS: selection.members.map((member) => member.processor).join(","),
     ACURAST_REPLICAS: groupDeployEnabled ? String(selection.members.length) : undefined,
-    SWITCHBOARD_DEPLOY_RELAY_URL: relayUrl,
+    SWITCHBOARD_DEPLOY_RELAY_URL: operationRelayUrl,
     SWITCHBOARD_DEPLOY_ROUTE_ACTIVATION_MODE: "relay-reconciled",
     SWITCHBOARD_DEPLOY_VALIDATOR_MODE: "skip",
     SWITCHBOARD_DEPLOY_DURATION_MINUTES: String(durationMinutes),
@@ -1566,8 +1574,8 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     HUB_ETH_RPC_URL: manifestConfig.ethRpcUrl,
     HUB_SUBSTRATE_WS_URL: manifestConfig.substrateWsUrl,
     CHAIN_ID: manifestConfig.chainId,
-    RELAY_URL: relayUrl,
-    PROOF_CONTROL_PLANE_URL: relayUrl,
+    RELAY_URL: operationRelayUrl,
+    PROOF_CONTROL_PLANE_URL: operationRelayUrl,
     PAYMENT_ASSET_ADDRESS: manifestConfig.defaultAssetAddress,
     PROOF_QUOTE_DEFAULT_ASSET: manifestConfig.defaultAssetAddress,
     SWITCHBOARD_DEPLOY_EXPECTED_QUOTE_AMOUNT: ingressEstimate.ok ? ingressEstimate.amount : undefined,
@@ -1580,7 +1588,8 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
       action: "launch-demo-dry-run",
       command: SWITCHBOARD_CLI,
       args: ["launch-demo", "--yes-spend"],
-      relayUrl,
+      relayUrl: operationRelayUrl,
+      relayCandidates: relayUrls,
       target: target.name,
       acurastNetwork,
       durationMinutes,
@@ -1599,7 +1608,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     writeOutput(flags, output, () => {
       console.log(sectionTitle("Switchboard launch-demo dry run"));
       printOutputRows([
-        { label: "Relay", value: relayUrl },
+        { label: "Relay", value: operationRelayUrl },
         { label: "Operator", value: formatOperator(selection.operatorId, selection.gatewayId) },
         { label: "Manager", value: selection.managerId ?? "pinned processor" },
         { label: "Processors", value: formatLaunchDemoProcessors(selection) },
@@ -1625,7 +1634,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
   });
   if (!boolFlag(flags, "json")) {
     printLaunchDemoStart({
-      relayUrl,
+      relayUrl: operationRelayUrl,
       target: target.name,
       acurastNetwork,
       durationMinutes,
@@ -1653,7 +1662,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
   const report = JSON.parse(await readFile(reportPath, "utf8")) as Record<string, any>;
   const output = deployOutput(report, reportPath, {
     action: "launch-demo",
-    relayUrl,
+    relayUrl: operationRelayUrl,
     routeActivationMode: "relay-reconciled",
     certificateMode: "job-acme",
     maxCostPerExecution,
@@ -1788,8 +1797,35 @@ function launchDemoMinReady(flags: Map<string, string | boolean>, processorCount
   return minReady;
 }
 
+function relayUrlPinnedByUser(flags: Map<string, string | boolean>, envNames: string[]): boolean {
+  return Boolean(stringFlag(flags, "relay-url") || envNames.some((name) => Boolean(optionalEnv(name))));
+}
+
+function controlRelayCandidateUrls(
+  primaryRelayUrl: string,
+  manifestConfig: CliNetworkConfig,
+  options: { pinned: boolean }
+): string[] {
+  if (options.pinned) {
+    return [normalizeCliBaseUrl(primaryRelayUrl)];
+  }
+  return uniqueStrings([
+    primaryRelayUrl,
+    ...(manifestConfig.controlApiUrls ?? [])
+  ].map(normalizeCliBaseUrl));
+}
+
+function normalizeCliBaseUrl(value: string): string {
+  return new URL("/", value).toString().replace(/\/$/, "");
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
+}
+
 async function selectLaunchDemoCapacity(input: {
   relayUrl: string;
+  relayUrls?: string[];
   network: AcurastNetwork;
   durationMinutes: number;
   scheduleBufferMinutes: number;
@@ -1799,7 +1835,8 @@ async function selectLaunchDemoCapacity(input: {
   gatewayId?: string;
   processor?: string;
 }): Promise<LaunchDemoCapacitySelection> {
-  const reports = await readLaunchDemoCapabilityReports(input.relayUrl);
+  const relayUrls = input.relayUrls?.length ? input.relayUrls : [input.relayUrl];
+  const reports = await readLaunchDemoCapabilityReports(relayUrls);
   const errors: string[] = [];
   const requestedOperatorId = input.operatorId?.toLowerCase();
   const requestedProcessorId = input.processor ? processorRefToId(input.processor) : undefined;
@@ -1863,7 +1900,7 @@ async function selectLaunchDemoCapacity(input: {
           const processorId = processorRefToId(processor);
           if (!processorId) continue;
           candidates.push(
-            launchDemoMemberFromReport(report, {
+            launchDemoMemberFromReport(stored, {
               memberId: `member-${candidates.length + 1}`,
               processor,
               processorId,
@@ -1886,7 +1923,8 @@ async function selectLaunchDemoCapacity(input: {
       input.processor ? `processor ${input.processor}` : undefined
     ].filter(Boolean).join(", ");
     const scope = pinned ? ` for ${pinned}` : "";
-    throw new Error(`Only ${candidates.length}/${input.processorCount} launch-demo processors are currently available from ${input.relayUrl}${scope}.${reason}`);
+    const source = relayUrls.length === 1 ? relayUrls[0] : `${relayUrls.length} control relays`;
+    throw new Error(`Only ${candidates.length}/${input.processorCount} launch-demo processors are currently available from ${source}${scope}.${reason}`);
   }
 
   const selectedMembers = selectLaunchDemoCandidatePool(candidates, input.processorCount);
@@ -1915,7 +1953,7 @@ export function selectLaunchDemoCandidatePool(
 }
 
 function launchDemoMemberFromReport(
-  report: GatewayCapabilityReport,
+  report: LaunchDemoCapacityReport,
   input: {
     memberId: string;
     processor: string;
@@ -1926,17 +1964,18 @@ function launchDemoMemberFromReport(
 ): LaunchDemoMemberSelection {
   return {
     memberId: input.memberId,
-    operatorId: report.operator.operatorId.toLowerCase(),
-    gatewayId: report.operator.gatewayId,
+    operatorId: report.report.operator.operatorId.toLowerCase(),
+    gatewayId: report.report.operator.gatewayId,
     managerId: input.managerId,
     processor: input.processor,
     processorId: input.processorId,
     readiness: input.readiness,
-    reportId: report.reportId,
-    reportExpiresAt: report.expiresAt,
-    publicAddresses: report.gateway.publicAddresses,
-    activeRouteCount: report.gateway.activeRouteCount,
-    routeCapacity: report.gateway.routeCapacity
+    reportId: report.report.reportId,
+    reportExpiresAt: report.report.expiresAt,
+    publicAddresses: report.report.gateway.publicAddresses,
+    activeRouteCount: report.report.gateway.activeRouteCount,
+    routeCapacity: report.report.gateway.routeCapacity,
+    sourceRelayUrl: report.sourceRelayUrl
   };
 }
 
@@ -1952,11 +1991,12 @@ function capabilityReportProcessorReadiness(processor: string): ProcessorInfo {
 
 async function selectDeployCapacity(input: {
   relayUrl: string;
+  relayUrls?: string[];
   operatorId?: string;
   gatewayId?: string;
 }): Promise<LaunchDemoCapacitySelection> {
   const requestedOperatorId = input.operatorId?.toLowerCase();
-  const reports = await readLaunchDemoCapabilityReports(input.relayUrl);
+  const reports = await readLaunchDemoCapabilityReports(input.relayUrls?.length ? input.relayUrls : [input.relayUrl]);
   const errors: string[] = [];
   const candidates: LaunchDemoMemberSelection[] = [];
 
@@ -2000,7 +2040,8 @@ async function selectDeployCapacity(input: {
         reportExpiresAt: report.expiresAt,
         publicAddresses: report.gateway.publicAddresses,
         activeRouteCount: report.gateway.activeRouteCount,
-        routeCapacity: report.gateway.routeCapacity
+        routeCapacity: report.gateway.routeCapacity,
+        sourceRelayUrl: stored.sourceRelayUrl
       });
     }
   }
@@ -2020,6 +2061,7 @@ async function selectDeployCapacity(input: {
 
 export async function selectPinnedDeployCapacity(input: {
   relayUrl: string;
+  relayUrls?: string[];
   operatorId: string;
   processor: string;
 }): Promise<LaunchDemoCapacitySelection> {
@@ -2029,7 +2071,7 @@ export async function selectPinnedDeployCapacity(input: {
     throw new Error(`Cannot normalize pinned processor ${input.processor}; expected a 32-byte hex processor ID or SS58 processor address.`);
   }
 
-  const reports = await readLaunchDemoCapabilityReports(input.relayUrl);
+  const reports = await readLaunchDemoCapabilityReports(input.relayUrls?.length ? input.relayUrls : [input.relayUrl]);
   const errors: string[] = [];
   const candidates: LaunchDemoMemberSelection[] = [];
 
@@ -2068,7 +2110,8 @@ export async function selectPinnedDeployCapacity(input: {
       reportExpiresAt: report.expiresAt,
       publicAddresses: report.gateway.publicAddresses,
       activeRouteCount: report.gateway.activeRouteCount,
-      routeCapacity: report.gateway.routeCapacity
+      routeCapacity: report.gateway.routeCapacity,
+      sourceRelayUrl: stored.sourceRelayUrl
     };
     candidates.push(member);
   }
@@ -2153,30 +2196,98 @@ function launchDemoSelectionFromMembers(members: LaunchDemoMemberSelection[]): L
     publicAddresses: first.publicAddresses,
     activeRouteCount: first.activeRouteCount,
     routeCapacity: first.routeCapacity,
-    readiness: first.readiness
+    readiness: first.readiness,
+    sourceRelayUrl: first.sourceRelayUrl
   };
 }
 
-async function readLaunchDemoCapabilityReports(relayUrl: string): Promise<LaunchDemoCapacityReport[]> {
+export async function readLaunchDemoCapabilityReports(relayUrls: string | string[]): Promise<LaunchDemoCapacityReport[]> {
+  const urls = Array.isArray(relayUrls) ? relayUrls : [relayUrls];
+  if (urls.length === 1) {
+    return readLaunchDemoCapabilityReportsFromRelay(urls[0]);
+  }
+  const results = await Promise.all(urls.map((relayUrl) => readLaunchDemoCapacityFromRelay(relayUrl)));
+  const successfulReports = results.flatMap((result) => result.ok ? result.reports : []);
+  if (successfulReports.length > 0) {
+    return newestLaunchDemoReportsByGateway(successfulReports);
+  }
+  const details = results
+    .map((result) => result.ok ? `${result.relayUrl}:0` : `${result.relayUrl}:${result.error}`)
+    .join("; ");
+  throw new Error(`Operator capacity lookup failed across ${urls.length} control relays: ${details}`);
+}
+
+async function readLaunchDemoCapabilityReportsFromRelay(relayUrl: string): Promise<LaunchDemoCapacityReport[]> {
+  const result = await readLaunchDemoCapacityFromRelay(relayUrl);
+  if (result.ok) {
+    return result.reports;
+  }
+  throw new Error(`Operator capacity lookup failed at ${relayUrl}: ${result.error}`);
+}
+
+async function readLaunchDemoCapacityFromRelay(relayUrl: string): Promise<
+  | { ok: true; relayUrl: string; reports: LaunchDemoCapacityReport[] }
+  | { ok: false; relayUrl: string; error: string }
+> {
   const url = new URL("/v1/operator-capacity", relayUrl);
   url.searchParams.set("activeOnly", "true");
   url.searchParams.set("limit", "100");
-  const response = await fetch(url, {
-    headers: {
-      accept: "application/json"
-    },
-    signal: AbortSignal.timeout(15_000)
+  try {
+    const response = await fetch(url, {
+      headers: {
+        accept: "application/json"
+      },
+      signal: AbortSignal.timeout(15_000)
+    });
+    const body = await response.text();
+    const parsed = body ? parseJsonObject(body) : {};
+    if (response.status === 404) {
+      return {
+        ok: true,
+        relayUrl,
+        reports: (await readLegacyLaunchDemoCapabilityReports(relayUrl)).map((report) => ({ ...report, sourceRelayUrl: relayUrl }))
+      };
+    }
+    if (!response.ok || parsed?.ok !== true) {
+      const error = stringRecordField(parsed, "error") ?? `http_${response.status}`;
+      const reason = stringRecordField(parsed, "staleReason") ?? stringRecordField(parsed, "reason");
+      return {
+        ok: false,
+        relayUrl,
+        error: reason ? `${error}:${reason}` : `${error}:${body.slice(0, 300)}`
+      };
+    }
+    const values = Array.isArray(parsed.latest) ? parsed.latest : Array.isArray(parsed.reports) ? parsed.reports : [];
+    return {
+      ok: true,
+      relayUrl,
+      reports: values
+        .filter(isLaunchDemoCapacityReport)
+        .map((report) => ({ ...report, sourceRelayUrl: relayUrl }))
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      relayUrl,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function newestLaunchDemoReportsByGateway(reports: LaunchDemoCapacityReport[]): LaunchDemoCapacityReport[] {
+  const latest = new Map<string, LaunchDemoCapacityReport>();
+  for (const report of reports) {
+    const key = `${report.report.operator.operatorId.toLowerCase()}:${report.report.operator.gatewayId}`;
+    const existing = latest.get(key);
+    if (!existing || Date.parse(report.report.reportedAt) > Date.parse(existing.report.reportedAt)) {
+      latest.set(key, report);
+    }
+  }
+  return [...latest.values()].sort((left, right) => {
+    const routeDiff = left.report.gateway.activeRouteCount - right.report.gateway.activeRouteCount;
+    if (routeDiff !== 0) return routeDiff;
+    return Date.parse(right.report.reportedAt) - Date.parse(left.report.reportedAt);
   });
-  const body = await response.text();
-  const parsed = body ? parseJsonObject(body) : {};
-  if (response.status === 404) {
-    return readLegacyLaunchDemoCapabilityReports(relayUrl);
-  }
-  if (!response.ok || parsed?.ok !== true) {
-    throw new Error(`Operator capacity lookup failed (${response.status}): ${body}`);
-  }
-  const values = Array.isArray(parsed.latest) ? parsed.latest : Array.isArray(parsed.reports) ? parsed.reports : [];
-  return values.filter(isLaunchDemoCapacityReport);
 }
 
 async function readLegacyLaunchDemoCapabilityReports(relayUrl: string): Promise<LaunchDemoCapacityReport[]> {
@@ -2478,6 +2589,7 @@ function launchDemoSelectionOutput(selection: LaunchDemoCapacitySelection): Reco
     members: selection.members.map(launchDemoMemberEnv),
     reportId: selection.reportId,
     reportExpiresAt: selection.reportExpiresAt,
+    sourceRelayUrl: selection.sourceRelayUrl,
     publicAddresses: selection.publicAddresses,
     activeRouteCount: selection.activeRouteCount,
     routeCapacity: selection.routeCapacity,
@@ -2499,6 +2611,7 @@ function launchDemoMemberEnv(member: LaunchDemoMemberSelection): Record<string, 
     publicAddresses: member.publicAddresses,
     activeRouteCount: member.activeRouteCount,
     routeCapacity: member.routeCapacity,
+    sourceRelayUrl: member.sourceRelayUrl,
     heartbeatAgeSeconds: member.readiness.heartbeatAgeSeconds,
     availability: member.readiness.availability
   };
@@ -2542,6 +2655,9 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     optionalEnv("RELAY_URL") ??
     manifestConfig.relayUrl ??
     DEFAULT_CONTROL_PLANE_URL;
+  const relayUrls = controlRelayCandidateUrls(relayUrl, manifestConfig, {
+    pinned: relayUrlPinnedByUser(flags, ["SWITCHBOARD_DEPLOY_RELAY_URL", "RELAY_URL"])
+  });
   const durationMinutes = deployDurationMinutes(flags);
   const scheduleBufferMinutes = numberFlag(
     flags,
@@ -2565,22 +2681,26 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
   if (shouldSelectPinnedCapacity && explicitOperatorId && explicitProcessor) {
     selection = await selectPinnedDeployCapacity({
       relayUrl,
+      relayUrls,
       operatorId: explicitOperatorId,
       processor: explicitProcessor
     });
   } else if (routeActivationMode === "relay-reconciled" && explicitOperatorId && !explicitGatewayId) {
     selection = await selectDeployCapacity({
       relayUrl,
+      relayUrls,
       operatorId: explicitOperatorId
     });
   } else if (routeActivationMode === "relay-reconciled" && explicitGatewayId && !explicitOperatorId) {
     selection = await selectDeployCapacity({
       relayUrl,
+      relayUrls,
       gatewayId: explicitGatewayId
     });
   } else if (!explicitOperatorId) {
     selection = await selectLaunchDemoCapacity({
         relayUrl,
+        relayUrls,
         network: stringFlag(flags, "network") === "canary" ? "canary" : "mainnet",
         durationMinutes,
         scheduleBufferMinutes,
@@ -2602,7 +2722,8 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     );
   }
 
-  const childArgs = [INTERNAL_DEPLOY_RUNNER_SCRIPT, "--", "--yes", "--relay-url", relayUrl, "--operator-id", operatorId];
+  const operationRelayUrl = selection?.sourceRelayUrl ?? relayUrl;
+  const childArgs = [INTERNAL_DEPLOY_RUNNER_SCRIPT, "--", "--yes", "--relay-url", operationRelayUrl, "--operator-id", operatorId];
   if (!boolFlag(flags, "no-dns")) {
     childArgs.push("--dns");
   }
@@ -2675,8 +2796,8 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     HUB_ETH_RPC_URL: manifestConfig.ethRpcUrl,
     HUB_SUBSTRATE_WS_URL: manifestConfig.substrateWsUrl,
     CHAIN_ID: manifestConfig.chainId,
-    RELAY_URL: relayUrl,
-    PROOF_CONTROL_PLANE_URL: relayUrl,
+    RELAY_URL: operationRelayUrl,
+    PROOF_CONTROL_PLANE_URL: operationRelayUrl,
     PAYMENT_ASSET_ADDRESS: manifestConfig.defaultAssetAddress,
     PROOF_QUOTE_DEFAULT_ASSET: manifestConfig.defaultAssetAddress,
     ACURAST_ENTRYPOINT: stringFlag(flags, "entrypoint") ?? optionalEnv("ACURAST_ENTRYPOINT"),
@@ -2690,6 +2811,8 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
       action: "deploy-dry-run",
       command: SWITCHBOARD_CLI,
       args: ["deploy", "--yes"],
+      relayUrl: operationRelayUrl,
+      relayCandidates: relayUrls,
       env: childEnv,
       manifest: {
         url: manifestConfig.manifestUrl,
@@ -2703,7 +2826,7 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
       console.log(sectionTitle("Switchboard deploy dry run"));
       printOutputRows([
         { label: "Command", value: `${SWITCHBOARD_CLI} deploy --yes` },
-        { label: "Relay", value: relayUrl },
+        { label: "Relay", value: operationRelayUrl },
         { label: "Operator", value: selection ? formatOperator(selection.operatorId, selection.gatewayId) : compactId(operatorId) },
         { label: "Processor", value: childEnv.SWITCHBOARD_DEPLOY_PROCESSOR ? compactId(childEnv.SWITCHBOARD_DEPLOY_PROCESSOR) : "auto" },
         { label: "Lease", value: `${durationMinutes}m` },
@@ -2718,7 +2841,7 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
   const deployRunner = await resolveDeployRunner(childArgs, childEnv);
   if (!boolFlag(flags, "json")) {
     printProjectDeployStart({
-      relayUrl,
+      relayUrl: operationRelayUrl,
       target: targetFromFlags(flags, manifestConfig).name,
       operatorId,
       processor: childEnv.SWITCHBOARD_DEPLOY_PROCESSOR,
@@ -2741,7 +2864,7 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
   const reportPath = parseDeployReportPath(result.stdout, result.stderr);
   const report = JSON.parse(await readFile(reportPath, "utf8")) as Record<string, any>;
   const output = deployOutput(report, reportPath, {
-    relayUrl,
+    relayUrl: operationRelayUrl,
     routeActivationMode,
     certificateMode,
     maxCostPerExecution,
@@ -5785,7 +5908,8 @@ export async function resolveCliNetworkConfig(flags: Map<string, string | boolea
   });
   const manifest = discovery.manifest;
   const activeRegistry = manifest.registries.active[0];
-  const controlApiUrl = resolveControlApiEndpoints(discovery)[0];
+  const controlApiUrls = resolveControlApiEndpoints(discovery);
+  const controlApiUrl = controlApiUrls[0];
   const activeRelay =
     manifest.relays?.find((relay) => (relay.active ?? true) && relay.controlPlaneUrl) ??
     manifest.relays?.find((relay) => (relay.active ?? true) && relay.apiBaseUrl);
@@ -5804,6 +5928,7 @@ export async function resolveCliNetworkConfig(flags: Map<string, string | boolea
       activeRelay?.apiBaseUrl ??
       optionalEnv("RELAY_URL") ??
       optionalEnv("PROOF_CONTROL_PLANE_URL"),
+    controlApiUrls,
     ethRpcUrl: stringFlag(flags, "eth-rpc-url") ?? manifest.rpc?.eth?.[0] ?? optionalEnv("HUB_ETH_RPC_URL") ?? optionalEnv("ETH_RPC_URL"),
     substrateWsUrl:
       stringFlag(flags, "substrate-ws-url") ??
