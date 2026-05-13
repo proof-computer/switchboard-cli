@@ -1420,6 +1420,7 @@ interface LaunchDemoProject {
 }
 
 async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: CliRuntime) {
+  launchDemoDebug("start");
   if (!boolFlag(flags, "dry-run") && !boolFlag(flags, "yes-spend")) {
     const hint = boolFlag(flags, "yes")
       ? "`--yes` no longer authorizes spending for launch-demo; use `--yes-spend`."
@@ -1433,6 +1434,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
   }
 
   const manifestConfig = await resolveCliNetworkConfig(flags);
+  launchDemoDebug("resolved network manifest");
   const relayUrl =
     stringFlag(flags, "relay-url") ??
     optionalEnv("SWITCHBOARD_LAUNCH_DEMO_RELAY_URL") ??
@@ -1464,6 +1466,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     manifestConfig,
     timeoutMs: numberFlag(flags, "quote-preview-timeout-ms", "SWITCHBOARD_LAUNCH_DEMO_QUOTE_PREVIEW_TIMEOUT_MS", 15_000)
   });
+  launchDemoDebug(`quote preview ${ingressEstimate.ok ? "ok" : "unavailable"}`);
   if (!boolFlag(flags, "dry-run") && !ingressEstimate.ok) {
     throw new Error(`Ingress quote preview unavailable: ${ingressEstimate.error}`);
   }
@@ -1479,7 +1482,9 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     gatewayId: stringFlag(flags, "gateway-id"),
     processor: stringFlag(flags, "processor")
   });
+  launchDemoDebug(`selected ${selection.processors.length} processor candidate(s)`);
   const demoProject = await createLaunchDemoProject(flags);
+  launchDemoDebug("created demo project");
 
   const childArgs = [
     INTERNAL_DEPLOY_RUNNER_SCRIPT,
@@ -1579,7 +1584,8 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
       target: target.name,
       acurastNetwork,
       durationMinutes,
-      processorCount: selection.processors.length,
+      processorCount: requestedProcessorCount,
+      candidateProcessorCount: selection.processors.length,
       minReadyProcessors,
       fixedStartDelayMs: DEFAULT_LAUNCH_DEMO_START_DELAY_MS,
       scheduleBufferMinutes,
@@ -1597,7 +1603,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
         { label: "Operator", value: formatOperator(selection.operatorId, selection.gatewayId) },
         { label: "Manager", value: selection.managerId ?? "pinned processor" },
         { label: "Processors", value: formatLaunchDemoProcessors(selection) },
-        { label: "HA readiness", value: `${selection.processors.length}/${requestedProcessorCount} selected; min ${minReadyProcessors}` },
+        { label: "HA readiness", value: `${requestedProcessorCount}/${requestedProcessorCount} requested; ${selection.processors.length} candidate(s); min ${minReadyProcessors}` },
         { label: "Lease", value: `${durationMinutes}m` },
         { label: "Start delay", value: "3m" },
         { label: "Ingress estimate", value: formatLaunchDemoQuotePreview(ingressEstimate) },
@@ -1661,6 +1667,12 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
   await saveProjectDeployment(runtime, output);
 
   writeOutput(flags, output, () => printDeployResult(output));
+}
+
+function launchDemoDebug(message: string): void {
+  if (process.env.SWITCHBOARD_LAUNCH_DEMO_DEBUG === "true") {
+    console.error(`[launch-demo-debug] ${message}`);
+  }
 }
 
 async function createLaunchDemoProject(flags: Map<string, string | boolean>): Promise<LaunchDemoProject> {
@@ -1813,8 +1825,7 @@ async function selectLaunchDemoCapacity(input: {
       const capacityDiff = left.report.gateway.activeRouteCount - right.report.gateway.activeRouteCount;
       if (capacityDiff !== 0) return capacityDiff;
       return Date.parse(right.report.reportedAt) - Date.parse(left.report.reportedAt);
-    });
-  const durationMs = (input.durationMinutes + input.scheduleBufferMinutes) * 60_000;
+  });
   const candidates: LaunchDemoMemberSelection[] = [];
 
   for (const stored of eligibleReports) {
@@ -1834,77 +1845,37 @@ async function selectLaunchDemoCapacity(input: {
           errors.push(`${report.operator.gatewayId}/${scope.managerId}: capability report listed no gateway-local processors`);
           continue;
         }
-        const allowedIds = new Set(
-          allowedProcessors.map((value) => processorRefToId(value)).filter((value): value is string => Boolean(value))
-        );
         const excludedIds = new Set(
           (scope.excludeProcessors ?? []).map((value) => processorRefToId(value)).filter((value): value is string => Boolean(value))
         );
-        if (requestedProcessorId) {
-          allowedIds.add(requestedProcessorId);
-        }
-        const inventory = await discoverManagerProcessors({
-          network: input.network,
-          managerId: scope.managerId,
-          checkAvailability: true,
-          startDelayMs: DEFAULT_LAUNCH_DEMO_START_DELAY_MS,
-          durationMs,
-          processorFilter: (processors) => {
-            const allowed = new Set(allowedProcessors);
-            return processors.filter((processor) => {
-              const processorId = processorRefToId(processor);
-              if (processorId && excludedIds.has(processorId)) {
-                return false;
-              }
-              if (requestedProcessorId) {
-                return processorId === requestedProcessorId;
-              }
-              return allowed.size === 0 || allowed.has(processor) || Boolean(processorId && allowedIds.has(processorId));
-            });
+        const scopedCandidateProcessors = allowedProcessors.filter((processor) => {
+          const processorId = processorRefToId(processor);
+          if (!processorId || excludedIds.has(processorId)) {
+            return false;
           }
+          return requestedProcessorId ? processorId === requestedProcessorId : true;
         });
-        const readyProcessors = selectReadyProcessors(inventory.processors, {
-          maxAgeSeconds: DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS,
-          requireAvailability: true,
-          limit: Math.min(input.processorCount, availableRouteSlots)
-        })
-          .map((ready) => {
-            const processorId = processorRefToId(ready.processor);
-            return processorId ? { processor: ready.processor, processorId, readiness: ready } : undefined;
-          })
-          .filter((value): value is LaunchDemoProcessorSelection => Boolean(value));
-        if (readyProcessors.length === 0) {
-          errors.push(`${report.operator.gatewayId}/${scope.managerId}: no fresh available processors`);
+        if (scopedCandidateProcessors.length === 0) {
+          errors.push(`${report.operator.gatewayId}/${scope.managerId}: no matching gateway-local processors`);
           continue;
         }
-        for (const ready of readyProcessors) {
-          const operatorId = report.operator.operatorId.toLowerCase();
-          const member: LaunchDemoMemberSelection = {
-            memberId: `member-${candidates.length + 1}`,
-            operatorId,
-            gatewayId: report.operator.gatewayId,
-            managerId: scope.managerId,
-            processor: ready.processor,
-            processorId: ready.processorId,
-            readiness: ready.readiness,
-            reportId: report.reportId,
-            reportExpiresAt: report.expiresAt,
-            publicAddresses: report.gateway.publicAddresses,
-            activeRouteCount: report.gateway.activeRouteCount,
-            routeCapacity: report.gateway.routeCapacity
-          };
-          candidates.push(member);
+        for (const processor of scopedCandidateProcessors) {
+          const processorId = processorRefToId(processor);
+          if (!processorId) continue;
+          candidates.push(
+            launchDemoMemberFromReport(report, {
+              memberId: `member-${candidates.length + 1}`,
+              processor,
+              processorId,
+              managerId: scope.managerId,
+              readiness: capabilityReportProcessorReadiness(processor)
+            })
+          );
         }
       } catch (error) {
         errors.push(`${report.operator.gatewayId}/${scope.managerId}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-  }
-
-  const distinctEligibleGateways = new Set(candidates.map((candidate) => candidate.gatewayId));
-  if (input.processorCount > 1 && distinctEligibleGateways.size < 2) {
-    const reason = errors.length > 0 ? ` Checked: ${errors.slice(0, 5).join("; ")}` : "";
-    throw new Error(`launch-demo --ha requires at least two eligible gateways; found ${distinctEligibleGateways.size}.${reason}`);
   }
 
   if (candidates.length < input.processorCount) {
@@ -1918,7 +1889,7 @@ async function selectLaunchDemoCapacity(input: {
     throw new Error(`Only ${candidates.length}/${input.processorCount} launch-demo processors are currently available from ${input.relayUrl}${scope}.${reason}`);
   }
 
-  const selectedMembers = selectLaunchDemoMembers(candidates, input.processorCount);
+  const selectedMembers = selectLaunchDemoCandidatePool(candidates, input.processorCount);
   const selectedGateways = new Set(selectedMembers.map((member) => member.gatewayId));
   if (input.processorCount > 1 && selectedGateways.size < 2) {
     throw new Error(`launch-demo --ha requires selected members across at least two gateways; selected ${selectedGateways.size}`);
@@ -1934,6 +1905,49 @@ export function launchDemoManagerScopeProcessors(scope: ProcessorScope): string[
     return [];
   }
   return [...new Set([...(scope.processors ?? []), ...(scope.includeProcessors ?? [])].filter((value) => value.length > 0))];
+}
+
+export function selectLaunchDemoCandidatePool(
+  candidates: LaunchDemoMemberSelection[],
+  processorCount: number
+): LaunchDemoMemberSelection[] {
+  return selectLaunchDemoMembers(candidates, processorCount);
+}
+
+function launchDemoMemberFromReport(
+  report: GatewayCapabilityReport,
+  input: {
+    memberId: string;
+    processor: string;
+    processorId: string;
+    managerId?: string;
+    readiness: ProcessorInfo;
+  }
+): LaunchDemoMemberSelection {
+  return {
+    memberId: input.memberId,
+    operatorId: report.operator.operatorId.toLowerCase(),
+    gatewayId: report.operator.gatewayId,
+    managerId: input.managerId,
+    processor: input.processor,
+    processorId: input.processorId,
+    readiness: input.readiness,
+    reportId: report.reportId,
+    reportExpiresAt: report.expiresAt,
+    publicAddresses: report.gateway.publicAddresses,
+    activeRouteCount: report.gateway.activeRouteCount,
+    routeCapacity: report.gateway.routeCapacity
+  };
+}
+
+function capabilityReportProcessorReadiness(processor: string): ProcessorInfo {
+  return {
+    processor,
+    heartbeatMs: Date.now(),
+    heartbeatIso: new Date().toISOString(),
+    heartbeatAgeSeconds: 0,
+    version: "capability-report-candidate"
+  };
 }
 
 async function selectDeployCapacity(input: {
@@ -2095,7 +2109,11 @@ export function selectLaunchDemoMembers(candidates: LaunchDemoMemberSelection[],
     selectedKeys.add(key);
   }
 
-  return selected.map((member, index) => ({ ...member, memberId: `member-${index + 1}` }));
+  return renumberLaunchDemoMembers(selected);
+}
+
+function renumberLaunchDemoMembers(members: LaunchDemoMemberSelection[]): LaunchDemoMemberSelection[] {
+  return members.map((member, index) => ({ ...member, memberId: `member-${index + 1}` }));
 }
 
 function compareLaunchDemoMembers(left: LaunchDemoMemberSelection, right: LaunchDemoMemberSelection): number {
@@ -2788,7 +2806,8 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     scheduleBufferMinutes,
     executionMs: stringFlag(flags, "execution-ms") ?? optionalEnv("ACURAST_EXECUTION_MS")
   });
-  const validatorStartDelayMs = numberFlag(flags, "start-delay-ms", "ACURAST_START_DELAY_MS", 120_000);
+  const validatorStartDelayMs = numberFlag(flags, "start-delay-ms", "ACURAST_START_DELAY_MS", 600_000);
+  const validatorNetworkRequests = numberFlag(flags, "network-requests", "ACURAST_MAX_NETWORK_REQUESTS", 1_000);
   const validatorProcessors = await resolveValidatorLaunchProcessorSelection({
     flags,
     targetNetwork: targetNetwork === "canary" ? "canary" : "mainnet",
@@ -2816,6 +2835,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
         durationMinutes: durationMinutes ?? DEFAULT_DEPLOY_DURATION_MINUTES,
         scheduleBufferMinutes
       },
+      networkRequests: validatorNetworkRequests,
       validatorWork: validatorWorkEnv,
       processorSelection: validatorProcessors
     }, () => {
@@ -2826,6 +2846,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
       console.log(`SS58 format: ${ss58Format}`);
       console.log(`Enrollment pubkey: ${enrollmentPubkey}`);
       console.log(`Execution ms: ${validatorExecutionMs}`);
+      console.log(`Network requests: ${validatorNetworkRequests}`);
       console.log(`Work poll interval ms: ${validatorWorkEnv.VALIDATOR_WORK_POLL_INTERVAL_MS}`);
       console.log(`Work lease seconds: ${validatorWorkEnv.VALIDATOR_WORK_LEASE_SECONDS}`);
       console.log(`Work max items: ${validatorWorkEnv.VALIDATOR_WORK_MAX_ITEMS}`);
@@ -2864,6 +2885,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     ACURAST_INSTANT_MATCH_PROCESSORS: validatorProcessors.processors,
     ACURAST_EXECUTION_MS: validatorExecutionMs,
     ACURAST_START_DELAY_MS: String(validatorStartDelayMs),
+    ACURAST_MAX_NETWORK_REQUESTS: String(validatorNetworkRequests),
     ACURAST_MAX_ALLOWED_START_DELAY_MS: optionalEnv("ACURAST_MAX_ALLOWED_START_DELAY_MS"),
     ACURAST_INSTANT_MATCH_START_DELAY_MS: optionalEnv("ACURAST_INSTANT_MATCH_START_DELAY_MS"),
     ACURAST_MAX_COST_PER_EXECUTION: stringFlag(flags, "max-cost-per-execution") ?? optionalEnv("ACURAST_MAX_COST_PER_EXECUTION"),
@@ -2941,6 +2963,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
       durationMinutes: durationMinutes ?? DEFAULT_DEPLOY_DURATION_MINUTES,
       scheduleBufferMinutes
     },
+    networkRequests: validatorNetworkRequests,
     validatorWork: validatorWorkEnv
   }, () => {
     console.log("Validator launch registered");
@@ -2951,6 +2974,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     console.log(`SS58 format: ${ss58Format}`);
     console.log(`Enrollment pubkey: ${enrollmentPubkey}`);
     console.log(`Execution ms: ${validatorExecutionMs}`);
+    console.log(`Network requests: ${validatorNetworkRequests}`);
   });
 }
 

@@ -2866,8 +2866,8 @@ async function createValidatorWorkPackages(
         runId: config.runId,
         durationMinutes: config.durationMinutes,
         leaseSeconds: config.leaseSeconds,
-        validatorSlot: slot,
-        validatorSlots: count
+        workIndex: slot,
+        workCount: count
       }
     };
     let primaryWork: Record<string, unknown> | undefined;

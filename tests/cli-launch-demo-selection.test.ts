@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { launchDemoManagerScopeProcessors, launchDemoReportEligibilityReason, selectLaunchDemoMembers } from "../cli/src/index.js";
+import {
+  launchDemoManagerScopeProcessors,
+  launchDemoReportEligibilityReason,
+  selectLaunchDemoCandidatePool,
+  selectLaunchDemoMembers
+} from "../cli/src/index.js";
 
 describe("launch-demo HA member selection", () => {
   it("prefers one member per gateway, then fills by lowest active route count", () => {
@@ -35,6 +40,23 @@ describe("launch-demo HA member selection", () => {
         ),
       /requires at least two eligible gateways/
     );
+  });
+
+  it("selects one processor for single-replica demos", () => {
+    const selected = selectLaunchDemoCandidatePool(
+      [
+        launchDemoCandidate({ gatewayId: "gateway-a", processorId: hex32("01"), activeRouteCount: 1 }),
+        launchDemoCandidate({ gatewayId: "gateway-a", processorId: hex32("02"), activeRouteCount: 1 }),
+        launchDemoCandidate({ gatewayId: "gateway-a", processorId: hex32("03"), activeRouteCount: 1 })
+      ] as any,
+      1
+    );
+
+    assert.deepEqual(
+      selected.map((member) => member.processorId),
+      [hex32("01")]
+    );
+    assert.deepEqual(selected.map((member) => member.memberId), ["member-1"]);
   });
 
   it("requires launch-demo gateways to advertise route-state polling", () => {
