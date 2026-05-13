@@ -128,9 +128,6 @@ function launchDemoCandidate(input: {
       processor: `processor-${input.processorId.slice(-2)}`,
       heartbeatAgeSeconds: input.activeRouteCount,
       availability: { available: true }
-    },
-    allocation: {
-      mode: "cli-selected-capability"
     }
   };
 }

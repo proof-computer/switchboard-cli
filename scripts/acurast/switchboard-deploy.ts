@@ -153,7 +153,6 @@ interface DeploymentIntentGroupMemberBootstrap {
   gatewayId?: string;
   managerId?: string;
   validationHostname?: string;
-  allocation?: Record<string, unknown>;
   intent?: Record<string, unknown>;
 }
 
@@ -167,7 +166,6 @@ export interface DeploymentGroupMemberConfig {
   reportId?: string;
   reportExpiresAt?: string;
   publicAddresses?: string[];
-  allocation?: Record<string, unknown>;
 }
 
 export interface DeploymentGroupConfig {
@@ -1244,8 +1242,7 @@ function deploymentGroupConfigFromEnv(): DeploymentGroupConfig | undefined {
       managerId: stringField(record, "managerId"),
       reportId: stringField(record, "reportId"),
       reportExpiresAt: stringField(record, "reportExpiresAt"),
-      publicAddresses: stringArrayField(record, "publicAddresses"),
-      allocation: objectField(record, "allocation")
+      publicAddresses: stringArrayField(record, "publicAddresses")
     };
   });
   const expectedReplicas = numberEnv("SWITCHBOARD_DEPLOY_EXPECTED_REPLICAS", members.length);
@@ -1483,7 +1480,6 @@ async function createDeploymentIntentGroup(config: HarnessConfig): Promise<Deplo
       gatewayId: stringField(member, "gatewayId") ?? configured?.gatewayId,
       managerId: stringField(member, "managerId") ?? configured?.managerId,
       validationHostname: stringField(member, "validationHostname"),
-      allocation: objectField(member, "allocation"),
       intent: member
     };
   });
@@ -1513,7 +1509,6 @@ export function buildDeploymentIntentCreateBody(
     jobId: input.jobId,
     operatorId: config.operatorId,
     processorId: input.processorId,
-    allocation: deploymentIntentAllocation(config, input.processorId),
     source: {
       mode: "switchboard-deploy",
       runId: config.runId,
@@ -1537,44 +1532,13 @@ export function buildDeploymentIntentGroupCreateBody(
       processorId: member.processorId,
       processor: member.processor,
       gatewayId: member.gatewayId,
-      managerId: member.managerId,
-      allocation: member.allocation ?? deploymentIntentAllocationForGroupMember(member)
+      managerId: member.managerId
     })),
     source: {
       mode: "switchboard-deploy-group",
       runId: config.runId,
       target: config.targetName
     }
-  };
-}
-
-function deploymentIntentAllocationForGroupMember(member: DeploymentGroupMemberConfig): Record<string, unknown> {
-  return {
-    mode: "cli-selected-capability",
-    operatorId: member.operatorId,
-    gatewayId: member.gatewayId,
-    processorId: member.processorId,
-    processorAddress: member.processor,
-    managerId: member.managerId,
-    reportId: member.reportId,
-    reportExpiresAt: member.reportExpiresAt,
-    publicAddresses: member.publicAddresses
-  };
-}
-
-function deploymentIntentAllocation(config: DeploymentIntentCreateBodyConfig, processorId: string): Record<string, unknown> | undefined {
-  if (!config.gatewayId && config.operatorPublicAddresses.length === 0) {
-    return undefined;
-  }
-  return {
-    mode: "cli-selected-capability",
-    operatorId: config.operatorId,
-    gatewayId: config.gatewayId || undefined,
-    processorId,
-    managerId: config.managerId || undefined,
-    reportId: config.capabilityReportId || undefined,
-    reportExpiresAt: config.capabilityReportExpiresAt || undefined,
-    publicAddresses: config.operatorPublicAddresses.length > 0 ? config.operatorPublicAddresses : undefined
   };
 }
 
@@ -1601,7 +1565,6 @@ async function updateDeploymentIntentDeployment(
       processorId: input.processorId,
       processor: input.processor,
       upstreamPort: config.port,
-      allocation: deploymentIntentAllocation(config, input.processorId),
       source: {
         mode: "switchboard-deploy",
         runId: config.runId
@@ -1638,8 +1601,7 @@ async function updateDeploymentIntentGroupDeployment(
         jobId: member.jobId,
         operatorId: member.operatorId,
         processorId: member.processorId,
-        processor: member.processor,
-        allocation: member.allocation
+        processor: member.processor
       })),
       source: {
         mode: "switchboard-deploy-group",

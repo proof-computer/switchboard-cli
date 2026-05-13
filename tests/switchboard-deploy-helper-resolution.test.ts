@@ -66,6 +66,7 @@ describe("switchboard deploy helper script resolution", () => {
       assert.equal("endpointHostname" in single, false);
       assert.equal("validationHostname" in single, false);
       assert.equal("preferredDomain" in single, false);
+      assert.equal("allocation" in single, false);
 
       const group = mod.buildDeploymentIntentGroupCreateBody({
         ...config,
@@ -87,6 +88,7 @@ describe("switchboard deploy helper script resolution", () => {
       assert.equal("preferredDomain" in group, false);
       const member = (group.members as Array<Record<string, unknown>>)[0];
       assert.equal("validationHostname" in member, false);
+      assert.equal("allocation" in member, false);
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }

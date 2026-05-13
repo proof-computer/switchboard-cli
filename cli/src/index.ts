@@ -1384,7 +1384,6 @@ interface LaunchDemoMemberSelection extends LaunchDemoProcessorSelection {
   publicAddresses: string[];
   activeRouteCount: number;
   routeCapacity: number;
-  allocation: Record<string, unknown>;
 }
 
 type LaunchDemoGatewayCapabilityReport = GatewayCapabilityReport & {
@@ -1892,19 +1891,7 @@ async function selectLaunchDemoCapacity(input: {
             reportExpiresAt: report.expiresAt,
             publicAddresses: report.gateway.publicAddresses,
             activeRouteCount: report.gateway.activeRouteCount,
-            routeCapacity: report.gateway.routeCapacity,
-            allocation: launchDemoMemberAllocation({
-              operatorId,
-              gatewayId: report.operator.gatewayId,
-              managerId: scope.managerId,
-              processor: ready.processor,
-              processorId: ready.processorId,
-              reportId: report.reportId,
-              reportExpiresAt: report.expiresAt,
-              publicAddresses: report.gateway.publicAddresses,
-              activeRouteCount: report.gateway.activeRouteCount,
-              routeCapacity: report.gateway.routeCapacity
-            })
+            routeCapacity: report.gateway.routeCapacity
           };
           candidates.push(member);
         }
@@ -1999,19 +1986,7 @@ async function selectDeployCapacity(input: {
         reportExpiresAt: report.expiresAt,
         publicAddresses: report.gateway.publicAddresses,
         activeRouteCount: report.gateway.activeRouteCount,
-        routeCapacity: report.gateway.routeCapacity,
-        allocation: launchDemoMemberAllocation({
-          operatorId,
-          gatewayId: report.operator.gatewayId,
-          managerId: processor.managerId,
-          processor: processorRef,
-          processorId: processor.processorId,
-          reportId: report.reportId,
-          reportExpiresAt: report.expiresAt,
-          publicAddresses: report.gateway.publicAddresses,
-          activeRouteCount: report.gateway.activeRouteCount,
-          routeCapacity: report.gateway.routeCapacity
-        })
+        routeCapacity: report.gateway.routeCapacity
       });
     }
   }
@@ -2079,19 +2054,7 @@ export async function selectPinnedDeployCapacity(input: {
       reportExpiresAt: report.expiresAt,
       publicAddresses: report.gateway.publicAddresses,
       activeRouteCount: report.gateway.activeRouteCount,
-      routeCapacity: report.gateway.routeCapacity,
-      allocation: launchDemoMemberAllocation({
-        operatorId,
-        gatewayId: report.operator.gatewayId,
-        managerId: processor.managerId,
-        processor: input.processor,
-        processorId: requestedProcessorId,
-        reportId: report.reportId,
-        reportExpiresAt: report.expiresAt,
-        publicAddresses: report.gateway.publicAddresses,
-        activeRouteCount: report.gateway.activeRouteCount,
-        routeCapacity: report.gateway.routeCapacity
-      })
+      routeCapacity: report.gateway.routeCapacity
     };
     candidates.push(member);
   }
@@ -2148,33 +2111,6 @@ function compareLaunchDemoMembers(left: LaunchDemoMemberSelection, right: Launch
 
 function launchDemoMemberKey(member: LaunchDemoMemberSelection): string {
   return `${member.gatewayId}:${member.processorId}`;
-}
-
-function launchDemoMemberAllocation(input: {
-  operatorId: string;
-  gatewayId: string;
-  managerId?: string;
-  processor: string;
-  processorId: string;
-  reportId: string;
-  reportExpiresAt: string;
-  publicAddresses: string[];
-  activeRouteCount: number;
-  routeCapacity: number;
-}): Record<string, unknown> {
-  return {
-    mode: "cli-selected-capability",
-    operatorId: input.operatorId,
-    gatewayId: input.gatewayId,
-    processorId: input.processorId,
-    processorAddress: input.processor,
-    managerId: input.managerId,
-    reportId: input.reportId,
-    reportExpiresAt: input.reportExpiresAt,
-    publicAddresses: input.publicAddresses,
-    activeRouteCount: input.activeRouteCount,
-    routeCapacity: input.routeCapacity
-  };
 }
 
 function launchDemoSelectionFromMembers(members: LaunchDemoMemberSelection[]): LaunchDemoCapacitySelection {
@@ -2546,8 +2482,7 @@ function launchDemoMemberEnv(member: LaunchDemoMemberSelection): Record<string, 
     activeRouteCount: member.activeRouteCount,
     routeCapacity: member.routeCapacity,
     heartbeatAgeSeconds: member.readiness.heartbeatAgeSeconds,
-    availability: member.readiness.availability,
-    allocation: member.allocation
+    availability: member.readiness.availability
   };
 }
 
@@ -2901,9 +2836,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
   const validatorEnvKeys = [
     "PROOF_CONTROL_PLANE_URL",
     "PROOF_VALIDATOR_LAUNCH_INTENT_ID",
-    "PROOF_VALIDATOR_DEPLOYER_ADDRESS",
     "VALIDATOR_ENROLLMENT_SEED",
-    "VALIDATOR_WORK_MODE",
     "VALIDATOR_WORK_POLL",
     "VALIDATOR_WORK_RUN_MS",
     "VALIDATOR_WORK_POLL_INTERVAL_MS",
@@ -2918,7 +2851,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
   const deployRunner = await resolveAcurastDirectDeployRunner(["--script-ipfs", scriptIpfs, "--skip-env"], {
     ...contextRuntimeEnv(runtime),
     ACURAST_MAINNET_SEED: seed,
-    ACURAST_SEED: optionalEnv("ACURAST_SEED") ?? seed,
+    ACURAST_SEED: seed,
     ACURAST_CANARY_SEED: optionalEnv("ACURAST_CANARY_SEED"),
     ACURAST_ASSUME_YES: boolFlag(flags, "yes") ? "true" : optionalEnv("ACURAST_ASSUME_YES"),
     ACURAST_COMPACT_ENV: "true",
@@ -2942,9 +2875,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     SWITCHBOARD_DEPLOY_SCHEDULE_BUFFER_MINUTES: String(scheduleBufferMinutes),
     PROOF_CONTROL_PLANE_URL: relayUrl,
     PROOF_VALIDATOR_LAUNCH_INTENT_ID: stringRecordField(intentRecord, "intentId"),
-    PROOF_VALIDATOR_DEPLOYER_ADDRESS: deployer.address,
     VALIDATOR_ENROLLMENT_SEED: enrollmentMnemonic,
-    VALIDATOR_WORK_MODE: "poll",
     ...validatorWorkEnv,
     VALIDATOR_DEPLOYMENT_ID: pendingDeploymentId,
     VALIDATOR_ACURAST_JOB_ID: pendingAcurastJobId,
