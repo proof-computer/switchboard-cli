@@ -122,7 +122,7 @@ const DEFAULT_LAUNCH_DEMO_DURATION_MINUTES = 10;
 const DEFAULT_LAUNCH_DEMO_START_DELAY_MS = 180_000;
 const DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION = "40000000000";
 const DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS = 900;
-const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.6";
+const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.7";
 const LAUNCH_DEMO_ENTRYPOINT = "src/server.ts";
 const ANSI_ESCAPE_PATTERN = /\u001b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 export const PROOF_NETWORK_MANIFEST_URL = "https://control.switchboard.proof.computer/v1/network-manifest";
@@ -2848,29 +2848,56 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
 
   const durationMinutes = optionalIntegerFlag(flags, "duration-minutes", "SWITCHBOARD_DEPLOY_DURATION_MINUTES");
   const scheduleBufferMinutes = optionalIntegerFlag(flags, "schedule-buffer-minutes", "SWITCHBOARD_DEPLOY_SCHEDULE_BUFFER_MINUTES") ?? 0;
-  const validatorExecutionMs = durationMinutes === undefined
-    ? optionalEnv("ACURAST_EXECUTION_MS")
-    : String((durationMinutes + scheduleBufferMinutes) * 60_000);
+  const validatorExecutionMs = resolveValidatorLaunchExecutionMs({
+    durationMinutes,
+    scheduleBufferMinutes,
+    executionMs: stringFlag(flags, "execution-ms") ?? optionalEnv("ACURAST_EXECUTION_MS")
+  });
   const validatorStartDelayMs = numberFlag(flags, "start-delay-ms", "ACURAST_START_DELAY_MS", 120_000);
   const validatorProcessors = await resolveValidatorLaunchProcessorSelection({
     flags,
     targetNetwork: targetNetwork === "canary" ? "canary" : "mainnet",
     requestedCount: Number(intentPayload.requestedCount),
-    durationMs: validatorExecutionMs ? Number(validatorExecutionMs) : 300_000,
+    durationMs: Number(validatorExecutionMs),
     startDelayMs: validatorStartDelayMs
+  });
+  const validatorWorkEnv = resolveValidatorLaunchWorkRuntimeEnv({
+    executionMs: validatorExecutionMs
   });
 
   if (boolFlag(flags, "dry-run")) {
-    writeOutput(flags, { ok: true, intent, scriptIpfs, enrollmentPubkey, processorSelection: validatorProcessors }, () => {
+    writeOutput(flags, {
+      ok: true,
+      intent,
+      scriptIpfs,
+      enrollmentPubkey,
+      deployer: {
+        address: deployer.address,
+        ss58Format
+      },
+      execution: {
+        executionMs: validatorExecutionMs,
+        startDelayMs: validatorStartDelayMs,
+        durationMinutes: durationMinutes ?? DEFAULT_DEPLOY_DURATION_MINUTES,
+        scheduleBufferMinutes
+      },
+      validatorWork: validatorWorkEnv,
+      processorSelection: validatorProcessors
+    }, () => {
       console.log("Validator launch dry run");
       console.log(`Intent: ${stringRecordField(intentRecord, "intentId")}`);
       console.log(`Script: ${scriptIpfs}`);
+      console.log(`Deployer: ${deployer.address}`);
+      console.log(`SS58 format: ${ss58Format}`);
       console.log(`Enrollment pubkey: ${enrollmentPubkey}`);
+      console.log(`Execution ms: ${validatorExecutionMs}`);
+      console.log(`Work poll interval ms: ${validatorWorkEnv.VALIDATOR_WORK_POLL_INTERVAL_MS}`);
+      console.log(`Work lease seconds: ${validatorWorkEnv.VALIDATOR_WORK_LEASE_SECONDS}`);
+      console.log(`Work max items: ${validatorWorkEnv.VALIDATOR_WORK_MAX_ITEMS}`);
       if (validatorProcessors.processors) console.log(`Processors: ${validatorProcessors.processors}`);
     });
     return;
   }
-  const validatorWorkRunMs = optionalEnv("VALIDATOR_WORK_RUN_MS");
   const validatorEnvKeys = [
     "PROOF_CONTROL_PLANE_URL",
     "PROOF_VALIDATOR_LAUNCH_INTENT_ID",
@@ -2878,7 +2905,10 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     "VALIDATOR_ENROLLMENT_SEED",
     "VALIDATOR_WORK_MODE",
     "VALIDATOR_WORK_POLL",
-    ...(validatorWorkRunMs ? ["VALIDATOR_WORK_RUN_MS"] : []),
+    "VALIDATOR_WORK_RUN_MS",
+    "VALIDATOR_WORK_POLL_INTERVAL_MS",
+    "VALIDATOR_WORK_LEASE_SECONDS",
+    "VALIDATOR_WORK_MAX_ITEMS",
     "VALIDATOR_DEPLOYMENT_ID",
     "VALIDATOR_ACURAST_JOB_ID"
   ];
@@ -2915,8 +2945,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     PROOF_VALIDATOR_DEPLOYER_ADDRESS: deployer.address,
     VALIDATOR_ENROLLMENT_SEED: enrollmentMnemonic,
     VALIDATOR_WORK_MODE: "poll",
-    VALIDATOR_WORK_POLL: "true",
-    VALIDATOR_WORK_RUN_MS: validatorWorkRunMs,
+    ...validatorWorkEnv,
     VALIDATOR_DEPLOYMENT_ID: pendingDeploymentId,
     VALIDATOR_ACURAST_JOB_ID: pendingAcurastJobId,
     ACURAST_INCLUDE_ENV: validatorEnvKeys.join(",")
@@ -2965,13 +2994,77 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
       ss58Format
     }
   );
-  writeOutput(flags, { ok: true, intent, deploymentId, registered, enrollmentPubkey }, () => {
+  writeOutput(flags, {
+    ok: true,
+    intent,
+    deploymentId,
+    registered,
+    enrollmentPubkey,
+    deployer: {
+      address: deployer.address,
+      ss58Format
+    },
+    execution: {
+      executionMs: validatorExecutionMs,
+      startDelayMs: validatorStartDelayMs,
+      durationMinutes: durationMinutes ?? DEFAULT_DEPLOY_DURATION_MINUTES,
+      scheduleBufferMinutes
+    },
+    validatorWork: validatorWorkEnv
+  }, () => {
     console.log("Validator launch registered");
     console.log(`Intent: ${requiredStringRecordField(intentRecord, "intentId")}`);
     console.log(`Deployment: ${deploymentId}`);
     console.log(`Script: ${scriptIpfs}`);
+    console.log(`Deployer: ${deployer.address}`);
+    console.log(`SS58 format: ${ss58Format}`);
     console.log(`Enrollment pubkey: ${enrollmentPubkey}`);
+    console.log(`Execution ms: ${validatorExecutionMs}`);
   });
+}
+
+export function resolveValidatorLaunchExecutionMs(input: {
+  durationMinutes?: number;
+  scheduleBufferMinutes?: number;
+  executionMs?: string;
+}): string {
+  if (input.executionMs) {
+    const parsed = parsePositiveIntegerString("execution-ms", input.executionMs);
+    return String(parsed);
+  }
+  const durationMinutes = input.durationMinutes ?? DEFAULT_DEPLOY_DURATION_MINUTES;
+  const scheduleBufferMinutes = input.scheduleBufferMinutes ?? 0;
+  if (!Number.isSafeInteger(durationMinutes) || durationMinutes <= 0) {
+    throw new Error("validator launch duration-minutes must be a positive integer");
+  }
+  if (!Number.isSafeInteger(scheduleBufferMinutes) || scheduleBufferMinutes < 0) {
+    throw new Error("validator launch schedule-buffer-minutes must be a non-negative integer");
+  }
+  return String((durationMinutes + scheduleBufferMinutes) * 60_000);
+}
+
+export function resolveValidatorLaunchWorkRuntimeEnv(input: {
+  executionMs: string;
+  env?: Record<string, string | undefined>;
+}): Record<string, string> {
+  const env = input.env ?? process.env;
+  const runMs = env.VALIDATOR_WORK_RUN_MS ?? input.executionMs;
+  return {
+    VALIDATOR_WORK_POLL: "true",
+    VALIDATOR_WORK_RUN_MS: String(parsePositiveIntegerString("VALIDATOR_WORK_RUN_MS", runMs)),
+    VALIDATOR_WORK_POLL_INTERVAL_MS: String(parsePositiveIntegerString(
+      "VALIDATOR_WORK_POLL_INTERVAL_MS",
+      env.VALIDATOR_WORK_POLL_INTERVAL_MS ?? env.SWITCHBOARD_DEPLOY_VALIDATOR_WORK_POLL_INTERVAL_MS ?? "30000"
+    )),
+    VALIDATOR_WORK_LEASE_SECONDS: String(parsePositiveIntegerString(
+      "VALIDATOR_WORK_LEASE_SECONDS",
+      env.VALIDATOR_WORK_LEASE_SECONDS ?? env.SWITCHBOARD_DEPLOY_VALIDATOR_WORK_LEASE_SECONDS ?? "120"
+    )),
+    VALIDATOR_WORK_MAX_ITEMS: String(parsePositiveIntegerString(
+      "VALIDATOR_WORK_MAX_ITEMS",
+      env.VALIDATOR_WORK_MAX_ITEMS ?? env.SWITCHBOARD_DEPLOY_VALIDATOR_WORK_MAX_ITEMS ?? "1"
+    ))
+  };
 }
 
 export function selectValidatorLaunchProcessorsFromInventory(
@@ -6732,6 +6825,17 @@ function parseIntegerFlagValue(flagName: string, value: string): number {
   }
 
   return Number(value);
+}
+
+function parsePositiveIntegerString(label: string, value: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return parsed;
 }
 
 function optionalNumberEnv(name: string): number | undefined {

@@ -257,7 +257,7 @@ async function fetchVerifiedCatalog(
     now: config.now,
     allowExpired: config.allowExpiredCatalogs
   });
-  if (ref.maxStaleSeconds !== undefined) {
+  if (ref.maxStaleSeconds !== undefined && !config.allowExpiredCatalogs) {
     const issuedAtMs = Date.parse(verified.catalog.issuedAt);
     if (!Number.isFinite(issuedAtMs)) {
       throw new Error(`service catalog ${ref.url} has invalid issuedAt`);

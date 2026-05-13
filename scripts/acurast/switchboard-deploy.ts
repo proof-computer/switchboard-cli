@@ -157,7 +157,7 @@ interface DeploymentIntentGroupMemberBootstrap {
   intent?: Record<string, unknown>;
 }
 
-interface DeploymentGroupMemberConfig {
+export interface DeploymentGroupMemberConfig {
   memberId: string;
   operatorId: string;
   processorId: string;
@@ -170,10 +170,22 @@ interface DeploymentGroupMemberConfig {
   allocation?: Record<string, unknown>;
 }
 
-interface DeploymentGroupConfig {
+export interface DeploymentGroupConfig {
   expectedReplicas: number;
   minReady: number;
   members: DeploymentGroupMemberConfig[];
+}
+
+export interface DeploymentIntentCreateBodyConfig {
+  leaseSeconds?: number;
+  runId: string;
+  operatorId: string;
+  managerId: string;
+  gatewayId: string;
+  capabilityReportId: string;
+  capabilityReportExpiresAt: string;
+  operatorPublicAddresses: string[];
+  targetName: string;
 }
 
 interface RuntimeObservation {
@@ -1396,21 +1408,7 @@ async function createDeploymentIntent(
     processorId: string;
   }
 ): Promise<DeploymentIntentBootstrap> {
-  const body = {
-    paidSeconds: String(config.leaseSeconds ?? 3600),
-    sessionLabel: `switchboard-deploy-${config.runId}`,
-    jobId: input.jobId,
-    operatorId: config.operatorId,
-    processorId: input.processorId,
-    ...(config.endpointHostnameExplicit ? { endpointHostname: config.hostname } : {}),
-    validationHostname: config.validationHostname,
-    allocation: deploymentIntentAllocation(config, input.processorId),
-    source: {
-      mode: "switchboard-deploy",
-      runId: config.runId,
-      target: config.targetName
-    }
-  };
+  const body = buildDeploymentIntentCreateBody(config, input);
   const response = await fetch(new URL("/v1/deployment-intents", config.relayUrl), {
     method: "POST",
     headers: {
@@ -1449,28 +1447,7 @@ async function createDeploymentIntentGroup(config: HarnessConfig): Promise<Deplo
   if (!config.group) {
     throw new Error("Deployment group config is required");
   }
-  const body = {
-    paidSeconds: String(config.leaseSeconds ?? 3600),
-    sessionLabel: `switchboard-deploy-${config.runId}`,
-    expectedReplicas: config.group.expectedReplicas,
-    minReady: config.group.minReady,
-    members: config.group.members.map((member, index) => ({
-      memberId: member.memberId,
-      jobId: hashStringBytes32(`${config.runId}:${member.memberId}:job`),
-      operatorId: member.operatorId,
-      processorId: member.processorId,
-      processor: member.processor,
-      gatewayId: member.gatewayId,
-      managerId: member.managerId,
-      validationHostname: validationHostnameForGroupMember(config, index),
-      allocation: member.allocation ?? deploymentIntentAllocationForGroupMember(member)
-    })),
-    source: {
-      mode: "switchboard-deploy-group",
-      runId: config.runId,
-      target: config.targetName
-    }
-  };
+  const body = buildDeploymentIntentGroupCreateBody({ ...config, group: config.group });
   const response = await fetch(new URL("/v1/deployment-intent-groups", config.relayUrl), {
     method: "POST",
     headers: {
@@ -1523,9 +1500,52 @@ async function createDeploymentIntentGroup(config: HarnessConfig): Promise<Deplo
   };
 }
 
-function validationHostnameForGroupMember(config: HarnessConfig, index: number): string {
-  const suffix = config.validationHostname.split(".").slice(1).join(".");
-  return normalizeDnsHostname(`switchboard-${config.runId}-${index + 1}-validation.${suffix}`);
+export function buildDeploymentIntentCreateBody(
+  config: DeploymentIntentCreateBodyConfig,
+  input: {
+    jobId: string;
+    processorId: string;
+  }
+): Record<string, unknown> {
+  return {
+    paidSeconds: String(config.leaseSeconds ?? 3600),
+    sessionLabel: `switchboard-deploy-${config.runId}`,
+    jobId: input.jobId,
+    operatorId: config.operatorId,
+    processorId: input.processorId,
+    allocation: deploymentIntentAllocation(config, input.processorId),
+    source: {
+      mode: "switchboard-deploy",
+      runId: config.runId,
+      target: config.targetName
+    }
+  };
+}
+
+export function buildDeploymentIntentGroupCreateBody(
+  config: DeploymentIntentCreateBodyConfig & { group: DeploymentGroupConfig }
+): Record<string, unknown> {
+  return {
+    paidSeconds: String(config.leaseSeconds ?? 3600),
+    sessionLabel: `switchboard-deploy-${config.runId}`,
+    expectedReplicas: config.group.expectedReplicas,
+    minReady: config.group.minReady,
+    members: config.group.members.map((member) => ({
+      memberId: member.memberId,
+      jobId: hashStringBytes32(`${config.runId}:${member.memberId}:job`),
+      operatorId: member.operatorId,
+      processorId: member.processorId,
+      processor: member.processor,
+      gatewayId: member.gatewayId,
+      managerId: member.managerId,
+      allocation: member.allocation ?? deploymentIntentAllocationForGroupMember(member)
+    })),
+    source: {
+      mode: "switchboard-deploy-group",
+      runId: config.runId,
+      target: config.targetName
+    }
+  };
 }
 
 function deploymentIntentAllocationForGroupMember(member: DeploymentGroupMemberConfig): Record<string, unknown> {
@@ -1542,7 +1562,7 @@ function deploymentIntentAllocationForGroupMember(member: DeploymentGroupMemberC
   };
 }
 
-function deploymentIntentAllocation(config: HarnessConfig, processorId: string): Record<string, unknown> | undefined {
+function deploymentIntentAllocation(config: DeploymentIntentCreateBodyConfig, processorId: string): Record<string, unknown> | undefined {
   if (!config.gatewayId && config.operatorPublicAddresses.length === 0) {
     return undefined;
   }

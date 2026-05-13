@@ -2,7 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { classifyProcessorReadiness, selectReadyProcessors, type ProcessorInfo } from "../src/acurast-manager.js";
-import { selectValidatorLaunchProcessorsFromInventory } from "../cli/src/index.js";
+import {
+  resolveValidatorLaunchExecutionMs,
+  resolveValidatorLaunchWorkRuntimeEnv,
+  selectValidatorLaunchProcessorsFromInventory
+} from "../cli/src/index.js";
 
 function processor(overrides: Partial<ProcessorInfo>): ProcessorInfo {
   return {
@@ -134,6 +138,52 @@ describe("acurast manager processor readiness", () => {
     assert.throws(
       () => selectValidatorLaunchProcessorsFromInventory([readyA, processor({ processor: "5NoAvailability" })], { requestedCount: 2 }),
       /Insufficient fresh available validator processor capacity/
+    );
+  });
+
+  it("derives validator work polling runtime from the launch execution duration", () => {
+    assert.equal(
+      resolveValidatorLaunchExecutionMs({ durationMinutes: 75, scheduleBufferMinutes: 5 }),
+      "4800000"
+    );
+    assert.equal(
+      resolveValidatorLaunchExecutionMs({ executionMs: "1234567", durationMinutes: 75, scheduleBufferMinutes: 5 }),
+      "1234567"
+    );
+
+    assert.deepEqual(
+      resolveValidatorLaunchWorkRuntimeEnv({
+        executionMs: "4800000",
+        env: {}
+      }),
+      {
+        VALIDATOR_WORK_POLL: "true",
+        VALIDATOR_WORK_RUN_MS: "4800000",
+        VALIDATOR_WORK_POLL_INTERVAL_MS: "30000",
+        VALIDATOR_WORK_LEASE_SECONDS: "120",
+        VALIDATOR_WORK_MAX_ITEMS: "1"
+      }
+    );
+  });
+
+  it("keeps explicit validator work polling overrides", () => {
+    assert.deepEqual(
+      resolveValidatorLaunchWorkRuntimeEnv({
+        executionMs: "4800000",
+        env: {
+          VALIDATOR_WORK_RUN_MS: "600000",
+          SWITCHBOARD_DEPLOY_VALIDATOR_WORK_POLL_INTERVAL_MS: "15000",
+          SWITCHBOARD_DEPLOY_VALIDATOR_WORK_LEASE_SECONDS: "90",
+          SWITCHBOARD_DEPLOY_VALIDATOR_WORK_MAX_ITEMS: "2"
+        }
+      }),
+      {
+        VALIDATOR_WORK_POLL: "true",
+        VALIDATOR_WORK_RUN_MS: "600000",
+        VALIDATOR_WORK_POLL_INTERVAL_MS: "15000",
+        VALIDATOR_WORK_LEASE_SECONDS: "90",
+        VALIDATOR_WORK_MAX_ITEMS: "2"
+      }
     );
   });
 });
