@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { classifyProcessorReadiness, selectReadyProcessors, type ProcessorInfo } from "../src/acurast-manager.js";
 import {
+  relayUrlPinnedByUser,
   resolveValidatorLaunchExecutionMs,
   resolveValidatorLaunchWorkRuntimeEnv,
   selectWritableControlRelayUrl,
@@ -251,6 +252,17 @@ describe("acurast manager processor readiness", () => {
     assert.deepEqual(
       validatorLaunchControlRelayCandidates("https://control.example", { controlApiUrls: ["https://relay-a.example"] } as any, { pinned: true }),
       ["https://control.example"]
+    );
+  });
+
+  it("does not treat context-default relay URLs as explicit relay pins", () => {
+    assert.equal(relayUrlPinnedByUser(new Map([["relay-url", "https://control.example"]]), []), true);
+    assert.equal(
+      relayUrlPinnedByUser(new Map<string, string | boolean>([
+        ["relay-url", "https://control.example"],
+        ["__runtime-default:relay-url", true]
+      ]), []),
+      false
     );
   });
 });

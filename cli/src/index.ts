@@ -118,6 +118,7 @@ const DEFAULT_ROUTE_INTENT_URL = "http://127.0.0.1:18080/route-intents";
 const DEFAULT_MAX_COST_PER_EXECUTION = "100000000000";
 const DEFAULT_DEPLOY_DURATION_MINUTES = 60;
 const DEFAULT_DEPLOY_SCHEDULE_BUFFER_MINUTES = 10;
+const RUNTIME_DEFAULT_FLAG_PREFIX = "__runtime-default:";
 const DEFAULT_LAUNCH_DEMO_DURATION_MINUTES = 10;
 const DEFAULT_LAUNCH_DEMO_START_DELAY_MS = 180_000;
 const DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION = "40000000000";
@@ -1797,8 +1798,12 @@ function launchDemoMinReady(flags: Map<string, string | boolean>, processorCount
   return minReady;
 }
 
-function relayUrlPinnedByUser(flags: Map<string, string | boolean>, envNames: string[]): boolean {
-  return Boolean(stringFlag(flags, "relay-url") || envNames.some((name) => Boolean(optionalEnv(name))));
+export function relayUrlPinnedByUser(flags: Map<string, string | boolean>, envNames: string[]): boolean {
+  return Boolean(relayUrlFlagPinnedByUser(flags) || envNames.some((name) => Boolean(optionalEnv(name))));
+}
+
+function relayUrlFlagPinnedByUser(flags: Map<string, string | boolean>): boolean {
+  return Boolean(stringFlag(flags, "relay-url") && flags.get(runtimeDefaultFlagName("relay-url")) !== true);
 }
 
 function controlRelayCandidateUrls(
@@ -3041,7 +3046,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     optionalEnv("SWITCHBOARD_VALIDATOR_RELAY_URL") ??
     manifestConfig.relayUrl ??
     DEFAULT_CONTROL_PLANE_URL;
-  const relayPinned = Boolean(stringFlag(flags, "relay-url") || optionalEnv("SWITCHBOARD_VALIDATOR_RELAY_URL"));
+  const relayPinned = Boolean(relayUrlFlagPinnedByUser(flags) || optionalEnv("SWITCHBOARD_VALIDATOR_RELAY_URL"));
   const relayCandidates = validatorLaunchControlRelayCandidates(requestedRelayUrl, manifestConfig, { pinned: relayPinned });
   const validatorRelaySelection = await selectWritableControlRelayUrl(
     relayCandidates
@@ -6500,11 +6505,13 @@ function applyRuntimeDefaults(
   const setString = (name: string, value: string | number | undefined) => {
     if (!output.has(name) && value !== undefined && String(value).length > 0) {
       output.set(name, String(value));
+      output.set(runtimeDefaultFlagName(name), true);
     }
   };
   const setBool = (name: string, value: boolean | undefined) => {
     if (!output.has(name) && value === true) {
       output.set(name, true);
+      output.set(runtimeDefaultFlagName(name), true);
     }
   };
 
@@ -6561,6 +6568,10 @@ function applyRuntimeDefaults(
   }
 
   return output;
+}
+
+function runtimeDefaultFlagName(name: string): string {
+  return `${RUNTIME_DEFAULT_FLAG_PREFIX}${name}`;
 }
 
 async function readJsonFile<T>(filePath: string): Promise<T> {
