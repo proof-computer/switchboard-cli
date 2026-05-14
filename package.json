@@ -1,6 +1,6 @@
 {
   "name": "switchboard-cli",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "Switchboard CLI for deploying and operating Acurast ingress workloads.",
   "private": false,
   "type": "module",
