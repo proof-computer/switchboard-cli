@@ -5,7 +5,9 @@ import { classifyProcessorReadiness, selectReadyProcessors, type ProcessorInfo }
 import {
   resolveValidatorLaunchExecutionMs,
   resolveValidatorLaunchWorkRuntimeEnv,
-  selectValidatorLaunchProcessorsFromInventory
+  selectWritableControlRelayUrl,
+  selectValidatorLaunchProcessorsFromInventory,
+  validatorLaunchControlRelayCandidates
 } from "../cli/src/index.js";
 
 function processor(overrides: Partial<ProcessorInfo>): ProcessorInfo {
@@ -186,4 +188,88 @@ describe("acurast manager processor readiness", () => {
       }
     );
   });
+
+  it("selects a healthy writable relay for validator launch", async () => {
+    const result = await selectWritableControlRelayUrl(["https://relay-a.example", "https://relay-b.example"], {
+      fetchImpl: relayProbeFetch({
+        "https://relay-a.example/health": { status: 503, body: { ok: false } },
+        "https://relay-b.example/health": { status: 200, body: { ok: true } },
+        "https://relay-b.example/v1/control-readiness": {
+          status: 200,
+          body: { ok: true, authorityEligible: true }
+        }
+      })
+    });
+
+    assert.equal(result.relayUrl, "https://relay-b.example");
+    assert.equal(result.probes.length, 2);
+    assert.equal(result.probes[0].ok, false);
+    assert.equal(result.probes[1].ok, true);
+  });
+
+  it("does not select a relay that reports authority ineligible", async () => {
+    const result = await selectWritableControlRelayUrl(["https://relay-a.example", "https://relay-b.example"], {
+      fetchImpl: relayProbeFetch({
+        "https://relay-a.example/health": { status: 200, body: { ok: true } },
+        "https://relay-a.example/v1/control-readiness": {
+          status: 200,
+          body: { ok: false, authorityEligible: false }
+        },
+        "https://relay-b.example/health": { status: 200, body: { ok: true } },
+        "https://relay-b.example/v1/control-readiness": {
+          status: 200,
+          body: { ok: true, authorityEligible: true }
+        }
+      })
+    });
+
+    assert.equal(result.relayUrl, "https://relay-b.example");
+    assert.equal(result.probes[0].authorityEligible, false);
+  });
+
+  it("prefers direct manifest relay URLs for validator launch writes", () => {
+    const candidates = validatorLaunchControlRelayCandidates(
+      "https://control.example",
+      {
+        controlApiUrls: ["https://control.example"],
+        manifest: {
+          relays: [
+            { relayId: "relay-a", apiBaseUrl: "https://relay-a.example", active: true },
+            { relayId: "relay-b", controlPlaneUrl: "https://relay-b-control.example", apiBaseUrl: "https://relay-b.example", active: true },
+            { relayId: "relay-c", apiBaseUrl: "https://relay-c.example", active: false }
+          ]
+        }
+      } as any,
+      { pinned: false }
+    );
+
+    assert.deepEqual(candidates, [
+      "https://relay-a.example",
+      "https://relay-b-control.example",
+      "https://control.example"
+    ]);
+    assert.deepEqual(
+      validatorLaunchControlRelayCandidates("https://control.example", { controlApiUrls: ["https://relay-a.example"] } as any, { pinned: true }),
+      ["https://control.example"]
+    );
+  });
 });
+
+function relayProbeFetch(
+  responses: Record<string, { status: number; body: Record<string, unknown> }>
+): typeof fetch {
+  return async (input) => {
+    const url = input instanceof URL ? input.toString() : String(input);
+    const response = responses[url];
+    if (!response) {
+      return new Response(JSON.stringify({ error: "not_found" }), {
+        status: 404,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    return new Response(JSON.stringify(response.body), {
+      status: response.status,
+      headers: { "content-type": "application/json" }
+    });
+  };
+}

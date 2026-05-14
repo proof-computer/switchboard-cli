@@ -1811,8 +1811,163 @@ function controlRelayCandidateUrls(
   }
   return uniqueStrings([
     primaryRelayUrl,
-    ...(manifestConfig.controlApiUrls ?? [])
+    ...(manifestConfig.controlApiUrls ?? []),
+    ...manifestRelayControlUrls(manifestConfig)
   ].map(normalizeCliBaseUrl));
+}
+
+function manifestRelayControlUrls(manifestConfig: CliNetworkConfig): string[] {
+  return (manifestConfig.manifest?.relays ?? [])
+    .filter((relay) => (relay.active ?? true) !== false)
+    .map((relay) => relay.controlPlaneUrl ?? relay.apiBaseUrl)
+    .filter((url): url is string => Boolean(url));
+}
+
+export function validatorLaunchControlRelayCandidates(
+  requestedRelayUrl: string,
+  manifestConfig: CliNetworkConfig,
+  options: { pinned: boolean }
+): string[] {
+  if (options.pinned) {
+    return [normalizeCliBaseUrl(requestedRelayUrl)];
+  }
+  return uniqueStrings([
+    ...manifestRelayControlUrls(manifestConfig),
+    ...controlRelayCandidateUrls(requestedRelayUrl, manifestConfig, { pinned: false })
+  ].map(normalizeCliBaseUrl));
+}
+
+export interface WritableControlRelaySelection {
+  relayUrl: string;
+  probes: WritableControlRelayProbe[];
+}
+
+export interface WritableControlRelayProbe {
+  relayUrl: string;
+  ok: boolean;
+  healthOk?: boolean;
+  readinessOk?: boolean;
+  authorityEligible?: boolean;
+  detail: string;
+}
+
+export async function selectWritableControlRelayUrl(
+  relayUrls: string[],
+  options: {
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+  } = {}
+): Promise<WritableControlRelaySelection> {
+  const candidates = uniqueStrings(relayUrls.map(normalizeCliBaseUrl));
+  if (candidates.length === 0) {
+    throw new Error("No control relay URLs are available for validator launch");
+  }
+  if (candidates.length === 1) {
+    return {
+      relayUrl: candidates[0],
+      probes: []
+    };
+  }
+  const probes = await Promise.all(
+    candidates.map((relayUrl) => probeWritableControlRelay(relayUrl, options))
+  );
+  const selected = probes.find((probe) => probe.ok);
+  if (selected) {
+    return {
+      relayUrl: selected.relayUrl,
+      probes
+    };
+  }
+  throw new Error(
+    `No writable control relay is currently healthy for validator launch: ${probes.map((probe) => `${probe.relayUrl}=${probe.detail}`).join("; ")}`
+  );
+}
+
+async function probeWritableControlRelay(
+  relayUrl: string,
+  options: {
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+  }
+): Promise<WritableControlRelayProbe> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  try {
+    const health = await fetchImpl(new URL("/health", relayUrl), {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    const healthBody = await health.text();
+    if (!health.ok) {
+      return {
+        relayUrl,
+        ok: false,
+        healthOk: false,
+        detail: `health ${health.status} ${truncateText(healthBody || health.statusText, 180)}`
+      };
+    }
+  } catch (error) {
+    return {
+      relayUrl,
+      ok: false,
+      healthOk: false,
+      detail: `health ${safeErrorMessage(error)}`
+    };
+  }
+
+  try {
+    const readiness = await fetchImpl(new URL("/v1/control-readiness", relayUrl), {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    const readinessBody = await readiness.text();
+    if (readiness.status === 404) {
+      return {
+        relayUrl,
+        ok: true,
+        healthOk: true,
+        readinessOk: false,
+        detail: "health ok; readiness endpoint unavailable"
+      };
+    }
+    const parsed = readinessBody ? parseJsonObject(readinessBody) : undefined;
+    const authorityEligible = typeof parsed?.authorityEligible === "boolean" ? parsed.authorityEligible : undefined;
+    if (readiness.ok && authorityEligible !== false) {
+      return {
+        relayUrl,
+        ok: true,
+        healthOk: true,
+        readinessOk: true,
+        authorityEligible,
+        detail: "health ok; readiness ok"
+      };
+    }
+    if (authorityEligible === false) {
+      return {
+        relayUrl,
+        ok: false,
+        healthOk: true,
+        readinessOk: readiness.ok,
+        authorityEligible,
+        detail: `readiness authority ineligible ${readiness.status} ${truncateText(readinessBody || readiness.statusText, 180)}`
+      };
+    }
+    return {
+      relayUrl,
+      ok: true,
+      healthOk: true,
+      readinessOk: false,
+      detail: `health ok; readiness non-blocking ${readiness.status} ${truncateText(readinessBody || readiness.statusText, 180)}`
+    };
+  } catch (error) {
+    return {
+      relayUrl,
+      ok: true,
+      healthOk: true,
+      readinessOk: false,
+      detail: `health ok; readiness non-blocking ${safeErrorMessage(error)}`
+    };
+  }
 }
 
 function normalizeCliBaseUrl(value: string): string {
@@ -2881,7 +3036,17 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     throw new Error("Refusing to launch validator without --yes");
   }
   const manifestConfig = await resolveCliNetworkConfig(flags);
-  const relayUrl = stringFlag(flags, "relay-url") ?? manifestConfig.relayUrl ?? DEFAULT_CONTROL_PLANE_URL;
+  const requestedRelayUrl =
+    stringFlag(flags, "relay-url") ??
+    optionalEnv("SWITCHBOARD_VALIDATOR_RELAY_URL") ??
+    manifestConfig.relayUrl ??
+    DEFAULT_CONTROL_PLANE_URL;
+  const relayPinned = Boolean(stringFlag(flags, "relay-url") || optionalEnv("SWITCHBOARD_VALIDATOR_RELAY_URL"));
+  const relayCandidates = validatorLaunchControlRelayCandidates(requestedRelayUrl, manifestConfig, { pinned: relayPinned });
+  const validatorRelaySelection = await selectWritableControlRelayUrl(
+    relayCandidates
+  );
+  const relayUrl = validatorRelaySelection.relayUrl;
   const seed = stringFlag(flags, "deployer-seed") ?? optionalEnv("ACURAST_MAINNET_SEED") ?? optionalEnv("PROOF_ACURAST_MAINNET_DEPLOYER_SEED");
   if (!seed) {
     throw new Error("Missing --deployer-seed or ACURAST_MAINNET_SEED/PROOF_ACURAST_MAINNET_DEPLOYER_SEED");
@@ -2901,7 +3066,9 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     intent = await postSignedJson(new URL("/v1/validator-launch-intents", relayUrl).toString(), intentPayload, {
       domain: "switchboard.validator-launch-intent.v1",
       seed,
-      ss58Format
+      ss58Format,
+      retries: 2,
+      timeoutMs: 20_000
     });
   } catch (error) {
     const latest = await resolveValidatorScriptLookup(flags, manifestConfig);
@@ -2960,10 +3127,20 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
       },
       networkRequests: validatorNetworkRequests,
       validatorWork: validatorWorkEnv,
+      relay: {
+        relayUrl,
+        requestedRelayUrl,
+        candidates: validatorRelaySelection.probes.map((probe) => ({
+          relayUrl: probe.relayUrl,
+          ok: probe.ok,
+          detail: probe.detail
+        }))
+      },
       processorSelection: validatorProcessors
     }, () => {
       console.log("Validator launch dry run");
       console.log(`Intent: ${stringRecordField(intentRecord, "intentId")}`);
+      console.log(`Relay: ${relayUrl}`);
       console.log(`Script: ${scriptIpfs}`);
       console.log(`Deployer: ${deployer.address}`);
       console.log(`SS58 format: ${ss58Format}`);
@@ -3067,7 +3244,10 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     {
       domain: "switchboard.validator-deployment-registration.v1",
       seed,
-      ss58Format
+      ss58Format,
+      retries: 4,
+      retryDelayMs: 2_500,
+      timeoutMs: 20_000
     }
   );
   writeOutput(flags, {
@@ -3076,6 +3256,15 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
     deploymentId,
     registered,
     enrollmentPubkey,
+    relay: {
+      relayUrl,
+      requestedRelayUrl,
+      candidates: validatorRelaySelection.probes.map((probe) => ({
+        relayUrl: probe.relayUrl,
+        ok: probe.ok,
+        detail: probe.detail
+      }))
+    },
     deployer: {
       address: deployer.address,
       ss58Format
@@ -3091,6 +3280,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
   }, () => {
     console.log("Validator launch registered");
     console.log(`Intent: ${requiredStringRecordField(intentRecord, "intentId")}`);
+    console.log(`Relay: ${relayUrl}`);
     console.log(`Deployment: ${deploymentId}`);
     console.log(`Script: ${scriptIpfs}`);
     console.log(`Deployer: ${deployer.address}`);
@@ -5851,28 +6041,71 @@ function randomNonce(): string {
 async function postSignedJson(
   url: string,
   payload: Record<string, unknown>,
-  options: { domain: string; seed: string; ss58Format: number }
+  options: {
+    domain: string;
+    seed: string;
+    ss58Format: number;
+    retries?: number;
+    retryDelayMs?: number;
+    timeoutMs?: number;
+  }
 ): Promise<unknown> {
   const signature = await signReportPayload(options.seed, options.domain, payload, {
     scheme: "substrate-sr25519",
     ss58Format: options.ss58Format
   });
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json"
-    },
-    body: JSON.stringify({
-      ...payload,
-      signature
-    })
+  const body = JSON.stringify({
+    ...payload,
+    signature
   });
-  const body = await response.text();
-  if (!response.ok) {
-    throw new Error(`${url} failed: ${response.status} ${body.slice(0, 1000)}`);
+  const retries = options.retries ?? 0;
+  const retryDelayMs = options.retryDelayMs ?? 1_000;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json"
+        },
+        body,
+        signal: AbortSignal.timeout(options.timeoutMs ?? 15_000)
+      });
+      const responseBody = await response.text();
+      if (response.ok) {
+        return JSON.parse(responseBody);
+      }
+      const error = new Error(`${url} failed: ${response.status} ${responseBody.slice(0, 1000)}`);
+      if (!isRetryablePostSignedJsonStatus(response.status) || attempt >= retries) {
+        throw error;
+      }
+      lastError = error;
+    } catch (error) {
+      if (!isRetryablePostSignedJsonError(error) || attempt >= retries) {
+        throw error;
+      }
+      lastError = error;
+    }
+    await delay(retryDelayMs);
   }
-  return JSON.parse(body);
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function isRetryablePostSignedJsonStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
+function isRetryablePostSignedJsonError(error: unknown): boolean {
+  return error instanceof Error && (
+    error.name === "AbortError" ||
+    error.name === "TimeoutError" ||
+    /fetch failed|network|timeout|aborted/i.test(error.message)
+  );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function deploymentReportPath(flags: Map<string, string | boolean>): string | undefined {
