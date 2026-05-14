@@ -267,8 +267,7 @@ describe("acurast manager processor readiness", () => {
 
     assert.deepEqual(candidates, [
       "https://relay-a.example",
-      "https://relay-b-control.example",
-      "https://control.example"
+      "https://relay-b-control.example"
     ]);
     assert.deepEqual(
       validatorLaunchControlRelayCandidates("https://control.example", { controlApiUrls: ["https://relay-a.example"] } as any, { pinned: true }),

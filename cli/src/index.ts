@@ -1836,10 +1836,11 @@ export function validatorLaunchControlRelayCandidates(
   if (options.pinned) {
     return [normalizeCliBaseUrl(requestedRelayUrl)];
   }
-  return uniqueStrings([
-    ...manifestRelayControlUrls(manifestConfig),
-    ...controlRelayCandidateUrls(requestedRelayUrl, manifestConfig, { pinned: false })
-  ].map(normalizeCliBaseUrl));
+  const directRelayUrls = uniqueStrings(manifestRelayControlUrls(manifestConfig).map(normalizeCliBaseUrl));
+  if (directRelayUrls.length > 0) {
+    return directRelayUrls;
+  }
+  return controlRelayCandidateUrls(requestedRelayUrl, manifestConfig, { pinned: false });
 }
 
 export interface WritableControlRelaySelection {
