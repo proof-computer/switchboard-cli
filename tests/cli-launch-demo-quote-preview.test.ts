@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { formatLaunchDemoQuoteLineItems, formatLaunchDemoQuotePreview } from "../cli/src/index.js";
+import {
+  fetchLaunchDemoQuotePreview,
+  formatLaunchDemoQuoteLineItems,
+  formatLaunchDemoQuotePreview
+} from "../cli/src/index.js";
 
 describe("launch-demo quote preview formatting", () => {
   const manifestConfig = {
@@ -71,5 +75,75 @@ describe("launch-demo quote preview formatting", () => {
       } as any),
       "3.024 USDC (Base route 3.024 USDC; DNS/TLS included; Fair-use bandwidth standard)"
     );
+  });
+
+  it("retries transient quote preview timeouts before launch-demo spends", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        preview: {
+          amount: "9000",
+          asset: "0x0000000000000000000000000000000000001337",
+          paidSeconds: "7200"
+        }
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    try {
+      const preview = await fetchLaunchDemoQuotePreview({
+        relayUrl: "https://relay.test",
+        assetAddress: "0x0000000000000000000000000000000000001337",
+        paidSeconds: "7200",
+        manifestConfig,
+        timeoutMs: 10,
+        retries: 1,
+        retryDelayMs: 1
+      });
+
+      assert.equal(calls, 2);
+      assert.equal(preview.ok, true);
+      assert.equal(preview.ok ? preview.amount : "", "9000");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("does not retry non-transient quote preview rejections", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ ok: false, error: "bad_request" }), {
+        status: 400,
+        headers: { "content-type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    try {
+      const preview = await fetchLaunchDemoQuotePreview({
+        relayUrl: "https://relay.test",
+        assetAddress: "0x0000000000000000000000000000000000001337",
+        paidSeconds: "7200",
+        manifestConfig,
+        timeoutMs: 10,
+        retries: 3,
+        retryDelayMs: 1
+      });
+
+      assert.equal(calls, 1);
+      assert.equal(preview.ok, false);
+      assert.match(preview.ok ? "" : preview.error, /400/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

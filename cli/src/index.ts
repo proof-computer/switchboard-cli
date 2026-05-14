@@ -1486,7 +1486,9 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     assetAddress: manifestConfig.defaultAssetAddress,
     paidSeconds,
     manifestConfig,
-    timeoutMs: numberFlag(flags, "quote-preview-timeout-ms", "SWITCHBOARD_LAUNCH_DEMO_QUOTE_PREVIEW_TIMEOUT_MS", 15_000)
+    timeoutMs: numberFlag(flags, "quote-preview-timeout-ms", "SWITCHBOARD_LAUNCH_DEMO_QUOTE_PREVIEW_TIMEOUT_MS", 15_000),
+    retries: numberFlag(flags, "quote-preview-retries", "SWITCHBOARD_LAUNCH_DEMO_QUOTE_PREVIEW_RETRIES", 2),
+    retryDelayMs: numberFlag(flags, "quote-preview-retry-delay-ms", "SWITCHBOARD_LAUNCH_DEMO_QUOTE_PREVIEW_RETRY_DELAY_MS", 1_000)
   });
   launchDemoDebug(`quote preview ${ingressEstimate.ok ? "ok" : "unavailable"}`);
   if (!boolFlag(flags, "dry-run") && !ingressEstimate.ok) {
@@ -2523,12 +2525,14 @@ function launchDemoReportHasCapacity(report: GatewayCapabilityReport): boolean {
   return launchDemoReportEligibilityReason(report) === undefined;
 }
 
-async function fetchLaunchDemoQuotePreview(input: {
+export async function fetchLaunchDemoQuotePreview(input: {
   relayUrl: string;
   assetAddress?: string;
   paidSeconds: string;
   manifestConfig: CliNetworkConfig;
   timeoutMs: number;
+  retries?: number;
+  retryDelayMs?: number;
 }): Promise<LaunchDemoQuotePreview> {
   if (!input.assetAddress) {
     return { ok: false, error: "network manifest did not publish a default funding asset" };
@@ -2541,48 +2545,69 @@ async function fetchLaunchDemoQuotePreview(input: {
     return { ok: false, error: `invalid funding asset ${input.assetAddress}: ${safeErrorMessage(error)}` };
   }
 
-  try {
-    const response = await fetch(new URL("/v1/quote-preview", input.relayUrl), {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        asset,
-        paidSeconds: input.paidSeconds
-      }),
-      signal: AbortSignal.timeout(input.timeoutMs)
-    });
-    const body = await response.text();
-    const parsed = body ? parseJsonObject(body) : undefined;
-    if (!response.ok || parsed?.ok !== true) {
-      return {
-        ok: false,
-        error: `${response.status} ${truncateText(body || response.statusText, 300)}`
-      };
+  const retries = input.retries ?? 0;
+  const retryDelayMs = input.retryDelayMs ?? 1_000;
+  let lastError = "";
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await fetch(new URL("/v1/quote-preview", input.relayUrl), {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          asset,
+          paidSeconds: input.paidSeconds
+        }),
+        signal: AbortSignal.timeout(input.timeoutMs)
+      });
+      const body = await response.text();
+      const parsed = body ? parseJsonObject(body) : undefined;
+      if (!response.ok || parsed?.ok !== true) {
+        const error = `${response.status} ${truncateText(body || response.statusText, 300)}`;
+        if (!isRetryableLaunchDemoQuotePreviewStatus(response.status) || attempt >= retries) {
+          return { ok: false, error };
+        }
+        lastError = error;
+      } else {
+        const preview = nestedRecord(parsed, "preview");
+        const amount = stringRecordField(preview, "amount");
+        const previewAsset = stringRecordField(preview, "asset") ?? asset;
+        const paidSeconds = stringRecordField(preview, "paidSeconds") ?? input.paidSeconds;
+        if (!preview || !amount) {
+          return { ok: false, error: "relay quote preview response was missing preview.amount" };
+        }
+        const lineItemSummary = formatLaunchDemoQuoteLineItems(preview, previewAsset, input.manifestConfig);
+        const formattedAmount = formatLaunchDemoQuoteAmount(amount, previewAsset, input.manifestConfig);
+        return {
+          ok: true,
+          asset: previewAsset,
+          amount,
+          paidSeconds,
+          formattedAmount: lineItemSummary ? `${formattedAmount} (${lineItemSummary})` : formattedAmount,
+          lineItemSummary,
+          preview
+        };
+      }
+    } catch (error) {
+      if (!isRetryableLaunchDemoQuotePreviewError(error) || attempt >= retries) {
+        return { ok: false, error: safeErrorMessage(error) };
+      }
+      lastError = safeErrorMessage(error);
     }
-    const preview = nestedRecord(parsed, "preview");
-    const amount = stringRecordField(preview, "amount");
-    const previewAsset = stringRecordField(preview, "asset") ?? asset;
-    const paidSeconds = stringRecordField(preview, "paidSeconds") ?? input.paidSeconds;
-    if (!preview || !amount) {
-      return { ok: false, error: "relay quote preview response was missing preview.amount" };
-    }
-    const lineItemSummary = formatLaunchDemoQuoteLineItems(preview, previewAsset, input.manifestConfig);
-    const formattedAmount = formatLaunchDemoQuoteAmount(amount, previewAsset, input.manifestConfig);
-    return {
-      ok: true,
-      asset: previewAsset,
-      amount,
-      paidSeconds,
-      formattedAmount: lineItemSummary ? `${formattedAmount} (${lineItemSummary})` : formattedAmount,
-      lineItemSummary,
-      preview
-    };
-  } catch (error) {
-    return { ok: false, error: safeErrorMessage(error) };
+    await delay(retryDelayMs);
   }
+  return { ok: false, error: lastError || "quote preview failed" };
+}
+
+function isRetryableLaunchDemoQuotePreviewStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
+function isRetryableLaunchDemoQuotePreviewError(error: unknown): boolean {
+  const name = error && typeof error === "object" ? String((error as { name?: unknown }).name ?? "") : "";
+  return name === "AbortError" || name === "TimeoutError" || /timeout|network|fetch failed/i.test(safeErrorMessage(error));
 }
 
 function formatLaunchDemoQuoteAmount(amount: string, assetAddress: string, manifestConfig: CliNetworkConfig): string {
@@ -7450,6 +7475,7 @@ Launch demo:
   --min-ready <n>                  Minimum successful replicas required, default processor-count
   --demo-package <spec>            Demo package spec; use file:/path/to/switchboard-express-demo for local clones
   Ingress estimate                 Previewed before Acurast deploy/funding
+  --quote-preview-timeout-ms <ms>  Default 15000; retried on transient relay failures
   Acurast start delay              Fixed 3 minutes
   --max-cost-per-execution <n>     Default ${DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION}
 
