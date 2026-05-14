@@ -228,6 +228,27 @@ describe("acurast manager processor readiness", () => {
     assert.equal(result.probes[0].authorityEligible, false);
   });
 
+  it("prefers the fastest healthy writable relay", async () => {
+    const result = await selectWritableControlRelayUrl(["https://relay-a.example", "https://relay-b.example"], {
+      fetchImpl: relayProbeFetch({
+        "https://relay-a.example/health": { status: 200, body: { ok: true }, delayMs: 20 },
+        "https://relay-a.example/v1/control-readiness": {
+          status: 200,
+          body: { ok: true, authorityEligible: true },
+          delayMs: 20
+        },
+        "https://relay-b.example/health": { status: 200, body: { ok: true } },
+        "https://relay-b.example/v1/control-readiness": {
+          status: 200,
+          body: { ok: true, authorityEligible: true }
+        }
+      })
+    });
+
+    assert.equal(result.relayUrl, "https://relay-b.example");
+    assert.ok((result.probes[0].elapsedMs ?? 0) >= (result.probes[1].elapsedMs ?? 0));
+  });
+
   it("prefers direct manifest relay URLs for validator launch writes", () => {
     const candidates = validatorLaunchControlRelayCandidates(
       "https://control.example",
@@ -268,7 +289,7 @@ describe("acurast manager processor readiness", () => {
 });
 
 function relayProbeFetch(
-  responses: Record<string, { status: number; body: Record<string, unknown> }>
+  responses: Record<string, { status: number; body: Record<string, unknown>; delayMs?: number }>
 ): typeof fetch {
   return async (input) => {
     const url = input instanceof URL ? input.toString() : String(input);
@@ -278,6 +299,9 @@ function relayProbeFetch(
         status: 404,
         headers: { "content-type": "application/json" }
       });
+    }
+    if (response.delayMs) {
+      await new Promise((resolve) => setTimeout(resolve, response.delayMs));
     }
     return new Response(JSON.stringify(response.body), {
       status: response.status,

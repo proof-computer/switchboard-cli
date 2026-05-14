@@ -1853,6 +1853,7 @@ export interface WritableControlRelayProbe {
   healthOk?: boolean;
   readinessOk?: boolean;
   authorityEligible?: boolean;
+  elapsedMs?: number;
   detail: string;
 }
 
@@ -1876,7 +1877,9 @@ export async function selectWritableControlRelayUrl(
   const probes = await Promise.all(
     candidates.map((relayUrl) => probeWritableControlRelay(relayUrl, options))
   );
-  const selected = probes.find((probe) => probe.ok);
+  const selected = probes
+    .filter((probe) => probe.ok)
+    .sort((left, right) => (left.elapsedMs ?? Number.MAX_SAFE_INTEGER) - (right.elapsedMs ?? Number.MAX_SAFE_INTEGER))[0];
   if (selected) {
     return {
       relayUrl: selected.relayUrl,
@@ -1897,6 +1900,7 @@ async function probeWritableControlRelay(
 ): Promise<WritableControlRelayProbe> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const timeoutMs = options.timeoutMs ?? 5_000;
+  const startedAt = Date.now();
   try {
     const health = await fetchImpl(new URL("/health", relayUrl), {
       headers: { accept: "application/json" },
@@ -1908,6 +1912,7 @@ async function probeWritableControlRelay(
         relayUrl,
         ok: false,
         healthOk: false,
+        elapsedMs: Date.now() - startedAt,
         detail: `health ${health.status} ${truncateText(healthBody || health.statusText, 180)}`
       };
     }
@@ -1916,6 +1921,7 @@ async function probeWritableControlRelay(
       relayUrl,
       ok: false,
       healthOk: false,
+      elapsedMs: Date.now() - startedAt,
       detail: `health ${safeErrorMessage(error)}`
     };
   }
@@ -1932,6 +1938,7 @@ async function probeWritableControlRelay(
         ok: true,
         healthOk: true,
         readinessOk: false,
+        elapsedMs: Date.now() - startedAt,
         detail: "health ok; readiness endpoint unavailable"
       };
     }
@@ -1944,6 +1951,7 @@ async function probeWritableControlRelay(
         healthOk: true,
         readinessOk: true,
         authorityEligible,
+        elapsedMs: Date.now() - startedAt,
         detail: "health ok; readiness ok"
       };
     }
@@ -1954,6 +1962,7 @@ async function probeWritableControlRelay(
         healthOk: true,
         readinessOk: readiness.ok,
         authorityEligible,
+        elapsedMs: Date.now() - startedAt,
         detail: `readiness authority ineligible ${readiness.status} ${truncateText(readinessBody || readiness.statusText, 180)}`
       };
     }
@@ -1962,6 +1971,7 @@ async function probeWritableControlRelay(
       ok: true,
       healthOk: true,
       readinessOk: false,
+      elapsedMs: Date.now() - startedAt,
       detail: `health ok; readiness non-blocking ${readiness.status} ${truncateText(readinessBody || readiness.statusText, 180)}`
     };
   } catch (error) {
@@ -1970,6 +1980,7 @@ async function probeWritableControlRelay(
       ok: true,
       healthOk: true,
       readinessOk: false,
+      elapsedMs: Date.now() - startedAt,
       detail: `health ok; readiness non-blocking ${safeErrorMessage(error)}`
     };
   }
@@ -3138,6 +3149,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
         candidates: validatorRelaySelection.probes.map((probe) => ({
           relayUrl: probe.relayUrl,
           ok: probe.ok,
+          elapsedMs: probe.elapsedMs,
           detail: probe.detail
         }))
       },
@@ -3267,6 +3279,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
       candidates: validatorRelaySelection.probes.map((probe) => ({
         relayUrl: probe.relayUrl,
         ok: probe.ok,
+        elapsedMs: probe.elapsedMs,
         detail: probe.detail
       }))
     },
@@ -6102,11 +6115,8 @@ function isRetryablePostSignedJsonStatus(status: number): boolean {
 }
 
 function isRetryablePostSignedJsonError(error: unknown): boolean {
-  return error instanceof Error && (
-    error.name === "AbortError" ||
-    error.name === "TimeoutError" ||
-    /fetch failed|network|timeout|aborted/i.test(error.message)
-  );
+  void error;
+  return false;
 }
 
 function delay(ms: number): Promise<void> {
