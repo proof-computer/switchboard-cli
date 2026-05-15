@@ -47,9 +47,12 @@ describe("relay deployment spec", () => {
     assert.equal(spec.acurast?.entrypoint, "src/server.ts");
     assert.equal(spec.acurast?.executionMs, 3_600_000);
     assert.equal(spec.acurast?.maxCostPerExecution, "40000000000");
+    assert.equal(spec.acurast?.encryptedCode, true);
     assert.equal(spec.relay.authorityProfile, "durable-relay");
     assert.equal(spec.relay.autoRegister, false);
+    assert.equal(spec.relay.admissionMode, "none");
     assert.equal(spec.relay.enablePeerBackfill, true);
+    assert.equal(spec.relay.validationReportStoreKind, "sqlite");
     assert.equal(spec.relay.sqliteDriver, "node:sqlite");
   });
 
@@ -227,8 +230,45 @@ describe("relay deployment spec", () => {
       }
     });
     assert.equal(spec.relay.autoRegister, true);
+    assert.equal(spec.relay.admissionMode, "paid-ingress");
     assert.equal(spec.relay.bootstrapRelayUrl, "https://relay-a.switchboard.proof.computer");
     assert.equal(spec.relay.certificateMode, "job-acme");
+  });
+
+  it("accepts proof-infra admission without paid self-registration", () => {
+    const spec = parseRelayDeploymentSpec({
+      ...validAcurastSpec,
+      secrets: {
+        ...validAcurastSpec.secrets,
+        relayInfraAdmissionTokenEnv: "PROOF_RELAY_INFRA_ADMISSION_TOKEN"
+      },
+      relay: {
+        admissionMode: "proof-infra",
+        autoRegister: false,
+        bootstrapRelayUrl: "https://relay-a.switchboard.proof.computer"
+      }
+    });
+    assert.equal(spec.relay.admissionMode, "proof-infra");
+    assert.equal(spec.relay.autoRegister, false);
+  });
+
+  it("rejects proof-infra admission when paid self-registration is also enabled", () => {
+    const result = safeParseRelayDeploymentSpec({
+      ...validAcurastSpec,
+      secrets: {
+        ...validAcurastSpec.secrets,
+        relayInfraAdmissionTokenEnv: "PROOF_RELAY_INFRA_ADMISSION_TOKEN"
+      },
+      relay: {
+        admissionMode: "proof-infra",
+        autoRegister: true,
+        bootstrapRelayUrl: "https://relay-a.switchboard.proof.computer"
+      }
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.ok(result.error.errors.some((issue) => issue.message.includes("autoRegister")));
+    }
   });
 
   it("requires relay.bootstrapRelayUrl when target=acurast and autoRegister=true", () => {

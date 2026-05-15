@@ -53,6 +53,12 @@ export const relayAuthorityProfileSchema = z.enum([
   "bootstrap-control-plane"
 ]);
 
+export const relayAdmissionModeSchema = z.enum([
+  "proof-infra",
+  "paid-ingress",
+  "none"
+]);
+
 const peerRelaySchema = z
   .object({
     relayId: z.string().min(1),
@@ -66,6 +72,7 @@ const relaySecretsSchema = z
     relayerPrivateKeyEnv: envNameSchema,
     validationReadTokenEnv: envNameSchema.optional(),
     controlPlaneTokenEnv: envNameSchema.optional(),
+    relayInfraAdmissionTokenEnv: envNameSchema.optional(),
     logCreateTokenEnv: envNameSchema.optional(),
     logEncryptionKeyEnv: envNameSchema.optional()
   })
@@ -89,6 +96,7 @@ const acurastTargetSchema = z
     instantMatchProcessors: z.array(z.string().min(1)).default([]),
     compactEnv: z.boolean().default(true),
     includeEnv: z.array(envNameSchema).default([]),
+    encryptedCode: z.boolean().default(true),
     scriptIpfs: z.string().min(1).optional()
   })
   .strict();
@@ -107,6 +115,7 @@ const relayProcessConfigSchema = z
     authorityProfile: relayAuthorityProfileSchema.default("durable-relay"),
     settlementRelayId: z.string().min(1).optional(),
     authorityLeaseOwnerId: z.string().min(1).optional(),
+    admissionMode: relayAdmissionModeSchema.optional(),
     autoRegister: z.boolean().default(false),
     bootstrapRelayUrl: z.string().url().optional(),
     certificateMode: z.enum(["job-acme", "self-signed", "external"]).default("job-acme"),
@@ -125,12 +134,17 @@ const relayProcessConfigSchema = z
     enablePeerBackfill: z.boolean().default(true),
     enableMonitoring: z.boolean().default(true),
     enableRateLimits: z.boolean().default(true),
+    validationReportStoreKind: z.enum(["json", "sqlite"]).default("sqlite"),
     sqliteDriver: z.enum(["node:sqlite", "better-sqlite3"]).default("node:sqlite"),
     sqliteFile: z.string().min(1).default("tmp/validation-reports/proof-relay.sqlite"),
     publicMetrics: z.boolean().default(false),
     quotesEnabled: z.boolean().default(false)
   })
-  .strict();
+  .strict()
+  .transform((value) => ({
+    ...value,
+    admissionMode: value.admissionMode ?? (value.autoRegister ? "paid-ingress" : "none")
+  }));
 
 const verificationConfigSchema = z
   .object({
@@ -204,6 +218,29 @@ export const relayDeploymentSpecSchema = z
         path: ["relay", "bootstrapRelayUrl"]
       });
     }
+    if (value.target === "acurast" && value.relay.admissionMode === "proof-infra") {
+      if (value.relay.autoRegister) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "relay.autoRegister must be false when relay.admissionMode=proof-infra",
+          path: ["relay", "autoRegister"]
+        });
+      }
+      if (!value.relay.bootstrapRelayUrl) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "relay.bootstrapRelayUrl is required when target=acurast and relay.admissionMode=proof-infra",
+          path: ["relay", "bootstrapRelayUrl"]
+        });
+      }
+      if (!value.secrets.relayInfraAdmissionTokenEnv && !value.secrets.controlPlaneTokenEnv) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "secrets.relayInfraAdmissionTokenEnv or secrets.controlPlaneTokenEnv is required when relay.admissionMode=proof-infra",
+          path: ["secrets", "relayInfraAdmissionTokenEnv"]
+        });
+      }
+    }
     if (value.target === "acurast" && value.relay.enableLogs && !value.relay.bootstrapRelayUrl) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -242,6 +279,7 @@ export type RelayDeploymentSpec = z.output<typeof relayDeploymentSpecSchema>;
 export type RelayCatalogState = z.output<typeof relayCatalogStateSchema>;
 export type RelayDeploymentTarget = RelayDeploymentSpec["target"];
 export type RelayAuthorityProfile = RelayDeploymentSpec["relay"]["authorityProfile"];
+export type RelayAdmissionMode = NonNullable<RelayDeploymentSpec["relay"]["admissionMode"]>;
 
 export interface RelayDeploymentSpecParseError {
   errors: Array<{ path: string; message: string }>;
@@ -309,6 +347,7 @@ function collectShippedEnvRefs(value: z.output<typeof relayDeploymentSpecSchema>
   refs.push([value.secrets.relayerPrivateKeyEnv, ["secrets", "relayerPrivateKeyEnv"]]);
   if (value.secrets.validationReadTokenEnv) refs.push([value.secrets.validationReadTokenEnv, ["secrets", "validationReadTokenEnv"]]);
   if (value.secrets.controlPlaneTokenEnv) refs.push([value.secrets.controlPlaneTokenEnv, ["secrets", "controlPlaneTokenEnv"]]);
+  if (value.secrets.relayInfraAdmissionTokenEnv) refs.push([value.secrets.relayInfraAdmissionTokenEnv, ["secrets", "relayInfraAdmissionTokenEnv"]]);
   if (value.secrets.logCreateTokenEnv) refs.push([value.secrets.logCreateTokenEnv, ["secrets", "logCreateTokenEnv"]]);
   if (value.secrets.logEncryptionKeyEnv) refs.push([value.secrets.logEncryptionKeyEnv, ["secrets", "logEncryptionKeyEnv"]]);
   value.peers.forEach((peer, index) => {

@@ -67,6 +67,7 @@ const autoRegisterSpec = {
     managerId: "9470",
     instantMatchProcessors: ["5EYNfUtMgdxNQUwif5byPvzDWeMWcrv9tEnSAcsAVMuNbUHF"],
     includeEnv: [],
+    encryptedCode: false,
     executionMs: 3_600_000
   }
 };
@@ -119,7 +120,9 @@ const baseEnv: NodeJS.ProcessEnv = {
   CHAIN_ID: "420420419",
   PROOF_RECORDER_COORDINATOR_ADDRESS: "0xd4dFB4AD9A4a2AfF56CCBe479F661b84947287A5",
   PROOF_MAINNET_RELAY_D_RECORDER_PRIVATE_KEY: "0xRELAYER_PRIVATE_KEY_VALUE",
+  PROOF_MAINNET_QUOTE_SIGNER_PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000007",
   PROOF_ACURAST_MAINNET_DEPLOYER_SEED: "//Alice//acurast-deployer",
+  PROOF_RELAY_INFRA_ADMISSION_TOKEN: "infra-admission-token",
   LEDGER_ADDRESS: "0xaE6980ad5D0210585FF381A48Cba5c0be5C02C96",
   PROOF_OPERATOR_ID: `0x${"5c".repeat(32)}`
 };
@@ -162,7 +165,11 @@ describe("switchboard relay deploy: inline Hub funding", () => {
 
     let envSeenByDeploy: NodeJS.ProcessEnv | undefined;
     await runRelayDeploy({
-      flags: new Map<string, string | boolean>([["yes", true], ["no-catalog", true]]),
+      flags: new Map<string, string | boolean>([
+        ["yes", true],
+        ["no-catalog", true],
+        ["quote-timeout-ms", "60000"]
+      ]),
       positionals: ["relay", "deploy", "relay-d"],
       io,
       discoverProcessor: async () => inventory("5HnGyrtojCxgi9PLduFx5r4p9uFNNrNmmBA9E8zMBg2affQ3"),
@@ -195,6 +202,9 @@ describe("switchboard relay deploy: inline Hub funding", () => {
     assert.equal(call.ledger.chainId, "420420419");
     assert.equal(call.ledger.ledgerAddress, baseEnv.LEDGER_ADDRESS);
     assert.equal(call.operatorId, baseEnv.PROOF_OPERATOR_ID);
+    assert.equal(call.endpointHostname, "relay-d.switchboard.proof.computer");
+    assert.equal(call.quoteSignerPrivateKey, baseEnv.PROOF_MAINNET_QUOTE_SIGNER_PRIVATE_KEY);
+    assert.equal(call.quoteTimeoutMs, 60_000);
     // jobSignerAddress derives from ephemeral private key bytes; assert
     // that something address-shaped came through.
     assert.match(call.jobSignerAddress, /^0x[0-9a-fA-F]{40}$/);
@@ -203,6 +213,7 @@ describe("switchboard relay deploy: inline Hub funding", () => {
     const buildConfig = JSON.parse(envSeenByDeploy?.SWITCHBOARD_BUILD_CONFIG ?? "{}");
     assert.equal(buildConfig.SESSION_ID, fakeSessionId);
     assert.equal(buildConfig.JOB_ID, fakeJobId);
+    assert.equal(buildConfig.NONCE, "1");
     assert.equal(envSeenByDeploy?.JOB_SIGNER_PRIVATE_KEY, `0x${"aa".repeat(32)}`);
     // ACURAST_INCLUDE_ENV must contain JOB_SIGNER_PRIVATE_KEY so the job env
     // receives it through the encrypted Acurast channel.
@@ -292,6 +303,43 @@ describe("switchboard relay deploy: inline Hub funding", () => {
     });
 
     assert.equal(fundCalls, 0);
+  });
+
+  it("does not call fundHubSession for proof-infra relay admission", async () => {
+    const proofInfra = JSON.parse(JSON.stringify(autoRegisterSpec));
+    proofInfra.secrets.relayInfraAdmissionTokenEnv = "PROOF_RELAY_INFRA_ADMISSION_TOKEN";
+    proofInfra.relay.admissionMode = "proof-infra";
+    proofInfra.relay.autoRegister = false;
+    proofInfra.relay.enableLogs = false;
+    await writeSpec(workDir, "relay-d", proofInfra);
+    const { io } = makeIo();
+
+    let fundCalls = 0;
+    let envSeenByDeploy: NodeJS.ProcessEnv | undefined;
+    await runRelayDeploy({
+      flags: new Map<string, string | boolean>([["yes", true], ["no-catalog", true]]),
+      positionals: ["relay", "deploy", "relay-d"],
+      io,
+      discoverProcessor: async () => inventory("5HnGyrtojCxgi9PLduFx5r4p9uFNNrNmmBA9E8zMBg2affQ3"),
+      fundHubSession: async () => {
+        fundCalls += 1;
+        throw new Error("should not be called");
+      },
+      spawnPnpm: async (args, env) => {
+        if (args[0] === "acurast:deploy-express:direct") envSeenByDeploy = env;
+        return 0;
+      },
+      spawnNode: async () => 0,
+      skipReadinessPoll: true,
+      skipPeerCheck: true
+    });
+
+    assert.equal(fundCalls, 0);
+    const buildConfig = JSON.parse(envSeenByDeploy?.SWITCHBOARD_BUILD_CONFIG ?? "{}");
+    assert.equal(buildConfig.SWITCHBOARD_RELAY_ADMISSION_MODE, "proof-infra");
+    assert.equal(buildConfig.SWITCHBOARD_AUTO_REGISTER, "false");
+    assert.equal(buildConfig.SESSION_ID, undefined);
+    assert.equal(envSeenByDeploy?.SB_RELAY_INFRA_ADMISSION_TOKEN, "infra-admission-token");
   });
 
   it("provisions an encrypted log sink and persists read state when relay.enableLogs=true", async () => {
@@ -484,6 +532,8 @@ describe("switchboard relay deploy: inline Hub funding", () => {
           substrateCalls += 1;
           assert.equal(input.relayUrl, "https://relay-a.switchboard.proof.computer");
           assert.equal(input.signing.substrateWsUrl, "wss://example/sub");
+          assert.equal(input.endpointHostname, "relay-d.switchboard.proof.computer");
+          assert.equal(input.quoteSignerPrivateKey, baseEnv.PROOF_MAINNET_QUOTE_SIGNER_PRIVATE_KEY);
           // seed env defaulted to the spec's deployerSeedEnv (PROOF_ACURAST_MAINNET_DEPLOYER_SEED)
           assert.equal(input.signing.seed, baseEnv.PROOF_ACURAST_MAINNET_DEPLOYER_SEED);
           return {
@@ -513,6 +563,7 @@ describe("switchboard relay deploy: inline Hub funding", () => {
     assert.equal(substrateCalls, 1);
     const buildConfig = JSON.parse(envSeenByDeploy?.SWITCHBOARD_BUILD_CONFIG ?? "{}");
     assert.equal(buildConfig.SESSION_ID, `0x${"42".repeat(32)}`);
+    assert.equal(buildConfig.NONCE, "1");
   });
 
   it("--funding-mode=substrate aborts cleanly when HUB_SUBSTRATE_WS_URL is missing", async () => {
@@ -552,6 +603,7 @@ describe("switchboard relay deploy: inline Hub funding", () => {
     process.env.HUB_SUBSTRATE_WS_URL = "wss://example/sub";
     process.env.ACURAST_MAINNET_SEED = "fish method water vague travel wealth amused river curtain stadium digital wedding";
     let observedSeedEnvName: string | undefined;
+    let observedQuoteTimeoutMs: number | undefined;
     let envSeenByDeploy: NodeJS.ProcessEnv | undefined;
     try {
       await runRelayDeploy({
@@ -559,13 +611,15 @@ describe("switchboard relay deploy: inline Hub funding", () => {
           ["yes", true],
           ["no-catalog", true],
           ["funding-mode", "substrate"],
-          ["deployer-seed-env", "ACURAST_MAINNET_SEED"]
+          ["deployer-seed-env", "ACURAST_MAINNET_SEED"],
+          ["quote-timeout-ms", "45000"]
         ]),
         positionals: ["relay", "deploy", "relay-d"],
         io,
         discoverProcessor: async () => inventory("5DH3ipjftEhSSihRyXJEndcMtRBmxyVbphdH85rXw8BUJFkv"),
         fundHubSessionSubstrate: async (input: FundIngressSessionSubstrateInput) => {
           observedSeedEnvName = input.signing.seed === process.env.ACURAST_MAINNET_SEED ? "ACURAST_MAINNET_SEED" : "(other)";
+          observedQuoteTimeoutMs = input.quoteTimeoutMs;
           return {
             sessionId: `0x${"42".repeat(32)}`,
             jobId: `0x${"99".repeat(32)}`,
@@ -593,6 +647,7 @@ describe("switchboard relay deploy: inline Hub funding", () => {
     assert.ok(captured.warn.some((line) => line.includes("deployer override") && line.includes("ACURAST_MAINNET_SEED")));
     // funding signed with the overridden seed
     assert.equal(observedSeedEnvName, "ACURAST_MAINNET_SEED");
+    assert.equal(observedQuoteTimeoutMs, 45_000);
     // Acurast extrinsics also signed with the overridden seed (ACURAST_MAINNET_SEED in childEnv)
     assert.ok(envSeenByDeploy?.ACURAST_MAINNET_SEED);
   });

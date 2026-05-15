@@ -141,6 +141,9 @@ const rootDir = process.env.SWITCHBOARD_WORK_DIR
 const DEFAULT_MAINNET_RPC = "wss://archive.mainnet.acurast.com";
 const DEFAULT_CANARY_RPC = "wss://canarynet-ws-1.acurast-h-server-2.papers.tech";
 const DIRECT_SCHEDULE_END_ENV = "ACURAST_SCHEDULE_END_MS";
+const USE_EXISTING_STAGE_ENV = "ACURAST_USE_EXISTING_STAGE";
+const REQUIRE_ENCRYPTED_BUNDLE_ENV = "ACURAST_REQUIRE_ENCRYPTED_BUNDLE";
+const ENCRYPTED_BUNDLE_LOADER_MARKER = "Switchboard encrypted Acurast relay bootstrap";
 
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
@@ -165,7 +168,13 @@ async function main() {
     });
     return;
   }
-  const prepared = await prepareAcurastProject(config);
+  const canUseExistingStage = parsed.command === "deploy-direct" || parsed.command === "upload-script";
+  const prepared =
+    canUseExistingStage && shouldUseExistingStage(parsed.flags)
+      ? await loadExistingAcurastProject(config, {
+          requireEncryptedBundle: shouldRequireEncryptedBundle(parsed.flags)
+        })
+      : await prepareAcurastProject(config);
 
   if (parsed.command === "prepare") {
     writeOutput(parsed.flags, {
@@ -395,6 +404,76 @@ async function prepareAcurastProject(config: HarnessConfig) {
   };
 }
 
+async function loadExistingAcurastProject(
+  config: HarnessConfig,
+  options: { requireEncryptedBundle: boolean }
+) {
+  const bundlePath = path.join(config.stageDir, "dist/bundle.cjs");
+  const acurastConfigPath = path.join(config.stageDir, "acurast.json");
+  const envPath = path.join(config.stageDir, ".env");
+
+  await assertReadableFile(bundlePath, "staged Acurast bundle");
+  await assertReadableFile(acurastConfigPath, "staged Acurast config");
+  if (options.requireEncryptedBundle) {
+    await assertStagedBundleIsEncryptedLoader(bundlePath);
+  }
+
+  return {
+    stageDir: config.stageDir,
+    bundlePath,
+    acurastConfigPath,
+    envPath: (await fileExists(envPath)) ? envPath : undefined,
+    projectName: config.projectName,
+    network: config.network,
+    profile: config.profile.name
+  };
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await stat(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function assertReadableFile(filePath: string, label: string): Promise<void> {
+  try {
+    await stat(filePath);
+  } catch {
+    throw new Error(`${label} is missing at ${filePath}`);
+  }
+}
+
+async function assertStagedBundleIsEncryptedLoader(bundlePath: string): Promise<void> {
+  const content = await readFile(bundlePath, "utf8");
+  const requiredMarkers = [
+    ENCRYPTED_BUNDLE_LOADER_MARKER,
+    "SWITCHBOARD_CODE_CIPHERTEXT_B64",
+    "SWITCHBOARD_CODE_PLAINTEXT_SHA256"
+  ];
+  const missing = requiredMarkers.filter((marker) => !content.includes(marker));
+  if (missing.length > 0) {
+    throw new Error(
+      `Refusing to upload unencrypted Acurast relay bundle: ${path.basename(bundlePath)} is missing encrypted loader marker(s): ${missing.join(", ")}`
+    );
+  }
+
+  const plaintextMarkers = [
+    "__SWITCHBOARD_BUILD_CONFIG__",
+    "registerIngressWithRelay",
+    "maybeRegisterIngress",
+    "PLAINTEXT_RELAY_BUNDLE_MARKER"
+  ];
+  const leakedMarkers = plaintextMarkers.filter((marker) => content.includes(marker));
+  if (leakedMarkers.length > 0) {
+    throw new Error(
+      `Refusing to upload unencrypted Acurast relay bundle: ${path.basename(bundlePath)} still contains plaintext marker(s): ${leakedMarkers.join(", ")}`
+    );
+  }
+}
+
 async function fileSha256(filePath: string): Promise<string> {
   const { createHash } = await import("node:crypto");
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
@@ -413,6 +492,7 @@ async function assertNoSecretValuesInUploadArtifacts(paths: string[]): Promise<v
     "PROOF_VALIDATION_READ_TOKEN",
     "PROOF_NETWORK_MANIFEST_SIGNING_KEY",
     "SWITCHBOARD_CONTROL_TOKEN",
+    "SWITCHBOARD_CODE_KEY",
     "ACURAST_SEED",
     "ACURAST_MAINNET_SEED",
     "ACURAST_CANARY_SEED",
@@ -458,6 +538,7 @@ function isSecretLikeEnvName(name: string): boolean {
     /^ACME_EAB_/,
     /^CLOUDFLARE_/,
     /^PROOF_.*_(SECRET|TOKEN|KEY|SEED)$/,
+    /^SWITCHBOARD_.*_(SECRET|TOKEN|KEY|SEED)$/,
     /^ACURAST_.*_(SEED|TOKEN|KEY)$/
   ].some((pattern) => pattern.test(name));
 }
@@ -620,6 +701,10 @@ async function resolveDirectScriptIpfs(config: HarnessConfig, flags: Map<string,
       throw new Error("ACURAST_SCRIPT_IPFS/--script-ipfs must start with ipfs://");
     }
     return explicit;
+  }
+
+  if (shouldRequireEncryptedBundle(flags)) {
+    await assertStagedBundleIsEncryptedLoader(path.join(config.stageDir, "dist/bundle.cjs"));
   }
 
   const output = await runAcurastCli(config, [
@@ -1822,6 +1907,14 @@ function stringFlag(flags: Map<string, string | boolean>, name: string): string 
 
 function boolFlag(flags: Map<string, string | boolean>, name: string): boolean {
   return flags.get(name) === true;
+}
+
+function shouldUseExistingStage(flags: Map<string, string | boolean>): boolean {
+  return boolFlag(flags, "use-existing-stage") || process.env[USE_EXISTING_STAGE_ENV] === "true";
+}
+
+function shouldRequireEncryptedBundle(flags: Map<string, string | boolean>): boolean {
+  return boolFlag(flags, "require-encrypted-bundle") || process.env[REQUIRE_ENCRYPTED_BUNDLE_ENV] === "true";
 }
 
 function jsonOutput(flags: Map<string, string | boolean>): boolean {

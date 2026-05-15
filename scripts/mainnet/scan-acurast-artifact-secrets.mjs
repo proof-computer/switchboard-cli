@@ -21,6 +21,7 @@ const secretNamePatterns = [
   /^ACME_EAB_/,
   /^CLOUDFLARE_/,
   /^PROOF_.*_(SECRET|TOKEN|KEY|SEED)$/,
+  /^SWITCHBOARD_.*_(SECRET|TOKEN|KEY|SEED)$/,
   /^ACURAST_.*_(SEED|TOKEN|KEY)$/
 ];
 

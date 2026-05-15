@@ -67,7 +67,7 @@ import {
 } from "./secret-intent.js";
 
 const SS58_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{45,50}$/;
-const DEPLOY_AUTO_PICK_START_DELAY_MS = 360_000;
+const DEPLOY_AUTO_PICK_START_DELAY_MS = 120_000;
 const DEPLOY_AUTO_PICK_MAX_AGE_SECONDS = 900;
 
 const RELAY_CATALOG_STATES = [
@@ -167,9 +167,13 @@ export async function runRelayDeploy(args: {
     io.log(`--bootstrap-url override: spec.relay.bootstrapRelayUrl = ${spec.relay.bootstrapRelayUrl}`);
   }
 
+  // Keep --dry-run output aligned with the live run when operators pass a
+  // one-off deployer override.
+  maybeApplyDeployerSeedOverride(spec, args.flags, io);
+
   const dryRun = boolFlag(args.flags, "dry-run");
   if (dryRun) {
-    printDeployDryRun(spec, effectiveState, io);
+    printDeployDryRun(spec, effectiveState, io, args.flags);
     return;
   }
 
@@ -212,11 +216,6 @@ export async function runRelayDeploy(args: {
 
       const acurastEnv = await synthesizeAcurastDeployEnvFromFlags(args.flags, io, args.fetchImpl);
       await resolveAcurastDeployProcessor({ spec, flags: args.flags, io, discover: args.discoverProcessor });
-      // --deployer-seed-env <NAME> overrides the spec's `acurast.deployerSeedEnv`
-      // for this run only. Used for tight-loop testing where you want the
-      // Acurast deploy signed with a non-production funded key (e.g. .envrc
-      // canary mnemonic) without editing relays/<id>.json.
-      maybeApplyDeployerSeedOverride(spec, args.flags, io);
       const registration = collectRegistrationOverrides(args.flags);
       const ephemeralRng = args.randomBytes ?? randomBytes;
       const fundResult = await maybeFundHubSession({
@@ -257,8 +256,8 @@ export async function runRelayDeploy(args: {
         sources,
         spawnPnpm: args.spawnPnpm,
         spawnNode: args.spawnNode,
-        skipReadinessPoll: args.skipReadinessPoll,
-        skipPeerCheck: args.skipPeerCheck,
+        skipReadinessPoll: args.skipReadinessPoll ?? boolFlag(args.flags, "skip-readiness-poll"),
+        skipPeerCheck: args.skipPeerCheck ?? boolFlag(args.flags, "skip-peer-check"),
         fetchImpl: args.fetchImpl
       });
       acurastState = await readLatestAcurastDeployState(spec.acurast!.stageDir).catch(() => undefined);
@@ -651,7 +650,8 @@ function relayIdFromArgs(args: { positionals: string[]; flags: Map<string, strin
 function printDeployDryRun(
   spec: RelayDeploymentSpec,
   effectiveState: RelayDeploymentSpec["catalogState"],
-  io: RelayCommandIo
+  io: RelayCommandIo,
+  flags: Map<string, string | boolean> = new Map()
 ): void {
   const announce = (line: string) => io.log(line);
 
@@ -676,6 +676,9 @@ function printDeployDryRun(
   }
   if (spec.secrets.controlPlaneTokenEnv) {
     announce(`  PROOF_CONTROL_PLANE_TOKEN  <- ${spec.secrets.controlPlaneTokenEnv} ${envPresence(spec.secrets.controlPlaneTokenEnv)}`);
+  }
+  if (spec.secrets.relayInfraAdmissionTokenEnv) {
+    announce(`  SB_RELAY_INFRA_ADMISSION_TOKEN <- ${spec.secrets.relayInfraAdmissionTokenEnv} ${envPresence(spec.secrets.relayInfraAdmissionTokenEnv)}`);
   }
   if (spec.secrets.logCreateTokenEnv) {
     announce(`  PROOF_LOG_CREATE_TOKEN     <- ${spec.secrets.logCreateTokenEnv} ${envPresence(spec.secrets.logCreateTokenEnv)}`);
@@ -704,6 +707,8 @@ function printDeployDryRun(
     announce(`  execution ms         : ${spec.acurast.executionMs}`);
     announce(`  max cost / execution : ${spec.acurast.maxCostPerExecution}`);
     announce(`  replicas             : ${spec.acurast.replicas}`);
+    announce(`  encrypted code       : ${spec.acurast.encryptedCode === false ? "disabled" : "enabled (AES-256-GCM bootstrap)"}`);
+    announce(`  admission mode       : ${spec.relay.admissionMode}`);
     if (spec.acurast.scriptIpfs) {
       announce(`  script ipfs (pinned) : ${spec.acurast.scriptIpfs}`);
     }
@@ -732,9 +737,24 @@ function printDeployDryRun(
     if (spec.acurast.managerId) {
       announce(`  - auto-pick a schedule-clear processor under manager ${spec.acurast.managerId}`);
     }
-    if (spec.relay.autoRegister) {
+    if (spec.relay.admissionMode === "proof-infra") {
       announce(
-        `  - generate ephemeral job-signer keypair and fund a Hub ingress session via Ledger (skipped if --session-id passed)`
+        `  - submit signed PROOF-only relay infra admission to ${spec.relay.bootstrapRelayUrl ?? "<bootstrapRelayUrl>"} (no Hub funding or deployment intent)`
+      );
+    }
+    if (spec.relay.autoRegister && spec.relay.admissionMode === "paid-ingress") {
+      const fundingMode = boolFlag(flags, "no-fund") ? "skip" : resolveFundingMode(flags);
+      const fundingSeedEnv =
+        stringFlag(flags, "funding-seed-env") ??
+        (fundingMode === "substrate" ? spec.acurast.deployerSeedEnv : undefined);
+      const fundingDetail =
+        fundingMode === "ledger"
+          ? "via Ledger"
+          : fundingMode === "substrate"
+            ? `via substrate sr25519${fundingSeedEnv ? ` (${fundingSeedEnv})` : ""}`
+            : "out-of-band";
+      announce(
+        `  - generate ephemeral job-signer keypair and fund a Hub ingress session ${fundingDetail} (skipped if --session-id passed)`
       );
     }
     if (spec.relay.enableLogs) {
@@ -743,6 +763,9 @@ function printDeployDryRun(
       );
     }
     announce(`  - prepare the Acurast project bundle`);
+    if (spec.acurast.encryptedCode !== false) {
+      announce(`  - replace dist/bundle.cjs with encrypted-code bootstrap after plaintext scan`);
+    }
     announce(`  - deploy the Acurast project directly with --yes`);
     announce(`  - poll ${spec.apiBaseUrl}/health, /v1/relay-status, /v1/service-catalogs/relay`);
     announce(
@@ -888,6 +911,11 @@ async function maybeFundHubSession(
 ): Promise<MaybeFundHubSessionResult | undefined> {
   const { spec, flags, io, baseEnv, registration, rng, fundLedger, fundSubstrate } = input;
   if (spec.target !== "acurast" || !spec.relay.autoRegister) return undefined;
+  if (spec.relay.admissionMode === "proof-infra") {
+    io.log("");
+    io.log("Skipping inline Hub funding: relay.admissionMode=proof-infra uses protected relay infra admission.");
+    return undefined;
+  }
   if (registration.sessionId) {
     io.log("");
     io.log(`Skipping inline Hub funding: --session-id ${registration.sessionId} already provided.`);
@@ -926,8 +954,16 @@ async function maybeFundHubSession(
   const asset =
     stringFlag(flags, "asset") ?? baseEnv.PAYMENT_ASSET_ADDRESS ?? baseEnv.PROOF_QUOTE_DEFAULT_ASSET ?? HUB_USDC.contractAddress;
   const paidSeconds = stringFlag(flags, "paid-seconds") ?? baseEnv.PAID_SECONDS ?? "600";
+  const quoteTimeoutMs = numberFlag(flags, "quote-timeout-ms", 15_000);
   const sessionLabel = stringFlag(flags, "session-label") ?? baseEnv.SESSION_LABEL ?? `switchboard-${spec.relayId}`;
   const sessionSalt = stringFlag(flags, "session-salt") ?? baseEnv.SESSION_SALT;
+  const endpointHostname = endpointHostnameFromSpec(spec);
+  const quoteSignerPrivateKey = baseEnv.QUOTE_SIGNER_PRIVATE_KEY ?? baseEnv.PROOF_MAINNET_QUOTE_SIGNER_PRIVATE_KEY;
+  if (!quoteSignerPrivateKey) {
+    throw new Error(
+      "relay deploy: canonical relay endpoint funding requires QUOTE_SIGNER_PRIVATE_KEY or PROOF_MAINNET_QUOTE_SIGNER_PRIVATE_KEY so the SDK can locally rebind and sign the quote endpoint"
+    );
+  }
 
   // Ephemeral job signer for this deploy. v1: deployer holds the key, ships
   // it into the relay job's encrypted runtime env. v2: derive via Acurast TEE
@@ -969,7 +1005,10 @@ async function maybeFundHubSession(
       operatorId: registration.operatorId ?? baseEnv.PROOF_OPERATOR_ID ?? baseEnv.OPERATOR_ID,
       processorId: derivedProcessorIdFromSpec(spec),
       sessionLabel,
+      endpointHostname,
+      quoteSignerPrivateKey,
       sessionSalt,
+      quoteTimeoutMs,
       io
     };
 
@@ -1031,7 +1070,10 @@ async function maybeFundHubSession(
     operatorId: registration.operatorId ?? baseEnv.PROOF_OPERATOR_ID ?? baseEnv.OPERATOR_ID,
     processorId: derivedProcessorIdFromSpec(spec),
     sessionLabel,
+    endpointHostname,
+    quoteSignerPrivateKey,
     sessionSalt,
+    quoteTimeoutMs,
     io
   };
   const substrate = await fundSubstrate(substrateInput);
@@ -1117,4 +1159,8 @@ function derivedProcessorIdFromSpec(spec: RelayDeploymentSpec): string | undefin
   const ss58 = spec.acurast.instantMatchProcessors[0];
   if (!ss58) return undefined;
   return `0x${Buffer.from(decodeAddress(ss58)).toString("hex")}`.toLowerCase();
+}
+
+function endpointHostnameFromSpec(spec: RelayDeploymentSpec): string {
+  return new URL(spec.apiBaseUrl).hostname;
 }

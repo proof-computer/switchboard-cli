@@ -81,13 +81,16 @@ describe("switchboard relay deploy (dry-run)", () => {
     assert.match(output, /target\s*:\s*acurast/);
     assert.match(output, /catalog state\s*:\s*candidate$/m);
     assert.match(output, /project name\s*:\s*switchboard-mainnet-relay-d/);
+    assert.match(output, /encrypted code\s*:\s*enabled \(AES-256-GCM bootstrap\)/);
     assert.match(output, /secret intent plan:/);
     assert.match(output, /authority profile\s*:\s*durable-relay/);
     assert.match(output, /public build config \(IPFS-public\):/);
     assert.match(output, /encrypted runtime env:/);
+    assert.match(output, /SWITCHBOARD_CODE_KEY/);
     assert.match(output, /local only:/);
     assert.match(output, /PROOF_ACURAST_MAINNET_DEPLOYER_SEED/);
     assert.match(output, /prepare the Acurast project bundle/);
+    assert.match(output, /replace dist\/bundle\.cjs with encrypted-code bootstrap/);
     assert.match(output, /poll https:\/\/relay-d\.switchboard\.proof\.computer\/health/);
   });
 

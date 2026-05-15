@@ -7,6 +7,7 @@ import {
   type RelayDeploymentSpec
 } from "../../../src/relay-deployment-spec.js";
 import type { AcurastDeployContext } from "./acurast-target.js";
+import { SWITCHBOARD_CODE_KEY_ENV } from "./encrypted-code.js";
 
 export type SecretIntentCategory =
   | "publicBuildConfig"
@@ -39,7 +40,7 @@ export function buildSpecSecretIntentPlan(
   env: NodeJS.ProcessEnv = process.env
 ): SecretIntentPlan {
   const items: SecretIntentItem[] = [];
-  for (const name of expectedBuildConfigNames(spec)) {
+  for (const name of expectedBuildConfigNames(spec, env)) {
     items.push(classifiedItem(name, "publicBuildConfig", "__SWITCHBOARD_BUILD_CONFIG__", true, undefined));
   }
 
@@ -68,6 +69,16 @@ export function buildSpecSecretIntentPlan(
       source: "generated per deploy",
       shipped: true,
       note: "generated after funding unless --session-id supplies an existing session"
+    });
+  }
+
+  if (spec.acurast?.encryptedCode !== false) {
+    items.push({
+      name: SWITCHBOARD_CODE_KEY_ENV,
+      category: "encryptedRuntimeEnv",
+      source: "generated per deploy",
+      shipped: true,
+      note: "decrypts the IPFS-public relay bootstrap bundle at runtime"
     });
   }
 
@@ -237,7 +248,7 @@ function categoryForShippedName(name: string, fallback: SecretIntentCategory): S
   return fallback;
 }
 
-function expectedBuildConfigNames(spec: RelayDeploymentSpec): string[] {
+function expectedBuildConfigNames(spec: RelayDeploymentSpec, env: NodeJS.ProcessEnv): string[] {
   const names = [
     "SWITCHBOARD_HOST",
     "PORT",
@@ -278,6 +289,12 @@ function expectedBuildConfigNames(spec: RelayDeploymentSpec): string[] {
   }
   if (spec.relay.enableLogs) {
     names.push("SWITCHBOARD_LOG_URL", "SWITCHBOARD_LOG_CONTEXT");
+  }
+  if (env.SWITCHBOARD_RELAY_STARTUP_DIAGNOSTICS === "true") {
+    names.push("SWITCHBOARD_RELAY_STARTUP_DIAGNOSTICS");
+  }
+  if (env.SWITCHBOARD_LOG_LEVEL || env.LOG_LEVEL) {
+    names.push("SWITCHBOARD_LOG_LEVEL");
   }
   return names;
 }

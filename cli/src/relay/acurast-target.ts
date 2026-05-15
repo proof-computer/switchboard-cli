@@ -11,6 +11,7 @@ import {
   isForbiddenAcurastEnvName,
   type RelayDeploymentSpec
 } from "../../../src/relay-deployment-spec.js";
+import { auditAcurastEnv } from "../../../src/acurast-env-budget.js";
 import { parseSignedServiceCatalog } from "../../../src/service-catalog.js";
 import {
   describeAcurastProcessorStatus,
@@ -29,8 +30,17 @@ import {
   formatSecretIntentPlan
 } from "./secret-intent.js";
 import { spawnAcurastScript } from "./acurast-script-runner.js";
+import {
+  ENCRYPTED_BUNDLE_LOADER_MARKER,
+  encryptAcurastBundleFile,
+  generateSwitchboardCodeKey,
+  SWITCHBOARD_CODE_KEY_ENV,
+  type EncryptAcurastBundleResult
+} from "./encrypted-code.js";
 
 const HEX32_REGEX = /^0x[0-9a-fA-F]{64}$/;
+const DEFAULT_ACURAST_MAX_NETWORK_REQUESTS = "1000";
+const LOG_LEVELS = new Set(["trace", "debug", "info", "warn", "error", "fatal", "silent"]);
 
 export interface AcurastRegistrationOverrides {
   /** 0x-prefixed 32-byte hex of the funded Hub session. Random per-deploy if absent. */
@@ -97,6 +107,8 @@ export interface AcurastDeploySources {
   logSink?: AcurastLogSinkOverride;
   /** Replace the random-bytes generator. Used by tests. */
   randomBytes?: (size: number) => Buffer;
+  /** Override the generated encrypted-code key. Used by tests. */
+  codeKeyHex?: string;
   /** Replace the wall clock. Used by tests. */
   now?: () => number;
 }
@@ -108,18 +120,30 @@ function defaultRandomHex32(rng: (size: number) => Buffer = randomBytes): string
   return `0x${rng(32).toString("hex")}`;
 }
 
-/**
- * Decimal uint256 string. The relay's `registerIngress` endpoint validates
- * `nonce` and `deadline` against `/^[0-9]+$/` (hex won't match). 8 random
- * bytes is plenty of entropy for a per-deploy nonce; convert to BigInt then
- * to base-10.
- */
-function defaultRandomUintString(rng: (size: number) => Buffer = randomBytes): string {
-  return BigInt(`0x${rng(8).toString("hex")}`).toString(10);
+function relayBuildConfigLogLevel(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.SWITCHBOARD_LOG_LEVEL ?? env.LOG_LEVEL;
+  const normalized = raw?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (!LOG_LEVELS.has(normalized)) {
+    throw new Error(
+      `SWITCHBOARD_LOG_LEVEL/LOG_LEVEL must be one of ${Array.from(LOG_LEVELS).join(", ")} when copied into Acurast build config`
+    );
+  }
+  return normalized;
 }
 
 function ss58ToBytes32Hex(address: string): string {
   return `0x${Buffer.from(decodeAddress(address)).toString("hex")}`.toLowerCase();
+}
+
+function requiredProcessorIdFromSpec(spec: RelayDeploymentSpec, reason: string): string {
+  const processor = spec.acurast?.instantMatchProcessors[0];
+  if (!processor) {
+    throw new Error(
+      `${reason} requires acurast.instantMatchProcessors[0] (the assigned processor) so PROCESSOR_ID can be derived`
+    );
+  }
+  return ss58ToBytes32Hex(processor);
 }
 
 export function prepareAcurastDeployContext(
@@ -156,6 +180,8 @@ export function prepareAcurastDeployContext(
   recordSecret(spec.secrets.validationReadTokenEnv);
   const controlPlaneToken = resolveOptionalEnv(spec.secrets.controlPlaneTokenEnv);
   recordSecret(spec.secrets.controlPlaneTokenEnv);
+  const relayInfraAdmissionToken = resolveOptionalEnv(spec.secrets.relayInfraAdmissionTokenEnv);
+  recordSecret(spec.secrets.relayInfraAdmissionTokenEnv);
   const logCreateToken = resolveOptionalEnv(spec.secrets.logCreateTokenEnv);
   recordSecret(spec.secrets.logCreateTokenEnv);
   const logEncryptionKey = resolveOptionalEnv(spec.secrets.logEncryptionKeyEnv);
@@ -178,13 +204,26 @@ export function prepareAcurastDeployContext(
   }
 
   const peerBackfillEnabled = spec.relay.enablePeerBackfill && peers.length > 0;
+  const proofInfraAdmission = spec.relay.admissionMode === "proof-infra";
+  const paidIngressAutoRegister = spec.relay.autoRegister && spec.relay.admissionMode === "paid-ingress";
+  if (proofInfraAdmission) {
+    if (!spec.relay.bootstrapRelayUrl) {
+      throw new Error("relay.admissionMode=proof-infra requires relay.bootstrapRelayUrl in the spec");
+    }
+    if (!relayInfraAdmissionToken && !controlPlaneToken) {
+      throw new Error(
+        "relay.admissionMode=proof-infra requires spec.secrets.relayInfraAdmissionTokenEnv or spec.secrets.controlPlaneTokenEnv to be set in env"
+      );
+    }
+  }
 
   // Public, IPFS-bound build config. NEVER includes secret tokens or any
   // value resolved from spec.secrets or peer readTokenEnv.
   const buildConfig: Record<string, string> = {
     SWITCHBOARD_HOST: "0.0.0.0",
     PORT: "3000",
-    SWITCHBOARD_AUTO_REGISTER: spec.relay.autoRegister ? "true" : "false",
+    SWITCHBOARD_AUTO_REGISTER: paidIngressAutoRegister ? "true" : "false",
+    SWITCHBOARD_RELAY_ADMISSION_MODE: spec.relay.admissionMode,
     HUB_ETH_RPC_URL: resolveEnv("HUB_ETH_RPC_URL", "HUB_ETH_RPC_URL"),
     INGRESS_REGISTRY_ADDRESS: resolveEnv("INGRESS_REGISTRY_ADDRESS", "INGRESS_REGISTRY_ADDRESS"),
     CHAIN_ID: resolveEnv("CHAIN_ID", "CHAIN_ID"),
@@ -193,7 +232,7 @@ export function prepareAcurastDeployContext(
     PROOF_AUTHORITY_LEASE_OWNER_ID: spec.relay.authorityLeaseOwnerId ?? spec.relayId,
     PROOF_QUOTES_ENABLED: spec.relay.quotesEnabled ? "true" : "false",
     PROOF_VALIDATION_REPORTS_ENABLED: spec.relay.enableValidationReports ? "true" : "false",
-    PROOF_VALIDATION_REPORT_STORE_KIND: "sqlite",
+    PROOF_VALIDATION_REPORT_STORE_KIND: spec.relay.validationReportStoreKind,
     PROOF_RELAY_SQLITE_FILE: spec.relay.sqliteFile,
     PROOF_SQLITE_DRIVER: spec.relay.sqliteDriver,
     PROOF_RELAY_PEER_BACKFILL_ENABLED: peerBackfillEnabled ? "true" : "false",
@@ -216,6 +255,31 @@ export function prepareAcurastDeployContext(
   if (serviceCatalogsJson) {
     buildConfig.PROOF_SERVICE_CATALOGS_JSON = serviceCatalogsJson;
   }
+  if (env.SWITCHBOARD_RELAY_STARTUP_DIAGNOSTICS === "true") {
+    buildConfig.SWITCHBOARD_RELAY_STARTUP_DIAGNOSTICS = "true";
+  }
+  const logLevel = relayBuildConfigLogLevel(env);
+  if (logLevel) {
+    buildConfig.SWITCHBOARD_LOG_LEVEL = logLevel;
+  }
+  if (proofInfraAdmission) {
+    const endpointHostname = new URL(spec.apiBaseUrl).hostname;
+    const admissionUrl =
+      env.SWITCHBOARD_RELAY_INFRA_ADMISSION_URL ??
+      env.PROOF_RELAY_INFRA_ADMISSION_URL ??
+      new URL("/v1/relay-infra/admissions", spec.relay.bootstrapRelayUrl).toString();
+    buildConfig.SWITCHBOARD_RELAY_INFRA_ADMISSION_URL = admissionUrl;
+    buildConfig.SWITCHBOARD_RELAY_HOSTNAME = endpointHostname;
+    buildConfig.ENDPOINT_HOSTNAME = endpointHostname;
+    buildConfig.SWITCHBOARD_RELAY_UPSTREAM_PORT = buildConfig.PORT;
+    buildConfig.PROCESSOR_ID = requiredProcessorIdFromSpec(spec, "relay.admissionMode=proof-infra");
+    if (spec.acurast.scriptIpfs) {
+      buildConfig.SWITCHBOARD_RELAY_SCRIPT_CID = spec.acurast.scriptIpfs;
+    }
+    if (env.SWITCHBOARD_RELAY_SCRIPT_DIGEST) {
+      buildConfig.SWITCHBOARD_RELAY_SCRIPT_DIGEST = env.SWITCHBOARD_RELAY_SCRIPT_DIGEST;
+    }
+  }
 
   // Self-registration env. When the relay is configured to register
   // itself as a Switchboard customer (`relay.autoRegister=true`), emit the
@@ -223,7 +287,7 @@ export function prepareAcurastDeployContext(
   // calls need. Without these, `maybeRegisterIngress` short-circuits with
   // `reason: "missing-env"`. See
   // docs/knowledge/raw-inputs/2026-05-03-acurast-relay-cutover-via-self-ingress.md.
-  if (spec.relay.autoRegister) {
+  if (paidIngressAutoRegister) {
     if (!spec.relay.bootstrapRelayUrl) {
       // The schema enforces this for target=acurast, but guard defensively
       // in case a non-standard spec slipped through.
@@ -255,7 +319,7 @@ export function prepareAcurastDeployContext(
     if (!HEX32_REGEX.test(jobId)) {
       throw new Error(`--job-id must be 0x-prefixed 32-byte hex (got ${jobId})`);
     }
-    const nonce = reg.nonce ?? defaultRandomUintString(rng);
+    const nonce = reg.nonce ?? "1";
 
     // Default deadline: execution end + a 10-minute buffer. Conservative —
     // the registration must remain valid for the relay job's full window
@@ -268,7 +332,7 @@ export function prepareAcurastDeployContext(
         "relay.autoRegister=true requires acurast.instantMatchProcessors[0] (the assigned processor) so PROCESSOR_ID can be derived"
       );
     }
-    const processorId = ss58ToBytes32Hex(spec.acurast!.instantMatchProcessors[0]);
+    const processorId = requiredProcessorIdFromSpec(spec, "relay.autoRegister=true");
 
     buildConfig.RELAY_URL = spec.relay.bootstrapRelayUrl;
     buildConfig.ENDPOINT_HOSTNAME = endpointHostname;
@@ -298,9 +362,12 @@ export function prepareAcurastDeployContext(
   };
   if (validationReadToken) runtimeEnv.PROOF_VALIDATION_READ_TOKEN = validationReadToken;
   if (controlPlaneToken) runtimeEnv.PROOF_CONTROL_PLANE_TOKEN = controlPlaneToken;
-  if (logCreateToken) runtimeEnv.PROOF_LOG_CREATE_TOKEN = logCreateToken;
+  if (proofInfraAdmission) {
+    runtimeEnv.SB_RELAY_INFRA_ADMISSION_TOKEN = relayInfraAdmissionToken ?? controlPlaneToken!;
+  }
+  if (logCreateToken && env.PROOF_LOGS_ENABLED === "true") runtimeEnv.PROOF_LOG_CREATE_TOKEN = logCreateToken;
   if (logEncryptionKey) runtimeEnv.SWITCHBOARD_LOG_ENCRYPTION_KEY = logEncryptionKey;
-  if (spec.relay.autoRegister && sources.jobSignerPrivateKey) {
+  if (paidIngressAutoRegister && sources.jobSignerPrivateKey) {
     runtimeEnv.JOB_SIGNER_PRIVATE_KEY = sources.jobSignerPrivateKey;
   }
   if (sources.logSink) {
@@ -312,6 +379,10 @@ export function prepareAcurastDeployContext(
     // env — they authenticate writes and encrypt log payloads.
     runtimeEnv.SWITCHBOARD_LOG_TOKEN = sources.logSink.writeToken;
     runtimeEnv.SWITCHBOARD_LOG_ENCRYPTION_KEY = sources.logSink.encryptionKey;
+  }
+  if (spec.acurast.encryptedCode !== false) {
+    runtimeEnv[SWITCHBOARD_CODE_KEY_ENV] =
+      sources.codeKeyHex ?? generateSwitchboardCodeKey(sources.randomBytes ?? randomBytes);
   }
   if (peerBackfillEnabled) {
     runtimeEnv.PROOF_RELAY_PEERS_JSON = JSON.stringify(
@@ -341,10 +412,14 @@ export function prepareAcurastDeployContext(
     ACURAST_DEPLOYMENT_PROFILE: spec.acurast.deploymentProfile,
     ACURAST_EXECUTION_MS: String(spec.acurast.executionMs),
     ACURAST_MAX_COST_PER_EXECUTION: spec.acurast.maxCostPerExecution,
+    ACURAST_MAX_NETWORK_REQUESTS: env.ACURAST_MAX_NETWORK_REQUESTS ?? DEFAULT_ACURAST_MAX_NETWORK_REQUESTS,
     ACURAST_REPLICAS: String(spec.acurast.replicas),
     ACURAST_COMPACT_ENV: spec.acurast.compactEnv ? "true" : "false",
     ACURAST_INCLUDE_ENV: includeEnvUnique.join(",")
   };
+  if (env.ACURAST_ENABLE_DEVTOOLS) {
+    acurastEnv.ACURAST_ENABLE_DEVTOOLS = env.ACURAST_ENABLE_DEVTOOLS;
+  }
   if (spec.acurast.instantMatchProcessors.length > 0) {
     acurastEnv.ACURAST_INSTANT_MATCH_PROCESSORS = spec.acurast.instantMatchProcessors.join(",");
   }
@@ -379,6 +454,11 @@ export interface RunAcurastDeployOptions {
   spawnPnpm?: (args: string[], env: NodeJS.ProcessEnv, cwd: string) => Promise<number>;
   /** Replace the node-script spawner used for the secret scanner. Used by tests. */
   spawnNode?: (args: string[], env: NodeJS.ProcessEnv, cwd: string) => Promise<number>;
+  /** Replace encrypted-bundle generation. Used by tests. */
+  encryptBundleFile?: (
+    bundlePath: string,
+    input: { keyHex: string }
+  ) => Promise<EncryptAcurastBundleResult>;
   /** Override env / sources, used by tests. */
   sources?: AcurastDeploySources;
   /** Override the fetch implementation used for readiness/peer probes. Used by tests. */
@@ -425,6 +505,13 @@ export async function runAcurastDeploy(
     ...context.runtimeEnv,
     SWITCHBOARD_BUILD_CONFIG: JSON.stringify(context.buildConfig)
   };
+  const explicitRuntimeEnv = new Set([...Object.keys(context.runtimeEnv), ...spec.acurast!.includeEnv]);
+  for (const key of Object.keys(context.buildConfig)) {
+    if (!explicitRuntimeEnv.has(key)) {
+      delete childEnv[key];
+    }
+  }
+  auditSubmittedRuntimeEnv(context, childEnv, spec.relayId);
 
   io.log(`relay deploy ${spec.relayId} -> acurast ${spec.acurast?.network}`);
   io.log(`  project name : ${spec.acurast?.projectName}`);
@@ -456,10 +543,35 @@ export async function runAcurastDeploy(
     );
   }
 
-  io.log(`> acurast deploy-express:direct --yes`);
+  if (spec.acurast!.encryptedCode !== false) {
+    const codeKey = context.runtimeEnv[SWITCHBOARD_CODE_KEY_ENV];
+    if (!codeKey) {
+      throw new Error(`${SWITCHBOARD_CODE_KEY_ENV} is required for encrypted-code Acurast relay deploys`);
+    }
+    const bundlePath = stagedBundlePath(cwd, stageDir);
+    io.log(`> encrypt staged relay bundle ${path.relative(cwd, bundlePath)}`);
+    const encrypted = await (options.encryptBundleFile ?? encryptAcurastBundleFile)(bundlePath, {
+      keyHex: codeKey
+    });
+    io.log(
+      `  encrypted code : sha256=${encrypted.plaintextSha256} ciphertext=${encrypted.ciphertextBytes}B loader=${encrypted.loaderBytes}B`
+    );
+    assertStagedBundleIsEncryptedLoader(bundlePath);
+  }
+
+  const deployEnv: NodeJS.ProcessEnv = {
+    ...childEnv,
+    ACURAST_USE_EXISTING_STAGE: "true"
+  };
+  const deployArgs = ["acurast:deploy-express:direct", "--", "--yes", "--use-existing-stage"];
+  if (spec.acurast!.encryptedCode !== false) {
+    deployEnv.ACURAST_REQUIRE_ENCRYPTED_BUNDLE = "true";
+    deployArgs.push("--require-encrypted-bundle");
+  }
+  io.log(`> ${deployArgs.join(" ")}`);
   const deployCode = await spawner(
-    ["acurast:deploy-express:direct", "--", "--yes"],
-    childEnv,
+    deployArgs,
+    deployEnv,
     cwd
   );
   if (deployCode !== 0) {
@@ -563,6 +675,60 @@ export async function runAcurastDeploy(
   }
 
   return { context, readiness, peerReachability };
+}
+
+function stagedBundlePath(cwd: string, stageDir: string): string {
+  const resolvedStageDir = path.isAbsolute(stageDir) ? stageDir : path.resolve(cwd, stageDir);
+  return path.join(resolvedStageDir, "dist", "bundle.cjs");
+}
+
+function assertStagedBundleIsEncryptedLoader(bundlePath: string): void {
+  const content = readFileSync(bundlePath, "utf8");
+  const requiredMarkers = [
+    ENCRYPTED_BUNDLE_LOADER_MARKER,
+    "SWITCHBOARD_CODE_CIPHERTEXT_B64",
+    "SWITCHBOARD_CODE_PLAINTEXT_SHA256"
+  ];
+  const missing = requiredMarkers.filter((marker) => !content.includes(marker));
+  if (missing.length > 0) {
+    throw new Error(
+      `Refusing to upload unencrypted Acurast relay bundle: ${path.basename(bundlePath)} is missing encrypted loader marker(s): ${missing.join(", ")}`
+    );
+  }
+
+  const plaintextMarkers = [
+    "__SWITCHBOARD_BUILD_CONFIG__",
+    "registerIngressWithRelay",
+    "maybeRegisterIngress",
+    "PLAINTEXT_RELAY_BUNDLE_MARKER"
+  ];
+  const leakedMarkers = plaintextMarkers.filter((marker) => content.includes(marker));
+  if (leakedMarkers.length > 0) {
+    throw new Error(
+      `Refusing to upload unencrypted Acurast relay bundle: ${path.basename(bundlePath)} still contains plaintext marker(s): ${leakedMarkers.join(", ")}`
+    );
+  }
+}
+
+function auditSubmittedRuntimeEnv(
+  context: AcurastDeployContext,
+  childEnv: NodeJS.ProcessEnv,
+  relayId: string
+): void {
+  const submitted: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const name of context.includeEnv) {
+    const value = childEnv[name];
+    if (typeof value !== "string" || value.length === 0) {
+      missing.push(name);
+      continue;
+    }
+    submitted[name] = value;
+  }
+  if (missing.length > 0) {
+    throw new Error(`Acurast runtime env for ${relayId} is missing value(s): ${missing.join(", ")}`);
+  }
+  auditAcurastEnv(submitted, `relay deploy ${relayId}`);
 }
 
 function signedServiceCatalogsJson(env: NodeJS.ProcessEnv, cwd: string): string | undefined {
