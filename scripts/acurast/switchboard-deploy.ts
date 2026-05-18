@@ -22,7 +22,7 @@ interface ParsedArgs {
   flags: Map<string, string | boolean>;
 }
 
-interface HarnessConfig {
+export interface HarnessConfig {
   rootDir: string;
   runId: string;
   runDir: string;
@@ -119,7 +119,7 @@ interface AcurastJobConfigFile {
   SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS?: string;
 }
 
-interface DeploymentIntentBootstrap {
+export interface DeploymentIntentBootstrap {
   intentId: string;
   cliToken: string;
   groupId?: string;
@@ -129,6 +129,40 @@ interface DeploymentIntentBootstrap {
     SWITCHBOARD_INTENT_TOKEN: string;
   };
   intent?: Record<string, unknown>;
+}
+
+export interface PrecreatedDeployIntentPayload {
+  workflowId: string;
+  jobId: string;
+  capacity: {
+    operatorId: string;
+    processorId: string;
+    processor?: string;
+    gatewayId?: string;
+    managerId?: string;
+  };
+  deploymentIntent: DeploymentIntentBootstrap;
+  sensitiveFields?: string[];
+}
+
+export interface PrecreatedDeployGroupPayload {
+  workflowId: string;
+  deploymentMode: "group";
+  jobId: string;
+  capacity: {
+    operatorId: string;
+    processorId: string;
+    processor?: string;
+    gatewayId?: string;
+    managerId?: string;
+  };
+  group: {
+    expectedReplicas: number;
+    minReady: number;
+    members: DeploymentGroupMemberConfig[];
+  };
+  deploymentIntentGroup: DeploymentIntentGroupBootstrap;
+  sensitiveFields?: string[];
 }
 
 interface DeploymentIntentGroupBootstrap {
@@ -329,15 +363,29 @@ async function main(): Promise<void> {
   }
 
   let sessionId = ethers.hexlify(randomBytes(32));
-  const jobId = ethers.hexlify(randomBytes(32));
+  const precreatedIntent = parsePrecreatedDeployIntentPayload();
+  const precreatedGroup = parsePrecreatedDeployGroupPayload();
+  if (precreatedIntent && precreatedGroup) {
+    throw new Error("Only one of SWITCHBOARD_DEPLOY_PRECREATED_INTENT_JSON or SWITCHBOARD_DEPLOY_PRECREATED_GROUP_JSON may be set");
+  }
+  const jobId = precreatedIntent?.jobId ?? ethers.hexlify(randomBytes(32));
   const processor = await selectProcessor(config);
   if (config.group) {
-    await runDeploymentIntentGroup(config, processor, { json: boolFlag(parsed.flags, "json") });
+    if (precreatedGroup) {
+      validatePrecreatedDeployGroupPayload(precreatedGroup, config);
+    }
+    await runDeploymentIntentGroup(config, processor, { json: boolFlag(parsed.flags, "json"), precreatedGroup });
     return;
   }
+  if (precreatedGroup) {
+    throw new Error("SWITCHBOARD_DEPLOY_PRECREATED_GROUP_JSON requires group deploy mode");
+  }
   const processorId = accountIdBytes32(processor);
+  if (precreatedIntent) {
+    validatePrecreatedDeployIntentPayload(precreatedIntent, config, { processor, processorId });
+  }
   const tls = config.certificateMode === "self-signed" ? await createSelfSignedCertificate(config) : undefined;
-  const deploymentIntent = await createDeploymentIntent(config, {
+  const deploymentIntent = precreatedIntent?.deploymentIntent ?? await createDeploymentIntent(config, {
     jobId,
     processorId
   });
@@ -465,6 +513,64 @@ async function main(): Promise<void> {
     processor,
     processorId
   });
+
+  if (deployRunnerMode() === "acurast-submit-only") {
+    const report = {
+      ok: true,
+      runId: config.runId,
+      mode: "acurast-submit-only",
+      deployment,
+      session: {
+        jobId,
+        operatorId: config.operatorId,
+        gatewayId: config.gatewayId,
+        processor,
+        processorId,
+        hostname: config.hostname,
+        validationHostname: config.validationHostname
+      },
+      hostnames: {
+        public: config.hostname,
+        validation: config.validationHostname
+      },
+      relay: {
+        url: config.relayUrl
+      },
+      deploymentIntent: {
+        intentId: deploymentIntent.intentId,
+        relayUrl: config.relayUrl,
+        localSecret: {
+          description: "Deployer-local deployment intent token. Do not publish this report.",
+          cliToken: deploymentIntent.cliToken
+        },
+        sensitiveFields: ["deploymentIntent.localSecret.cliToken"]
+      },
+      lifecycle: {
+        durationMinutes: config.durationMinutes,
+        leaseSeconds: config.leaseSeconds,
+        paymentMode: config.paymentMode,
+        expectedQuoteAmount: config.expectedQuoteAmount,
+        executionMs: config.executionMs,
+        scheduleBufferMinutes: config.scheduleBufferMinutes,
+        schedule: deploymentSchedule
+      },
+      artifacts: {
+        runDir: config.runDir,
+        buildConfigPath,
+        metadataPath,
+        reportPath,
+        certPath: tls?.certPath,
+        keyPath: tls?.keyPath
+      }
+    };
+    await writeJson(reportPath, report);
+    console.log(deployStatus("ok", "Wrote deployment report", reportPath));
+    console.log(`[switchboard-deploy] report=${reportPath}`);
+    if (boolFlag(parsed.flags, "json")) {
+      console.log(JSON.stringify(report, null, 2));
+    }
+    return;
+  }
 
   let runtime: RuntimeObservation;
   try {
@@ -731,9 +837,9 @@ async function main(): Promise<void> {
 async function runDeploymentIntentGroup(
   config: HarnessConfig,
   processor: string,
-  options: { json: boolean }
+  options: { json: boolean; precreatedGroup?: PrecreatedDeployGroupPayload }
 ): Promise<void> {
-  const group = await createDeploymentIntentGroup(config);
+  const group = options.precreatedGroup?.deploymentIntentGroup ?? await createDeploymentIntentGroup(config);
   const buildConfigPath = path.join(config.runDir, "acurast-config.json");
   const extraBuildConfig = await readManagedExtraBuildConfig();
   const metadataPath = path.join(config.runDir, "metadata.json");
@@ -810,6 +916,60 @@ async function runDeploymentIntentGroup(
   await updateDeploymentIntentGroupDeployment(config, group, {
     deploymentId: deployment.deploymentId
   });
+
+  if (deployRunnerMode() === "acurast-group-submit-only") {
+    const report = {
+      ok: true,
+      runId: config.runId,
+      mode: "acurast-group-submit-only",
+      deployment,
+      deploymentIntentGroup: {
+        groupId: group.groupId,
+        relayUrl: config.relayUrl,
+        group: group.group,
+        members: group.members.map((member) => ({
+          memberId: member.memberId,
+          intentId: member.intentId,
+          jobId: member.jobId,
+          operatorId: member.operatorId,
+          processorId: member.processorId,
+          processor: member.processor,
+          gatewayId: member.gatewayId,
+          validationHostname: member.validationHostname
+        })),
+        expectedReplicas: config.group!.expectedReplicas,
+        minReady: config.group!.minReady,
+        localSecret: {
+          description: "Deployer-local deployment intent group token. Do not publish this report.",
+          cliToken: group.cliToken
+        },
+        sensitiveFields: ["deploymentIntentGroup.localSecret.cliToken"]
+      },
+      relay: { url: config.relayUrl },
+      lifecycle: {
+        durationMinutes: config.durationMinutes,
+        leaseSeconds: config.leaseSeconds,
+        paymentMode: config.paymentMode,
+        expectedQuoteAmount: config.expectedQuoteAmount,
+        executionMs: config.executionMs,
+        scheduleBufferMinutes: config.scheduleBufferMinutes,
+        schedule: deploymentSchedule
+      },
+      artifacts: {
+        runDir: config.runDir,
+        buildConfigPath,
+        metadataPath,
+        reportPath
+      }
+    };
+    await writeJson(reportPath, report);
+    console.log(deployStatus("ok", "Wrote deployment report", reportPath));
+    console.log(`[switchboard-deploy] report=${reportPath}`);
+    if (options.json) {
+      console.log(JSON.stringify(report, null, 2));
+    }
+    return;
+  }
 
   let claimed = await waitForDeploymentIntentGroupClaims(config, group, config.group!.minReady, deploymentSchedule);
   console.log(deployStatus("ok", "Runtime claims reached min-ready", `${claimed.length}/${config.group!.expectedReplicas}`));
@@ -1449,6 +1609,224 @@ async function createDeploymentIntent(
     },
     intent: json.intent && typeof json.intent === "object" ? json.intent as Record<string, unknown> : undefined
   };
+}
+
+function parsePrecreatedDeployIntentPayload(): PrecreatedDeployIntentPayload | undefined {
+  const raw = stringEnv("SWITCHBOARD_DEPLOY_PRECREATED_INTENT_JSON");
+  if (!raw) return undefined;
+  return parsePrecreatedDeployIntentPayloadJson(raw);
+}
+
+export function parsePrecreatedDeployIntentPayloadJson(raw: string): PrecreatedDeployIntentPayload {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`SWITCHBOARD_DEPLOY_PRECREATED_INTENT_JSON is not valid JSON: ${safeError(error).message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("SWITCHBOARD_DEPLOY_PRECREATED_INTENT_JSON must be a JSON object");
+  }
+  const record = parsed as Record<string, unknown>;
+  const capacity = requiredRecordField(record, "capacity");
+  const deploymentIntentRecord = requiredRecordField(record, "deploymentIntent");
+  const env = requiredRecordField(deploymentIntentRecord, "env");
+  const deploymentIntent: DeploymentIntentBootstrap = {
+    intentId: requiredStringField(deploymentIntentRecord, "intentId"),
+    cliToken: requiredStringField(deploymentIntentRecord, "cliToken"),
+    env: {
+      SWITCHBOARD_RELAY_URL: requiredStringField(env, "SWITCHBOARD_RELAY_URL"),
+      SWITCHBOARD_INTENT_ID: requiredStringField(env, "SWITCHBOARD_INTENT_ID"),
+      SWITCHBOARD_INTENT_TOKEN: requiredStringField(env, "SWITCHBOARD_INTENT_TOKEN")
+    },
+    intent: deploymentIntentRecord.intent && typeof deploymentIntentRecord.intent === "object" && !Array.isArray(deploymentIntentRecord.intent)
+      ? deploymentIntentRecord.intent as Record<string, unknown>
+      : undefined
+  };
+  if (deploymentIntent.env.SWITCHBOARD_INTENT_ID !== deploymentIntent.intentId) {
+    throw new Error("Precreated deployment intent env SWITCHBOARD_INTENT_ID does not match intentId");
+  }
+  return {
+    workflowId: requiredStringField(record, "workflowId"),
+    jobId: requiredStringField(record, "jobId"),
+    capacity: {
+      operatorId: requiredStringField(capacity, "operatorId"),
+      processorId: requiredStringField(capacity, "processorId"),
+      processor: stringField(capacity, "processor"),
+      gatewayId: stringField(capacity, "gatewayId"),
+      managerId: stringField(capacity, "managerId")
+    },
+    deploymentIntent,
+    sensitiveFields: Array.isArray(record.sensitiveFields) ? record.sensitiveFields.filter((item): item is string => typeof item === "string") : undefined
+  };
+}
+
+export function validatePrecreatedDeployIntentPayload(
+  payload: PrecreatedDeployIntentPayload,
+  config: HarnessConfig,
+  selected: { processor: string; processorId: string }
+): void {
+  assertEqualIgnoreCase(payload.capacity.operatorId, config.operatorId, "precreated intent operatorId");
+  assertEqualIgnoreCase(payload.capacity.processorId, selected.processorId, "precreated intent processorId");
+  if (payload.capacity.processor) {
+    assertEqual(payload.capacity.processor, selected.processor, "precreated intent processor");
+  }
+  if (payload.capacity.gatewayId && config.gatewayId) {
+    assertEqual(payload.capacity.gatewayId, config.gatewayId, "precreated intent gatewayId");
+  }
+  if (payload.capacity.managerId && config.managerId) {
+    assertEqual(payload.capacity.managerId, config.managerId, "precreated intent managerId");
+  }
+  if (payload.deploymentIntent.env.SWITCHBOARD_RELAY_URL !== config.relayUrl) {
+    throw new Error("Precreated deployment intent relay URL does not match runner relay URL");
+  }
+  if (!payload.sensitiveFields?.includes("deploymentIntent.cliToken") ||
+      !payload.sensitiveFields.includes("deploymentIntent.env.SWITCHBOARD_INTENT_TOKEN")) {
+    throw new Error("Precreated deployment intent payload is missing sensitive field markers");
+  }
+}
+
+function parsePrecreatedDeployGroupPayload(): PrecreatedDeployGroupPayload | undefined {
+  const raw = stringEnv("SWITCHBOARD_DEPLOY_PRECREATED_GROUP_JSON");
+  if (!raw) return undefined;
+  return parsePrecreatedDeployGroupPayloadJson(raw);
+}
+
+export function parsePrecreatedDeployGroupPayloadJson(raw: string): PrecreatedDeployGroupPayload {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (error) {
+    throw new Error(`SWITCHBOARD_DEPLOY_PRECREATED_GROUP_JSON is not valid JSON: ${safeError(error).message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("SWITCHBOARD_DEPLOY_PRECREATED_GROUP_JSON must be a JSON object");
+  }
+  const record = parsed as Record<string, unknown>;
+  const groupRecord = requiredRecordField(record, "group");
+  const bootstrapRecord = requiredRecordField(record, "deploymentIntentGroup");
+  const env = requiredRecordField(bootstrapRecord, "env");
+  const members = recordArrayField(groupRecord, "members").map((member, index): DeploymentGroupMemberConfig => ({
+    memberId: stringField(member, "memberId") ?? `member-${index + 1}`,
+    operatorId: lowerHex32(requiredStringField(member, "operatorId")),
+    processorId: lowerHex32(requiredStringField(member, "processorId")),
+    processor: requiredStringField(member, "processor"),
+    gatewayId: stringField(member, "gatewayId"),
+    managerId: stringField(member, "managerId"),
+    reportId: stringField(member, "reportId"),
+    reportExpiresAt: stringField(member, "reportExpiresAt"),
+    publicAddresses: stringArrayField(member, "publicAddresses")
+  }));
+  const bootstrapMembers = recordArrayField(bootstrapRecord, "members").map((member, index): DeploymentIntentGroupMemberBootstrap => {
+    const configured = members[index];
+    return {
+      memberId: stringField(member, "memberId") ?? configured?.memberId ?? `member-${index + 1}`,
+      intentId: requiredStringField(member, "intentId"),
+      cliToken: requiredStringField(bootstrapRecord, "cliToken"),
+      jobId: requiredStringField(member, "jobId"),
+      operatorId: lowerHex32(requiredStringField(member, "operatorId")),
+      processorId: lowerHex32(requiredStringField(member, "processorId")),
+      processor: stringField(member, "processor") ?? configured?.processor,
+      gatewayId: stringField(member, "gatewayId") ?? configured?.gatewayId,
+      managerId: stringField(member, "managerId") ?? configured?.managerId,
+      validationHostname: stringField(member, "validationHostname"),
+      intent: member
+    };
+  });
+  return {
+    workflowId: requiredStringField(record, "workflowId"),
+    deploymentMode: "group",
+    jobId: requiredStringField(record, "jobId"),
+    capacity: {
+      operatorId: requiredStringField(requiredRecordField(record, "capacity"), "operatorId"),
+      processorId: requiredStringField(requiredRecordField(record, "capacity"), "processorId"),
+      processor: stringField(requiredRecordField(record, "capacity"), "processor"),
+      gatewayId: stringField(requiredRecordField(record, "capacity"), "gatewayId"),
+      managerId: stringField(requiredRecordField(record, "capacity"), "managerId")
+    },
+    group: {
+      expectedReplicas: Number(requiredStringOrNumberField(groupRecord, "expectedReplicas")),
+      minReady: Number(requiredStringOrNumberField(groupRecord, "minReady")),
+      members
+    },
+    deploymentIntentGroup: {
+      groupId: requiredStringField(bootstrapRecord, "groupId"),
+      cliToken: requiredStringField(bootstrapRecord, "cliToken"),
+      env: {
+        SWITCHBOARD_RELAY_URL: requiredStringField(env, "SWITCHBOARD_RELAY_URL"),
+        SWITCHBOARD_INTENT_GROUP_ID: requiredStringField(env, "SWITCHBOARD_INTENT_GROUP_ID"),
+        SWITCHBOARD_INTENT_TOKEN: requiredStringField(env, "SWITCHBOARD_INTENT_TOKEN")
+      },
+      group: bootstrapRecord.group && typeof bootstrapRecord.group === "object" && !Array.isArray(bootstrapRecord.group)
+        ? bootstrapRecord.group as Record<string, unknown>
+        : undefined,
+      members: bootstrapMembers
+    },
+    sensitiveFields: Array.isArray(record.sensitiveFields) ? record.sensitiveFields.filter((item): item is string => typeof item === "string") : undefined
+  };
+}
+
+export function validatePrecreatedDeployGroupPayload(
+  payload: PrecreatedDeployGroupPayload,
+  config: HarnessConfig
+): void {
+  if (!config.group) {
+    throw new Error("Precreated deployment intent group requires group config");
+  }
+  assertEqualIgnoreCase(payload.capacity.operatorId, config.operatorId, "group operatorId");
+  if (payload.capacity.gatewayId && config.gatewayId) {
+    assertEqual(payload.capacity.gatewayId, config.gatewayId, "group gatewayId");
+  }
+  if (payload.capacity.managerId && config.managerId) {
+    assertEqual(payload.capacity.managerId, config.managerId, "group managerId");
+  }
+  if (payload.group.expectedReplicas !== config.group.expectedReplicas) {
+    throw new Error(`Precreated deployment intent group expectedReplicas mismatch: expected ${config.group.expectedReplicas}, got ${payload.group.expectedReplicas}`);
+  }
+  if (payload.group.minReady !== config.group.minReady) {
+    throw new Error(`Precreated deployment intent group minReady mismatch: expected ${config.group.minReady}, got ${payload.group.minReady}`);
+  }
+  if (payload.deploymentIntentGroup.env.SWITCHBOARD_RELAY_URL !== config.relayUrl) {
+    throw new Error("Precreated deployment intent group relay URL does not match runner relay URL");
+  }
+  if (payload.deploymentIntentGroup.env.SWITCHBOARD_INTENT_GROUP_ID !== payload.deploymentIntentGroup.groupId) {
+    throw new Error("Precreated deployment intent group env SWITCHBOARD_INTENT_GROUP_ID does not match groupId");
+  }
+  if (!payload.sensitiveFields?.includes("deploymentIntentGroup.cliToken") ||
+      !payload.sensitiveFields.includes("deploymentIntentGroup.env.SWITCHBOARD_INTENT_TOKEN")) {
+    throw new Error("Precreated deployment intent group payload is missing sensitive field markers");
+  }
+  const expectedMembers = config.group.members;
+  if (payload.group.members.length !== expectedMembers.length || payload.deploymentIntentGroup.members.length !== expectedMembers.length) {
+    throw new Error("Precreated deployment intent group member count does not match selected capacity");
+  }
+  for (const expected of expectedMembers) {
+    const selected = payload.group.members.find((member) => member.memberId === expected.memberId);
+    const bootstrap = payload.deploymentIntentGroup.members.find((member) => member.memberId === expected.memberId);
+    if (!selected || !bootstrap) {
+      throw new Error(`Precreated deployment intent group is missing member ${expected.memberId}`);
+    }
+    assertEqualIgnoreCase(selected.operatorId, expected.operatorId, `group member ${expected.memberId} operatorId`);
+    assertEqualIgnoreCase(selected.processorId, expected.processorId, `group member ${expected.memberId} processorId`);
+    assertEqual(selected.processor, expected.processor, `group member ${expected.memberId} processor`);
+    if (expected.gatewayId) assertEqual(selected.gatewayId ?? "", expected.gatewayId, `group member ${expected.memberId} gatewayId`);
+    assertEqualIgnoreCase(bootstrap.operatorId, expected.operatorId, `group bootstrap member ${expected.memberId} operatorId`);
+    assertEqualIgnoreCase(bootstrap.processorId, expected.processorId, `group bootstrap member ${expected.memberId} processorId`);
+    if (bootstrap.processor) assertEqual(bootstrap.processor, expected.processor, `group bootstrap member ${expected.memberId} processor`);
+    if (expected.gatewayId && bootstrap.gatewayId) assertEqual(bootstrap.gatewayId, expected.gatewayId, `group bootstrap member ${expected.memberId} gatewayId`);
+  }
+}
+
+function assertEqual(actual: string, expected: string, label: string): void {
+  if (actual !== expected) {
+    throw new Error(`Precreated deployment intent ${label} mismatch: expected ${expected}, got ${actual}`);
+  }
+}
+
+function assertEqualIgnoreCase(actual: string, expected: string, label: string): void {
+  if (actual.toLowerCase() !== expected.toLowerCase()) {
+    throw new Error(`Precreated deployment intent ${label} mismatch: expected ${expected}, got ${actual}`);
+  }
 }
 
 async function createDeploymentIntentGroup(config: HarnessConfig): Promise<DeploymentIntentGroupBootstrap> {
@@ -3547,6 +3925,17 @@ function requiredStringField(record: unknown, name: string): string {
   return value;
 }
 
+function requiredStringOrNumberField(record: unknown, name: string): string | number {
+  if (!record || typeof record !== "object") {
+    throw new Error(`Expected record with field ${name}`);
+  }
+  const value = (record as Record<string, unknown>)[name];
+  if (typeof value !== "string" && typeof value !== "number") {
+    throw new Error(`Expected string or number field ${name}`);
+  }
+  return value;
+}
+
 function requiredRecordField(record: unknown, name: string): Record<string, unknown> {
   if (!record || typeof record !== "object") {
     throw new Error(`Expected record with field ${name}`);
@@ -3813,6 +4202,14 @@ function validatorModeFlag(flags: Map<string, string | boolean>): HarnessConfig[
     throw new Error(`Unsupported validator mode: ${value}`);
   }
   return value;
+}
+
+function deployRunnerMode(): "full" | "acurast-submit-only" | "acurast-group-submit-only" {
+  const value = stringEnv("SWITCHBOARD_DEPLOY_RUNNER_MODE") ?? "full";
+  if (value === "full" || value === "acurast-submit-only" || value === "acurast-group-submit-only") {
+    return value;
+  }
+  throw new Error(`Unsupported SWITCHBOARD_DEPLOY_RUNNER_MODE: ${value}`);
 }
 
 function numberFlag(flags: Map<string, string | boolean>, name: string, fallback: number): number {

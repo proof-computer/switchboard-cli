@@ -119,7 +119,7 @@ export function deriveIngressSessionId(input: {
     ethers.AbiCoder.defaultAbiCoder().encode(
       ["bytes32", "uint256", "address", "address", "address", "bytes32", "address", "bytes32", "bytes32", "bytes32", "bytes32"],
       [
-        idBytes32("SWITCHBOARD_SESSION_V1"),
+        idBytes32("PROOF_INGRESS_SESSION_V1"),
         input.chainId,
         ethers.getAddress(input.registryAddress),
         ethers.getAddress(input.developerAddress),

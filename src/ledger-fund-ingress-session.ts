@@ -2,9 +2,14 @@ import { spawn } from "node:child_process";
 
 import { ethers } from "ethers";
 
-import { encodeFundWithAssetQuote, type IngressQuote } from "./ingress-quote.js";
+import {
+  assertIngressQuoteMatchesRequest,
+  encodeFundWithAssetQuote,
+  normalizeIngressQuote,
+  rebindIngressQuoteEndpoint,
+  signIngressQuote
+} from "../../switchboard-sdk/src/funding.js";
 import { INGRESS_REGISTRY_ABI } from "./ingress-contract.js";
-import { assertIngressQuoteMatchesRequest } from "./quote-binding.js";
 
 const ERC20_ABI = [
   "function approve(address spender,uint256 amount) returns (bool)",
@@ -54,6 +59,11 @@ export interface FundIngressSessionInput {
   endpointHostname?: string;
   /** Optional 0x-32 endpoint hash sent to the quote endpoint and validated directly. */
   endpointHash?: string;
+  /**
+   * Ops-only: when set, request a normal public relay quote, then locally
+   * rebind/sign the endpoint fields for a protected service hostname.
+   */
+  quoteSignerPrivateKey?: string;
   /** Optional 0x-32 hex salt to disambiguate sessions for the same tuple. */
   sessionSalt?: string;
   /** Replace the JSON-RPC provider. Used by tests. */
@@ -115,6 +125,7 @@ interface QuoteResponse {
   quote: Record<string, unknown>;
   signature: string;
   endpointHostname?: string;
+  policy?: unknown;
 }
 
 const DEFAULT_RUN_COMMAND: NonNullable<FundIngressSessionInput["runCommand"]> = (command, args) =>
@@ -149,6 +160,7 @@ export async function fundIngressSessionWithLedger(
   const asset = ethers.getAddress(input.asset);
   const registryAddress = ethers.getAddress(input.registryAddress);
   const jobSignerAddress = ethers.getAddress(input.jobSignerAddress);
+  const localEndpointBinding = Boolean(input.quoteSignerPrivateKey && (input.endpointHostname || input.endpointHash));
 
   const quoteResponse = await requestQuote(
     fetchImpl,
@@ -162,13 +174,33 @@ export async function fundIngressSessionWithLedger(
       expectedJobSigner: jobSignerAddress,
       operatorId: input.operatorId,
       processorId: input.processorId,
-      endpointHostname: input.endpointHostname,
-      endpointHash: input.endpointHash,
+      endpointHostname: localEndpointBinding ? undefined : input.endpointHostname,
+      endpointHash: localEndpointBinding ? undefined : input.endpointHash,
       salt: input.sessionSalt
     },
     input.quoteTimeoutMs ?? 15_000
   );
-  const quote = normalizeQuote(quoteResponse.quote);
+  let quote = normalizeIngressQuote(quoteResponse.quote);
+  let quoteSignature = quoteResponse.signature;
+  const endpointHostname = localEndpointBinding
+    ? input.endpointHostname ?? quoteResponse.endpointHostname
+    : quoteResponse.endpointHostname;
+  if (localEndpointBinding) {
+    quote = rebindIngressQuoteEndpoint({
+      quote,
+      chainId: input.ledger.chainId,
+      registryAddress,
+      endpointHostname: input.endpointHostname,
+      endpointHash: input.endpointHash,
+      sessionLabel: input.sessionLabel,
+      policy: quoteResponse.policy
+    });
+    quoteSignature = signIngressQuote(
+      quote,
+      { chainId: input.ledger.chainId, registryAddress },
+      input.quoteSignerPrivateKey!
+    );
+  }
 
   assertIngressQuoteMatchesRequest(quote, {
     developer,
@@ -190,13 +222,13 @@ export async function fundIngressSessionWithLedger(
   ]);
 
   if (existingDeveloper !== ethers.ZeroAddress) {
-    io.log(
-      `Hub session ${quote.sessionId} already funded by ${existingDeveloper}; skipping ledger broadcast.`
-    );
+      io.log(
+        `Hub session ${quote.sessionId} already funded by ${existingDeveloper}; skipping ledger broadcast.`
+      );
     return {
       sessionId: quote.sessionId,
       jobId: quote.jobId,
-      endpointHostname: quoteResponse.endpointHostname,
+      endpointHostname,
       alreadyFunded: true,
       developer,
       amount: quote.amount.toString(),
@@ -225,7 +257,7 @@ export async function fundIngressSessionWithLedger(
       ]
     });
   }
-  const fundingCalldata = encodeFundWithAssetQuote(quote, quoteResponse.signature);
+  const fundingCalldata = encodeFundWithAssetQuote(quote, quoteSignature);
   commands.push({
     action: "fundWithAssetQuote",
     command: "cast",
@@ -236,7 +268,7 @@ export async function fundIngressSessionWithLedger(
     return {
       sessionId: quote.sessionId,
       jobId: quote.jobId,
-      endpointHostname: quoteResponse.endpointHostname,
+      endpointHostname,
       alreadyFunded: false,
       developer,
       amount: quote.amount.toString(),
@@ -253,7 +285,7 @@ export async function fundIngressSessionWithLedger(
   return {
     sessionId: quote.sessionId,
     jobId: quote.jobId,
-    endpointHostname: quoteResponse.endpointHostname,
+    endpointHostname,
     alreadyFunded: false,
     developer,
     amount: quote.amount.toString(),
@@ -321,63 +353,4 @@ async function requestQuote(
     throw new Error(`Quote request to ${relayUrl}/v1/ingress-intents failed (${response.status}): ${text.slice(0, 500)}`);
   }
   return json;
-}
-
-function normalizeQuote(input: Record<string, unknown>): IngressQuote {
-  return {
-    quoteId: bytes32(input.quoteId, "quote.quoteId"),
-    sessionId: bytes32(input.sessionId, "quote.sessionId"),
-    developer: ethers.getAddress(requiredString(input.developer, "quote.developer")),
-    asset: ethers.getAddress(requiredString(input.asset, "quote.asset")),
-    amount: bigintField(input.amount, "quote.amount"),
-    minAmount: bigintField(input.minAmount, "quote.minAmount"),
-    maxAmount: bigintField(input.maxAmount, "quote.maxAmount"),
-    paidSeconds: bigintField(input.paidSeconds, "quote.paidSeconds"),
-    serviceAmount: bigintField(input.serviceAmount, "quote.serviceAmount"),
-    setupFee: bigintField(input.setupFee, "quote.setupFee"),
-    validationFeeCap: bigintField(input.validationFeeCap, "quote.validationFeeCap"),
-    jobId: bytes32(input.jobId, "quote.jobId"),
-    expectedJobSigner: ethers.getAddress(requiredString(input.expectedJobSigner, "quote.expectedJobSigner")),
-    operatorId: bytes32(input.operatorId, "quote.operatorId"),
-    processorId: bytes32(input.processorId, "quote.processorId"),
-    endpointHash: bytes32(input.endpointHash, "quote.endpointHash"),
-    salt: bytes32(input.salt, "quote.salt"),
-    operatorRecipient: ethers.getAddress(requiredString(input.operatorRecipient, "quote.operatorRecipient")),
-    validatorRecipient: ethers.getAddress(requiredString(input.validatorRecipient, "quote.validatorRecipient")),
-    proofRecipient: ethers.getAddress(requiredString(input.proofRecipient, "quote.proofRecipient")),
-    maxOperatorBps: numberField(input.maxOperatorBps, "quote.maxOperatorBps"),
-    maxValidatorBps: numberField(input.maxValidatorBps, "quote.maxValidatorBps"),
-    maxProofBps: numberField(input.maxProofBps, "quote.maxProofBps"),
-    policyHash: bytes32(input.policyHash, "quote.policyHash"),
-    deadline: bigintField(input.deadline, "quote.deadline")
-  };
-}
-
-function bytes32(value: unknown, name: string): string {
-  const stringValue = requiredString(value, name);
-  const hexValue = ethers.hexlify(stringValue);
-  if (ethers.dataLength(hexValue) !== 32) {
-    throw new Error(`${name} must be bytes32`);
-  }
-  return hexValue;
-}
-
-function requiredString(value: unknown, name: string): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new Error(`${name} must be a non-empty string`);
-  }
-  return value;
-}
-
-function bigintField(value: unknown, name: string): bigint {
-  if (typeof value === "bigint") return value;
-  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return BigInt(value);
-  if (typeof value === "string" && /^[0-9]+$/.test(value)) return BigInt(value);
-  throw new Error(`${name} must be a non-negative integer string`);
-}
-
-function numberField(value: unknown, name: string): number {
-  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
-  if (typeof value === "string" && /^[0-9]+$/.test(value)) return Number(value);
-  throw new Error(`${name} must be a non-negative integer`);
 }

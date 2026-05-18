@@ -50,6 +50,7 @@ const baseSpec = {
     managerId: "9470",
     instantMatchProcessors: ["5HePinnedCachedAddressxxxxxxxxxxxxxxxxxxxxxxxxx"],
     includeEnv: [],
+    encryptedCode: false,
     executionMs: 3_600_000
   }
 };

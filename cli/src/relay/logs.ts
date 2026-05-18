@@ -90,10 +90,29 @@ export async function runRelayLogs(options: RunRelayLogsOptions): Promise<void> 
   io.log("");
   for (const event of sliced) {
     const eventRecord = event as unknown as Record<string, unknown>;
-    const messagePart = eventRecord.message ?? eventRecord.body ?? "";
+    const messagePart = eventRecord.message ?? eventRecord.body ?? structuredEventMessage(eventRecord);
     const messageString = typeof messagePart === "string" ? messagePart : JSON.stringify(messagePart);
     io.log(`#${event.sequence}  ${event.receivedAt}  ${messageString}`);
   }
+}
+
+function structuredEventMessage(event: Record<string, unknown>): string {
+  const eventName = typeof event.event === "string" ? event.event : undefined;
+  const details = event.details && typeof event.details === "object" && !Array.isArray(event.details)
+    ? event.details as Record<string, unknown>
+    : undefined;
+  const detailsError = details?.error && typeof details.error === "object" && !Array.isArray(details.error)
+    ? details.error as Record<string, unknown>
+    : undefined;
+  const errorMessage = typeof detailsError?.message === "string"
+    ? detailsError.message
+    : typeof details?.error === "string"
+      ? details.error
+      : undefined;
+  if (eventName && errorMessage) return `${eventName}: ${errorMessage}`;
+  if (eventName) return eventName;
+  if (errorMessage) return errorMessage;
+  return "";
 }
 
 function stringFlag(flags: Map<string, string | boolean>, name: string): string | undefined {

@@ -10,6 +10,7 @@ import {
   signIngressQuote,
   type IngressQuote
 } from "../src/ingress-quote.js";
+import { deriveIngressSessionId } from "../src/native-dot-payment.js";
 import {
   EIP712_DOMAIN_NAME,
   EIP712_DOMAIN_VERSION,
@@ -56,6 +57,25 @@ describe("registry EIP-712 domains", () => {
       WALLET.address
     );
     assert.equal(hashIngressQuote(quote, { chainId: CHAIN_ID, registryAddress: REGISTRY }), expectedRegistryQuoteDigest(quote));
+  });
+
+  it("derives session ids with the deployed registry domain", () => {
+    const quote = exampleQuote();
+    assert.equal(
+      deriveIngressSessionId({
+        chainId: CHAIN_ID,
+        registryAddress: REGISTRY,
+        developerAddress: quote.developer,
+        assetAddress: quote.asset,
+        jobId: quote.jobId,
+        expectedJobSigner: quote.expectedJobSigner,
+        operatorId: quote.operatorId,
+        processorId: quote.processorId,
+        endpointHash: quote.endpointHash,
+        salt: quote.salt
+      }),
+      "0x19dfb78f97fdbe735b89351dd6816680cfc3694cba6e299be2bfbd9c8662a4ba"
+    );
   });
 });
 

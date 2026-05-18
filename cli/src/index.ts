@@ -13,7 +13,25 @@ import { u8aToHex } from "@polkadot/util";
 import { decodeAddress, mnemonicGenerate } from "@polkadot/util-crypto";
 import { ethers } from "ethers";
 
-import { registerIngressWithRelay } from "../../src/runtime/index.js";
+import {
+  SwitchboardDeployWorkflow,
+  buildAcurastDeployRequiredAction,
+  buildAcurastGroupDeployRequiredAction,
+  launchDemoWorkflowInput,
+  redactDeployWorkflowSnapshot,
+  type AcurastGroupDeployReceiptPayload,
+  type SwitchboardCapacitySelection,
+  type SwitchboardGroupMemberSelection,
+  type SwitchboardDeployWorkflowAdapters,
+  type SwitchboardDeployWorkflowEvent,
+  type SwitchboardDeployWorkflowInput,
+  type SwitchboardDeployWorkflowSnapshot,
+  type WorkflowActionReceipt,
+  type WorkflowRequiredAction
+} from "../../../switchboard-sdk/src/workflows.js";
+import { registerIngressWithRelay } from "../../../switchboard-sdk/src/index.js";
+import type { QuoteResponse } from "../../../switchboard-sdk/src/funding.js";
+import { SwitchboardControlPlaneClient, type DeploymentIntentBootstrap, type DeploymentIntentGroupBootstrap } from "../../../switchboard-sdk/src/control-plane.js";
 import {
   discoverManagerProcessors,
   selectReadyProcessors,
@@ -74,6 +92,10 @@ import {
 import { contextAddCommand } from "./context/add.js";
 import { contextDnsClearCommand, contextDnsSetCommand } from "./context/dns.js";
 import { checkMnemonicSeed, checkSeedAddressMatch } from "./preflight/mnemonic-check.js";
+import {
+  submitAcurastSingleReplicaWithSdk,
+  type AcurastSdkSubmitActionPayload
+} from "./acurast-submit-adapter.js";
 import {
   compactId,
   createGroupedDeployTranscriptWriter,
@@ -1584,6 +1606,20 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     SWITCHBOARD_DEPLOY_EXPECTED_QUOTE_AMOUNT: ingressEstimate.ok ? ingressEstimate.amount : undefined,
     SWITCHBOARD_DEPLOY_COLOR: cliColorEnabled(boolFlag(flags, "json") ? process.stderr : process.stdout) ? "1" : undefined
   };
+  const workflowInput = launchDemoWorkflowInputFromCli({
+    relayUrl: operationRelayUrl,
+    manifestConfig,
+    flags,
+    durationMinutes,
+    maxCostPerExecution,
+    selection,
+    demoProject,
+    minReady: minReadyProcessors,
+    groupDeployEnabled
+  });
+  const workflowStore = deployWorkflowStore(flags);
+  const workflow = new SwitchboardDeployWorkflow(workflowInput, deployWorkflowAdapters(workflowInput, workflowStore));
+  const capacitySnapshot = await workflow.advanceOnce();
 
   if (boolFlag(flags, "dry-run")) {
     const output = {
@@ -1606,6 +1642,12 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
       selection: launchDemoSelectionOutput(selection),
       demoProject,
       env: childEnv,
+      workflow: {
+        workflowId: capacitySnapshot.workflowId,
+        input: workflowInput,
+        snapshot: capacitySnapshot,
+        events: capacitySnapshot.events
+      },
       note: "No Acurast deployment, Hub transaction, DNS change, or route mutation was attempted."
     };
     writeOutput(flags, output, () => {
@@ -1650,19 +1692,27 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     });
   }
 
-  const deployRunner = await resolveDeployRunner(childArgs, childEnv, { workDir: demoProject.dir });
-  const result = await runDeployRunner(deployRunner.command, deployRunner.args, {
-    env: {
-      ...contextRuntimeEnv(runtime),
-      ...deployRunner.env
-    },
-    cwd: deployRunner.cwd,
-    childStdoutToStderr: boolFlag(flags, "json"),
-    action: "launch-demo",
-    json: boolFlag(flags, "json")
-  });
-  const reportPath = parseDeployReportPath(result.stdout, result.stderr);
-  const report = JSON.parse(await readFile(reportPath, "utf8")) as Record<string, any>;
+  const { report, reportPath } = groupDeployEnabled
+    ? await runDeployWorkflowGroupRunner({
+        workflow,
+        workflowStore,
+        childArgs,
+        childEnv,
+        runtime,
+        action: "launch-demo",
+        json: boolFlag(flags, "json"),
+        workDir: demoProject.dir
+      })
+    : await runDeployWorkflowCompatibilityRunner({
+        workflow,
+        workflowStore,
+        childArgs,
+        childEnv,
+        runtime,
+        action: "launch-demo",
+        json: boolFlag(flags, "json"),
+        workDir: demoProject.dir
+      });
   const output = deployOutput(report, reportPath, {
     action: "launch-demo",
     relayUrl: operationRelayUrl,
@@ -2814,6 +2864,85 @@ function launchDemoMemberEnv(member: LaunchDemoMemberSelection): Record<string, 
   };
 }
 
+function launchDemoWorkflowInputFromCli(input: {
+  relayUrl: string;
+  manifestConfig: CliNetworkConfig;
+  flags: Map<string, string | boolean>;
+  durationMinutes: number;
+  maxCostPerExecution: string;
+  selection: LaunchDemoCapacitySelection;
+  demoProject: LaunchDemoProject;
+  minReady: number;
+  groupDeployEnabled?: boolean;
+}): SwitchboardDeployWorkflowInput {
+  const target = targetFromFlags(input.flags, input.manifestConfig);
+  return launchDemoWorkflowInput({
+    deploymentMode: input.groupDeployEnabled ? "group" : "single",
+    relayUrl: input.relayUrl,
+    target: {
+      name: target.name,
+      chainId: input.manifestConfig.chainId ?? target.expectedChainId?.toString() ?? "",
+      registryAddress: input.manifestConfig.registryAddress ?? "",
+      ethRpcUrl: input.manifestConfig.ethRpcUrl,
+      substrateWsUrl: input.manifestConfig.substrateWsUrl
+    },
+    durationSeconds: input.durationMinutes * 60,
+    asset: input.manifestConfig.defaultAssetAddress,
+    quoteCapAmount: input.maxCostPerExecution,
+    certificateMode: "job-acme",
+    capacity: launchDemoWorkflowCapacity(input.selection),
+    group: input.groupDeployEnabled ? {
+      expectedReplicas: input.selection.members.length,
+      minReady: input.minReady,
+      members: input.selection.members.map(launchDemoWorkflowGroupMember)
+    } : undefined,
+    pins: {
+      operatorId: input.selection.operatorId,
+      processorId: input.selection.processorId,
+      processor: input.selection.processor,
+      gatewayId: input.selection.gatewayId,
+      managerId: input.selection.managerId
+    },
+    source: {
+      mode: "switchboard-cli-launch-demo",
+      compatibilityRunner: "switchboard-deploy",
+      demoPackageSpec: input.demoProject.packageSpec,
+      demoPackageVersion: input.demoProject.packageVersion
+    },
+    demoPackage: input.demoProject.packageSpec,
+    minReady: input.minReady
+  });
+}
+
+function launchDemoWorkflowGroupMember(member: LaunchDemoMemberSelection): SwitchboardGroupMemberSelection {
+  return {
+    memberId: member.memberId,
+    operatorId: member.operatorId,
+    processorId: member.processorId,
+    processor: member.processor,
+    gatewayId: member.gatewayId,
+    managerId: member.managerId,
+    reportId: member.reportId,
+    reportExpiresAt: member.reportExpiresAt,
+    publicAddresses: member.publicAddresses,
+    sourceRelayUrl: member.sourceRelayUrl
+  };
+}
+
+function launchDemoWorkflowCapacity(selection: LaunchDemoCapacitySelection): SwitchboardCapacitySelection {
+  return {
+    operatorId: selection.operatorId,
+    processorId: selection.processorId,
+    processor: selection.processor,
+    gatewayId: selection.gatewayId,
+    managerId: selection.managerId,
+    reportId: selection.reportId,
+    reportExpiresAt: selection.reportExpiresAt,
+    publicAddresses: selection.publicAddresses,
+    sourceRelayUrl: selection.sourceRelayUrl
+  };
+}
+
 function formatLaunchDemoProcessors(selection: LaunchDemoCapacitySelection): string {
   if (selection.processors.length === 1) {
     return compactId(selection.processor);
@@ -2828,6 +2957,619 @@ function deployGatewayOverride(flags: Map<string, string | boolean>): string | u
     optionalEnv("SWITCHBOARD_GATEWAY_ID") ??
     optionalEnv("GATEWAY_ID")
   );
+}
+
+function deployWorkflowInputFromCli(input: {
+  relayUrl: string;
+  manifestConfig: CliNetworkConfig;
+  flags: Map<string, string | boolean>;
+  durationMinutes: number;
+  certificateMode: string;
+  maxCostPerExecution: string;
+  operatorId: string;
+  processor?: string;
+  processorId?: string;
+  gatewayId?: string;
+  managerId?: string;
+  selection?: LaunchDemoCapacitySelection;
+}): SwitchboardDeployWorkflowInput {
+  const target = targetFromFlags(input.flags, input.manifestConfig);
+  const processorId = input.processorId ?? (input.processor ? processorRefToId(input.processor) : undefined);
+  const capacity: SwitchboardCapacitySelection = {
+    operatorId: input.operatorId,
+    processorId: processorId ?? input.processor ?? "auto",
+    processor: input.processor,
+    gatewayId: input.gatewayId,
+    managerId: input.managerId,
+    reportId: input.selection?.reportId,
+    reportExpiresAt: input.selection?.reportExpiresAt,
+    publicAddresses: input.selection?.publicAddresses,
+    sourceRelayUrl: input.selection?.sourceRelayUrl
+  };
+  return {
+    relayUrl: input.relayUrl,
+    target: {
+      name: target.name,
+      chainId: input.manifestConfig.chainId ?? target.expectedChainId?.toString() ?? "",
+      registryAddress: input.manifestConfig.registryAddress ?? "",
+      ethRpcUrl: input.manifestConfig.ethRpcUrl,
+      substrateWsUrl: input.manifestConfig.substrateWsUrl
+    },
+    durationSeconds: input.durationMinutes * 60,
+    entrypoint: stringFlag(input.flags, "entrypoint") ?? optionalEnv("ACURAST_ENTRYPOINT"),
+    asset: input.manifestConfig.defaultAssetAddress,
+    quoteCapAmount: stringFlag(input.flags, "payment-amount") ?? input.maxCostPerExecution,
+    certificateMode: input.certificateMode === "self-signed" ? "self-signed" : "job-acme",
+    validatorMode: "skip",
+    capacity,
+    pins: {
+      operatorId: input.operatorId,
+      processorId,
+      processor: input.processor,
+      gatewayId: input.gatewayId,
+      managerId: input.managerId
+    },
+    source: {
+      mode: "switchboard-cli-deploy",
+      compatibilityRunner: "switchboard-deploy"
+    }
+  };
+}
+
+function deployWorkflowAdapters(
+  input: SwitchboardDeployWorkflowInput,
+  store?: ReturnType<typeof deployWorkflowStore>
+): SwitchboardDeployWorkflowAdapters {
+  const controlPlane = new SwitchboardControlPlaneClient({ relayUrl: input.relayUrl });
+  return {
+    controlPlane,
+    acurast: {
+      async submit({ workflow, deploymentIntent, deploymentIntentGroup }) {
+        if (workflow.input.deploymentMode === "group") {
+          if (!deploymentIntentGroup) {
+            throw new Error("Group deploy workflow is missing deployment intent group");
+          }
+          return {
+            id: "cli-runner-acurast-deploy",
+            kind: "acurast.deploy",
+            description: "Run the compatibility switchboard-deploy group runner",
+            payload: buildAcurastGroupDeployRequiredAction(workflow, deploymentIntentGroup)
+          };
+        }
+        if (!deploymentIntent) {
+          throw new Error("Deploy workflow is missing deployment intent");
+        }
+        return {
+          id: "cli-runner-acurast-deploy",
+          kind: "acurast.deploy",
+          description: "Run the compatibility switchboard-deploy runner",
+          payload: buildAcurastDeployRequiredAction(workflow, deploymentIntent)
+        };
+      }
+    },
+    funding: {
+      async requestQuote({ workflow, deploymentIntent, runtime }) {
+        return requestDeployWorkflowQuoteViaCliHelper(input, workflow, deploymentIntent, runtime);
+      },
+      async fundQuote({ workflow, deploymentIntent, quote, runtime }) {
+        return fundDeployWorkflowQuoteViaCliHelper(input, workflow, deploymentIntent, quote, runtime);
+      }
+    },
+    confirmation: {
+      async confirmSpend() {
+        return true;
+      }
+    },
+    store
+  };
+}
+
+async function requestDeployWorkflowQuoteViaCliHelper(
+  input: SwitchboardDeployWorkflowInput,
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  deploymentIntent: DeploymentIntentBootstrap,
+  runtime: Record<string, unknown>
+): Promise<QuoteResponse> {
+  const helper = await resolveHubFundingHelper();
+  const result = await runCliChild(helper.command, [
+    ...helper.args,
+    "--dry-run",
+    "--relay-url",
+    input.relayUrl,
+    "--deployment-intent-id",
+    deploymentIntent.intentId,
+    ...(deploymentIntent.groupId ? ["--deployment-intent-group-id", deploymentIntent.groupId, "--group-member-intent-id", deploymentIntent.intentId] : []),
+    "--intent-token",
+    deploymentIntent.cliToken,
+    "--paid-seconds",
+    String(input.durationSeconds),
+    "--session-label",
+    input.sessionLabel ?? `switchboard-${snapshot.workflowId}`
+  ], {
+    cwd: helper.cwd,
+    env: deployWorkflowFundingHelperEnv(input, snapshot, deploymentIntent, runtime),
+    stream: false
+  });
+  const dryRun = parseHelperJsonOutput(result.stdout, "Hub quote helper dry-run");
+  const quote = dryRun.quote && typeof dryRun.quote === "object" ? dryRun.quote as Record<string, unknown> : undefined;
+  const signature = stringRecordField(dryRun, "signature");
+  if (!quote || !signature) {
+    throw new Error("Hub quote helper dry-run did not return quote and signature");
+  }
+  return jsonSafeOutput({
+    ok: true,
+    quote,
+    signature,
+    endpointHostname: stringRecordField(dryRun, "endpointHostname"),
+    validationHostname: stringRecordField(dryRun, "validationHostname"),
+    policy: dryRun.policy,
+    allocation: dryRun.allocation,
+    intent: dryRun.intent,
+    dns: dryRun.dns,
+    funding: dryRun.funding,
+    lineItems: dryRun.lineItems,
+    pricingPolicy: dryRun.pricingPolicy
+  }) as QuoteResponse;
+}
+
+async function fundDeployWorkflowQuoteViaCliHelper(
+  input: SwitchboardDeployWorkflowInput,
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  deploymentIntent: DeploymentIntentBootstrap,
+  quote: QuoteResponse,
+  runtime?: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const quoteFileDir = await mkdtemp(path.join(tmpdir(), "switchboard-workflow-quote-"));
+  const quoteFile = path.join(quoteFileDir, "quote-response.json");
+  await writeFile(quoteFile, `${JSON.stringify(jsonSafeOutput(quote), null, 2)}\n`, "utf8");
+  const helper = await resolveHubFundingHelper();
+  const result = await runCliChild(helper.command, [
+    ...helper.args,
+    "--yes",
+    "--quote-response-file",
+    quoteFile,
+    "--relay-url",
+    input.relayUrl,
+    "--deployment-intent-id",
+    deploymentIntent.intentId,
+    ...(deploymentIntent.groupId ? ["--deployment-intent-group-id", deploymentIntent.groupId, "--group-member-intent-id", deploymentIntent.intentId] : []),
+    "--intent-token",
+    deploymentIntent.cliToken,
+    "--paid-seconds",
+    String(input.durationSeconds),
+    "--session-label",
+    input.sessionLabel ?? `switchboard-${snapshot.workflowId}`
+  ], {
+    cwd: helper.cwd,
+    env: deployWorkflowFundingHelperEnv(input, snapshot, deploymentIntent, runtime ?? {
+      runtimeSigner: stringRecordField(snapshot.data.runtime, "runtimeSigner")
+    }),
+    stream: false
+  });
+  const funded = parseHelperJsonOutput(result.stdout, "Hub quote funding helper");
+  const txs = Array.isArray(funded.txs) ? funded.txs.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item))) : [];
+  const fundingTx = txs.find((tx) => stringRecordField(tx, "action") === "fundWithAssetQuote") ?? txs[txs.length - 1];
+  return jsonSafeOutput({
+    adapter: "hub:fund-native-asset-quote",
+    ok: funded.ok === true,
+    txHash: stringRecordField(fundingTx, "txHash"),
+    fundingTxHash: stringRecordField(fundingTx, "txHash"),
+    txs,
+    sessionId: stringRecordField(funded.session, "sessionId") ?? stringRecordField(funded.quote, "sessionId"),
+    endpointHostname: stringRecordField(funded, "endpointHostname"),
+    validationHostname: stringRecordField(funded, "validationHostname"),
+    session: funded.session && typeof funded.session === "object" ? funded.session : undefined,
+    quote: funded.quote && typeof funded.quote === "object" ? funded.quote : undefined
+  }) as Record<string, unknown>;
+}
+
+function deployWorkflowFundingHelperEnv(
+  input: SwitchboardDeployWorkflowInput,
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  deploymentIntent: DeploymentIntentBootstrap,
+  runtime: Record<string, unknown>
+): Record<string, string | undefined> {
+  const capacity = snapshot.data.capacity && typeof snapshot.data.capacity === "object"
+    ? snapshot.data.capacity as Record<string, unknown>
+    : {};
+  const runtimeSigner = stringRecordField(runtime, "runtimeSigner") ?? stringRecordField(snapshot.data.runtime, "runtimeSigner");
+  return {
+    SWITCHBOARD_TARGET: input.target.name,
+    INGRESS_REGISTRY_ADDRESS: input.target.registryAddress,
+    HUB_ETH_RPC_URL: input.target.ethRpcUrl,
+    HUB_SUBSTRATE_WS_URL: input.target.substrateWsUrl,
+    CHAIN_ID: input.target.chainId,
+    RELAY_URL: input.relayUrl,
+    PROOF_CONTROL_PLANE_URL: input.relayUrl,
+    SWITCHBOARD_DEPLOY_RELAY_URL: input.relayUrl,
+    SWITCHBOARD_INTENT_ID: deploymentIntent.intentId,
+    SWITCHBOARD_INTENT_GROUP_ID: deploymentIntent.groupId,
+    SWITCHBOARD_INTENT_CLI_TOKEN: deploymentIntent.cliToken,
+    JOB_ID: input.jobId,
+    JOB_SIGNER_ADDRESS: runtimeSigner,
+    OPERATOR_ID: stringRecordField(capacity, "operatorId"),
+    PROCESSOR_ID: stringRecordField(capacity, "processorId"),
+    GATEWAY_ID: stringRecordField(capacity, "gatewayId"),
+    PAYMENT_ASSET_ADDRESS: input.asset,
+    PROOF_QUOTE_DEFAULT_ASSET: input.asset,
+    PAID_SECONDS: String(input.durationSeconds),
+    SWITCHBOARD_QUOTE_CAP_AMOUNT: input.quoteCapAmount
+  };
+}
+
+async function resolveHubFundingHelper(): Promise<{ command: string; args: string[]; cwd?: string }> {
+  const cliRoot = cliPackageRoot();
+  if (await repoScriptAvailable("hub:fund-native-asset-quote", { cwd: cliRoot })) {
+    return { command: "pnpm", args: ["--silent", "hub:fund-native-asset-quote", "--"], cwd: cliRoot };
+  }
+  const currentFile = fileURLToPath(import.meta.url);
+  const distDir = path.dirname(currentFile);
+  const internalDir = path.join(distDir, "internal");
+  const helper = path.join(internalDir, "hub-fund-native-asset-quote.js");
+  await access(helper).catch(() => {
+    throw new Error("deploy requires the packaged Hub funding helper. Rebuild or reinstall the Switchboard CLI package.");
+  });
+  return { command: process.execPath, args: [helper] };
+}
+
+function parseHelperJsonOutput(stdout: string, label: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(stdout) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("output was not a JSON object");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(`${label} produced non-JSON output: ${JSON.stringify(stdout)} (${safeErrorMessage(error)})`);
+  }
+}
+
+function deployWorkflowStore(flags: Map<string, string | boolean>): { save(snapshot: SwitchboardDeployWorkflowSnapshot): Promise<void> } | undefined {
+  const runDir = stringFlag(flags, "run-dir");
+  const reportPath = deploymentReportPath(flags);
+  const snapshotDir = runDir ?? (reportPath ? path.dirname(path.resolve(reportPath)) : undefined);
+  if (!snapshotDir) return undefined;
+  return {
+    async save(snapshot: SwitchboardDeployWorkflowSnapshot): Promise<void> {
+      await writeDeployWorkflowSnapshot(snapshotDir, redactDeployWorkflowSnapshot(snapshot));
+    }
+  };
+}
+
+async function writeDeployWorkflowSnapshot(dir: string, snapshot: SwitchboardDeployWorkflowSnapshot): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, "switchboard-deploy-workflow.snapshot.json"), `${JSON.stringify(jsonSafeOutput(redactDeployWorkflowSnapshot(snapshot)), null, 2)}\n`, "utf8");
+}
+
+async function saveDeployWorkflowSnapshot(
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  store: ReturnType<typeof deployWorkflowStore> | undefined,
+  reportPath: string
+): Promise<void> {
+  if (store) {
+    await store.save(snapshot);
+    return;
+  }
+  await writeDeployWorkflowSnapshot(path.dirname(path.resolve(reportPath)), snapshot);
+}
+
+function requireDeployWorkflowAcurastAction(snapshot: SwitchboardDeployWorkflowSnapshot): WorkflowRequiredAction {
+  if (snapshot.step !== "deploy_action_required" || snapshot.requiredAction?.kind !== "acurast.deploy") {
+    throw new Error(`Deploy workflow stopped at ${snapshot.step}; expected acurast.deploy action`);
+  }
+  return snapshot.requiredAction;
+}
+
+function deployWorkflowRunnerReceipt(
+  action: WorkflowRequiredAction,
+  report: Record<string, any>,
+  reportPath: string
+): WorkflowActionReceipt {
+  const route = report.route ?? report.routeActivation;
+  return {
+    actionId: action.id,
+    kind: action.kind,
+    receipt: jsonSafeOutput({
+      adapter: stringRecordField(report, "mode") === "acurast-sdk-submit-only" ? "acurast-sdk" : "switchboard-deploy",
+      ok: report.ok === true,
+      deploymentId: stringRecordField(report.deployment, "deploymentId"),
+      txHash: stringRecordField(report.deployment, "txHash"),
+      jobId: stringRecordField(report.session, "jobId"),
+      processor: stringRecordField(report.session, "processor"),
+      processorId: stringRecordField(report.session, "processorId"),
+      operatorId: stringRecordField(report.session, "operatorId"),
+      gatewayId: stringRecordField(report.session, "gatewayId"),
+      schedule: report.lifecycle && typeof report.lifecycle === "object" ? (report.lifecycle as Record<string, any>).schedule : undefined,
+      deploymentIntentId: stringRecordField(report.deploymentIntent, "intentId"),
+      reportPath,
+      route: route ? jsonSafeOutput(route) : undefined,
+      failure: report.ok === true ? undefined : {
+        stage: stringRecordField(report.failure, "stage") ?? stringRecordField(report.error, "stage"),
+        message: stringRecordField(report.failure, "message") ?? stringRecordField(report.error, "message") ?? stringRecordField(report, "error")
+      }
+    }) as Record<string, any>
+  };
+}
+
+function deployWorkflowGroupRunnerReceipt(
+  action: WorkflowRequiredAction,
+  report: Record<string, any>,
+  reportPath: string
+): WorkflowActionReceipt {
+  const receipt: AcurastGroupDeployReceiptPayload = {
+    adapter: "switchboard-deploy",
+    ok: report.ok === true,
+    deployment: jsonSafeWorkflowValue(report.deployment) as Record<string, any>,
+    deploymentIntentGroup: jsonSafeWorkflowValue(report.deploymentIntentGroup) as Record<string, any>,
+    ha: jsonSafeWorkflowValue(report.ha ?? report.deploymentIntentGroup) as Record<string, any>,
+    funding: jsonSafeWorkflowValue(report.funding) as Record<string, any>,
+    route: jsonSafeWorkflowValue(report.route ?? report.routeActivation ?? report.publicProbe) as Record<string, any>,
+    validation: jsonSafeWorkflowValue(report.validation ?? report.validationReports) as Record<string, any>,
+    reportPath,
+    failure: report.ok === true ? undefined : {
+      stage: stringRecordField(report.failure, "stage") ?? stringRecordField(report.error, "stage"),
+      message: stringRecordField(report.failure, "message") ?? stringRecordField(report.error, "message") ?? stringRecordField(report, "error")
+    }
+  };
+  return {
+    actionId: action.id,
+    kind: action.kind,
+    receipt: jsonSafeOutput(receipt) as Record<string, any>
+  };
+}
+
+async function runDeployWorkflowToTerminalOrBlockedWithPolling(input: {
+  workflow: SwitchboardDeployWorkflow;
+  pollMs: number;
+  timeoutMs: number;
+}): Promise<SwitchboardDeployWorkflowSnapshot> {
+  const startedAt = Date.now();
+  let snapshot = await input.workflow.runToBlocked();
+  while (!["complete", "failed", "funding_action_required", "deploy_action_required"].includes(snapshot.step)) {
+    if (Date.now() - startedAt > input.timeoutMs) {
+      throw new Error(`Timed out waiting for deploy workflow to advance from ${snapshot.step} after ${input.timeoutMs}ms`);
+    }
+    const before = snapshot.step;
+    snapshot = await input.workflow.advanceOnce();
+    if (snapshot.step === before) {
+      await sleep(input.pollMs);
+    }
+  }
+  return snapshot;
+}
+
+function deployWorkflowPollingConfig(childEnv: Record<string, string | undefined>): { pollMs: number; timeoutMs: number } {
+  const pollMs = parsePositiveIntegerString(
+    "SWITCHBOARD_DEPLOY_POLL_INTERVAL_MS",
+    childEnv.SWITCHBOARD_DEPLOY_POLL_INTERVAL_MS ?? optionalEnv("SWITCHBOARD_DEPLOY_POLL_INTERVAL_MS") ?? "10000"
+  );
+  const startDelayMs = parseIntegerFlagValue(
+    "ACURAST_START_DELAY_MS",
+    childEnv.ACURAST_START_DELAY_MS ?? optionalEnv("ACURAST_START_DELAY_MS") ?? "0"
+  );
+  const executionMs = parseIntegerFlagValue(
+    "ACURAST_EXECUTION_MS",
+    childEnv.ACURAST_EXECUTION_MS ?? optionalEnv("ACURAST_EXECUTION_MS") ?? "0"
+  );
+  const fallbackTimeoutMs = Math.max(900_000, startDelayMs + executionMs + 300_000);
+  const timeoutMs = parsePositiveIntegerString(
+    "SWITCHBOARD_DEPLOY_RUNTIME_TIMEOUT_MS",
+    childEnv.SWITCHBOARD_DEPLOY_RUNTIME_TIMEOUT_MS ?? optionalEnv("SWITCHBOARD_DEPLOY_RUNTIME_TIMEOUT_MS") ?? String(fallbackTimeoutMs)
+  );
+  return { pollMs, timeoutMs };
+}
+
+async function completeDeployWorkflowSnapshotFromRunner(
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  report: Record<string, any>,
+  reportPath: string,
+  receipt?: WorkflowActionReceipt
+): Promise<SwitchboardDeployWorkflowSnapshot> {
+  const updatedAt = new Date().toISOString();
+  const events = [
+    ...snapshot.events,
+    deployWorkflowEvent(snapshot.events.length + 1, updatedAt, "deploy_submitted", {
+      deploymentId: stringRecordField(report.deployment, "deploymentId"),
+      reportPath
+    }),
+    deployWorkflowEvent(snapshot.events.length + 2, updatedAt, "final_report", {
+      ok: report.ok === true,
+      sessionId: stringRecordField(report.session, "sessionId"),
+      hostname: deploymentReportHostnames(report).public ?? stringRecordField(report.session, "hostname")
+    })
+  ];
+  return {
+    ...snapshot,
+    step: report.ok === true ? "complete" : "failed",
+    data: {
+      ...snapshot.data,
+      deployment: jsonSafeOutput(report.deployment),
+      session: jsonSafeOutput(report.session),
+      quote: jsonSafeWorkflowValue(report.quote),
+      funding: jsonSafeWorkflowValue(report.funding),
+      route: jsonSafeWorkflowValue(report.route ?? report.routeActivation),
+      validation: jsonSafeWorkflowValue(report.validation ?? report.validationReports),
+      actionReceipts: [
+        ...(Array.isArray(snapshot.data.actionReceipts) ? snapshot.data.actionReceipts : []),
+        ...(receipt ? [receipt] : [])
+      ],
+      reportPath
+    },
+    requiredAction: report.ok === true ? undefined : {
+      id: receipt?.actionId ?? `deploy-runner-${snapshot.workflowId}`,
+      kind: "acurast.deploy",
+      description: "Compatibility deploy runner failed before the workflow completed",
+      payload: {
+        reportPath,
+        actionReceipt: receipt?.receipt
+      }
+    },
+    events,
+    updatedAt
+  };
+}
+
+function deployWorkflowEvent(
+  sequence: number,
+  at: string,
+  type: string,
+  details?: Record<string, unknown>
+): SwitchboardDeployWorkflowEvent {
+  return { sequence, at, type, details };
+}
+
+function attachDeployWorkflowReportMetadata(report: Record<string, any>, snapshot: SwitchboardDeployWorkflowSnapshot): void {
+  const redacted = redactDeployWorkflowSnapshot(snapshot);
+  mergeDeployWorkflowCompletionIntoReport(report, redacted);
+  report.workflowId = redacted.workflowId;
+  report.workflow = redacted;
+  report.workflowEvents = redacted.events;
+  if (redacted.requiredAction) {
+    report.requiredAction = redacted.requiredAction;
+  }
+}
+
+function mergeDeployWorkflowCompletionIntoReport(report: Record<string, any>, snapshot: SwitchboardDeployWorkflowSnapshot): void {
+  if (snapshot.step !== "complete") return;
+  const data = snapshot.data;
+  const quote = data.quote && typeof data.quote === "object" ? data.quote as Record<string, unknown> : {};
+  const quoteRecord = quote.quote && typeof quote.quote === "object" ? quote.quote as Record<string, unknown> : {};
+  const runtime = data.runtime && typeof data.runtime === "object" ? data.runtime as Record<string, unknown> : {};
+  const funding = data.funding && typeof data.funding === "object" ? data.funding as Record<string, unknown> : {};
+  const routeStatus = data.routeStatus && typeof data.routeStatus === "object" ? data.routeStatus as Record<string, unknown> : {};
+  const route = routeStatus.route && typeof routeStatus.route === "object"
+    ? routeStatus.route as Record<string, unknown>
+    : routeStatus.intent && typeof routeStatus.intent === "object" && (routeStatus.intent as Record<string, unknown>).route && typeof (routeStatus.intent as Record<string, unknown>).route === "object"
+      ? (routeStatus.intent as Record<string, any>).route as Record<string, unknown>
+      : {};
+  const sessionId =
+    stringRecordField(quoteRecord, "sessionId") ??
+    stringRecordField(funding, "sessionId") ??
+    stringRecordField(funding.session, "sessionId");
+  const endpointHostname = stringRecordField(quote, "endpointHostname") ?? stringRecordField(route, "hostname");
+  const validationHostname = stringRecordField(quote, "validationHostname");
+  report.session = {
+    ...(report.session && typeof report.session === "object" ? report.session : {}),
+    sessionId,
+    jobId: snapshot.input.jobId,
+    jobSigner: stringRecordField(runtime, "runtimeSigner"),
+    operatorId: stringRecordField(snapshot.data.capacity, "operatorId"),
+    processor: stringRecordField(snapshot.data.capacity, "processor"),
+    processorId: stringRecordField(snapshot.data.capacity, "processorId"),
+    hostname: endpointHostname,
+    validationHostname
+  };
+  report.hostnames = {
+    ...(report.hostnames && typeof report.hostnames === "object" ? report.hostnames : {}),
+    public: endpointHostname,
+    validation: validationHostname
+  };
+  report.quote = quote;
+  report.funding = funding;
+  report.route = Object.keys(route).length > 0 ? route : report.route;
+  report.validation = data.validation;
+}
+
+async function runDeployWorkflowCompatibilityRunner(input: {
+  workflow: SwitchboardDeployWorkflow;
+  workflowStore: ReturnType<typeof deployWorkflowStore> | undefined;
+  childArgs: string[];
+  childEnv: Record<string, string | undefined>;
+  runtime: CliRuntime;
+  action: "launch-demo" | "deploy";
+  json: boolean;
+  workDir?: string;
+}): Promise<{
+  report: Record<string, any>;
+  reportPath: string;
+  workflowSnapshot: SwitchboardDeployWorkflowSnapshot;
+}> {
+  const deployActionSnapshot = await input.workflow.runToBlocked();
+  const deployAction = requireDeployWorkflowAcurastAction(deployActionSnapshot);
+  const submit = await submitAcurastSingleReplicaWithSdk({
+    actionPayload: deployAction.payload as AcurastSdkSubmitActionPayload,
+    env: {
+      ...process.env,
+      ...contextRuntimeEnv(input.runtime),
+      ...input.childEnv,
+      SWITCHBOARD_DEPLOY_RUN_DIR: argValue(input.childArgs, "--run-dir"),
+      SWITCHBOARD_DEPLOY_PRECREATED_INTENT_JSON: JSON.stringify(deployAction.payload)
+    },
+    workDir: input.workDir,
+    action: input.action,
+    json: input.json
+  });
+  const reportPath = submit.reportPath;
+  const report = submit.report;
+  const receipt = deployWorkflowRunnerReceipt(deployAction, report, reportPath);
+  if (report.ok !== true) {
+    const workflowSnapshot = await completeDeployWorkflowSnapshotFromRunner(deployActionSnapshot, report, reportPath, receipt);
+    await saveDeployWorkflowSnapshot(workflowSnapshot, input.workflowStore, reportPath);
+    attachDeployWorkflowReportMetadata(report, workflowSnapshot);
+    await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    return { report, reportPath, workflowSnapshot };
+  }
+  await input.workflow.applyActionReceipt(receipt);
+  const workflowSnapshot = await runDeployWorkflowToTerminalOrBlockedWithPolling({
+    workflow: input.workflow,
+    ...deployWorkflowPollingConfig(input.childEnv)
+  });
+  await saveDeployWorkflowSnapshot(workflowSnapshot, input.workflowStore, reportPath);
+  attachDeployWorkflowReportMetadata(report, workflowSnapshot);
+  await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  return { report, reportPath, workflowSnapshot };
+}
+
+async function runDeployWorkflowGroupRunner(input: {
+  workflow: SwitchboardDeployWorkflow;
+  workflowStore: ReturnType<typeof deployWorkflowStore> | undefined;
+  childArgs: string[];
+  childEnv: Record<string, string | undefined>;
+  runtime: CliRuntime;
+  action: "launch-demo" | "deploy";
+  json: boolean;
+  workDir?: string;
+}): Promise<{
+  report: Record<string, any>;
+  reportPath: string;
+  workflowSnapshot: SwitchboardDeployWorkflowSnapshot;
+}> {
+  const deployActionSnapshot = await input.workflow.runToBlocked();
+  const deployAction = requireDeployWorkflowAcurastAction(deployActionSnapshot);
+  const deployRunner = await resolveDeployRunner(input.childArgs, {
+    ...contextRuntimeEnv(input.runtime),
+    ...input.childEnv,
+    SWITCHBOARD_DEPLOY_RUNNER_MODE: "acurast-group-submit-only",
+    SWITCHBOARD_DEPLOY_PRECREATED_GROUP_JSON: JSON.stringify(deployAction.payload)
+  }, { workDir: input.workDir });
+  const result = await runDeployRunner(deployRunner.command, deployRunner.args, {
+    env: deployRunner.env,
+    cwd: deployRunner.cwd,
+    childStdoutToStderr: input.json,
+    action: input.action,
+    json: input.json
+  });
+  const reportPath = parseDeployReportPath(result.stdout, result.stderr);
+  const report = JSON.parse(await readFile(reportPath, "utf8")) as Record<string, any>;
+  const receipt = deployWorkflowGroupRunnerReceipt(deployAction, report, reportPath);
+  await input.workflow.applyActionReceipt(receipt);
+  const workflowSnapshot = report.ok === true
+    ? await runDeployWorkflowToTerminalOrBlockedWithPolling({
+        workflow: input.workflow,
+        ...deployWorkflowPollingConfig(input.childEnv)
+      })
+    : input.workflow.snapshot;
+  await saveDeployWorkflowSnapshot(workflowSnapshot, input.workflowStore, reportPath);
+  attachDeployWorkflowReportMetadata(report, workflowSnapshot);
+  await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  return { report, reportPath, workflowSnapshot };
+}
+
+function argValue(args: string[], name: string): string | undefined {
+  const index = args.indexOf(name);
+  if (index < 0) return undefined;
+  const value = args[index + 1];
+  return value && !value.startsWith("--") ? value : undefined;
 }
 
 async function deployCommand(flags: Map<string, string | boolean>, runtime: CliRuntime) {
@@ -3002,6 +3744,23 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     ACURAST_INSTANT_MATCH_PROCESSORS: explicitProcessor ?? optionalEnv("ACURAST_INSTANT_MATCH_PROCESSORS") ?? selection?.processor,
     ACURAST_MANAGER_ID: stringFlag(flags, "manager-id") ?? optionalEnv("ACURAST_MANAGER_ID") ?? selection?.managerId
   };
+  const workflowInput = deployWorkflowInputFromCli({
+    relayUrl: operationRelayUrl,
+    manifestConfig,
+    flags,
+    durationMinutes,
+    certificateMode,
+    maxCostPerExecution,
+    operatorId,
+    processor: childEnv.SWITCHBOARD_DEPLOY_PROCESSOR,
+    processorId: selection?.processorId,
+    gatewayId: selectedGatewayId,
+    managerId: stringFlag(flags, "manager-id") ?? optionalEnv("ACURAST_MANAGER_ID") ?? selection?.managerId,
+    selection
+  });
+  const workflowStore = deployWorkflowStore(flags);
+  const workflow = new SwitchboardDeployWorkflow(workflowInput, deployWorkflowAdapters(workflowInput, workflowStore));
+  const capacitySnapshot = await workflow.advanceOnce();
   if (boolFlag(flags, "dry-run")) {
     const output = {
       ok: true,
@@ -3016,6 +3775,12 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
         signer: manifestConfig.signer,
         sequence: manifestConfig.manifest?.sequence,
         expiresAt: manifestConfig.manifest?.expiresAt
+      },
+      workflow: {
+        workflowId: capacitySnapshot.workflowId,
+        input: workflowInput,
+        snapshot: capacitySnapshot,
+        events: capacitySnapshot.events
       },
       note: "No Acurast deployment, Hub transaction, DNS change, or route mutation was attempted."
     };
@@ -3035,7 +3800,6 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     return;
   }
 
-  const deployRunner = await resolveDeployRunner(childArgs, childEnv);
   if (!boolFlag(flags, "json")) {
     printProjectDeployStart({
       relayUrl: operationRelayUrl,
@@ -3049,17 +3813,15 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
       certificateMode
     });
   }
-  const result = await runDeployRunner(deployRunner.command, deployRunner.args, {
-    env: {
-      ...contextRuntimeEnv(runtime),
-      ...deployRunner.env
-    },
-    childStdoutToStderr: boolFlag(flags, "json"),
+  const { report, reportPath } = await runDeployWorkflowCompatibilityRunner({
+    workflow,
+    workflowStore,
+    childArgs,
+    childEnv,
+    runtime,
     action: "deploy",
     json: boolFlag(flags, "json")
   });
-  const reportPath = parseDeployReportPath(result.stdout, result.stderr);
-  const report = JSON.parse(await readFile(reportPath, "utf8")) as Record<string, any>;
   const output = deployOutput(report, reportPath, {
     relayUrl: operationRelayUrl,
     routeActivationMode,
@@ -3290,7 +4052,7 @@ async function validatorLaunchCommand(flags: Map<string, string | boolean>, runt
       ss58Format,
       retries: 4,
       retryDelayMs: 2_500,
-      timeoutMs: 20_000
+      timeoutMs: numberFlag(flags, "validator-registration-timeout-ms", "SWITCHBOARD_VALIDATOR_REGISTRATION_TIMEOUT_MS", 60_000)
     }
   );
   writeOutput(flags, {
@@ -5077,6 +5839,10 @@ function deployOutput(
     ingressEstimate: defaults.ingressEstimate,
     estimate: defaults.estimate,
     demoProject: defaults.demoProject,
+    workflowId: stringRecordField(report, "workflowId"),
+    workflow: report.workflow && typeof report.workflow === "object" ? report.workflow : undefined,
+    workflowEvents: Array.isArray(report.workflowEvents) ? report.workflowEvents : undefined,
+    requiredAction: report.requiredAction && typeof report.requiredAction === "object" ? report.requiredAction : undefined,
     reportPath,
     runDir: stringRecordField(report.artifacts, "runDir")
   };
@@ -5913,6 +6679,10 @@ function parseDeployReportPath(stdout: string, stderr: string): string {
   return match[1].trim();
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function parseDeployFailureReportPath(stdout: string | undefined, stderr: string | undefined): string | undefined {
   return stripAnsi(`${stdout ?? ""}\n${stderr ?? ""}`).match(/\[switchboard-deploy\] failure report=(.+)/)?.[1]?.trim();
 }
@@ -6069,6 +6839,14 @@ export function sanitizeOutputValue(value: unknown): unknown {
     }
   }
   return output;
+}
+
+function jsonSafeOutput<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value, (_key, item) => typeof item === "bigint" ? item.toString() : item)) as T;
+}
+
+function jsonSafeWorkflowValue(value: unknown): unknown {
+  return value === undefined ? undefined : jsonSafeOutput(value);
 }
 
 function isSensitiveOutputKey(key: string): boolean {
@@ -6297,7 +7075,7 @@ async function deployRunnerAvailable(): Promise<{ ok: boolean; detail: string }>
   return { ok: true, detail: "packaged deploy runner" };
 }
 
-async function resolveDeployRunner(
+export async function resolveDeployRunner(
   repoChildArgs: string[],
   childEnv: Record<string, string | undefined>,
   context: { workDir?: string; currentFile?: string } = {}

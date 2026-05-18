@@ -262,6 +262,7 @@ async function main() {
         validationFeeCap: quote.validationFeeCap.toString(),
         deadline: quote.deadline.toString()
       },
+      signature,
       balancesBefore: {
         nativeFree: nativeBefore.toString(),
         asset: assetBalance.toString(),

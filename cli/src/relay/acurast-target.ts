@@ -40,6 +40,7 @@ import {
 
 const HEX32_REGEX = /^0x[0-9a-fA-F]{64}$/;
 const DEFAULT_ACURAST_MAX_NETWORK_REQUESTS = "1000";
+const DEFAULT_PROOF_ACURAST_RPC = "wss://acurast.rpc.proof.computer";
 const LOG_LEVELS = new Set(["trace", "debug", "info", "warn", "error", "fatal", "silent"]);
 
 export interface AcurastRegistrationOverrides {
@@ -273,6 +274,13 @@ export function prepareAcurastDeployContext(
     buildConfig.ENDPOINT_HOSTNAME = endpointHostname;
     buildConfig.SWITCHBOARD_RELAY_UPSTREAM_PORT = buildConfig.PORT;
     buildConfig.PROCESSOR_ID = requiredProcessorIdFromSpec(spec, "relay.admissionMode=proof-infra");
+    buildConfig.ACURAST_RPC = env.ACURAST_RPC ?? DEFAULT_PROOF_ACURAST_RPC;
+    if (env.ACURAST_MAINNET_RPC) {
+      buildConfig.ACURAST_MAINNET_RPC = env.ACURAST_MAINNET_RPC;
+    }
+    if (env.ACURAST_CANARY_RPC) {
+      buildConfig.ACURAST_CANARY_RPC = env.ACURAST_CANARY_RPC;
+    }
     if (spec.acurast.scriptIpfs) {
       buildConfig.SWITCHBOARD_RELAY_SCRIPT_CID = spec.acurast.scriptIpfs;
     }

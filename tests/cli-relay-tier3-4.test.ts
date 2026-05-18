@@ -162,6 +162,30 @@ describe("relay logs", () => {
     assert.match(out, /#2.*ready/);
   });
 
+  it("prints structured event names and nested error messages in text mode", async () => {
+    const { io, captured } = makeIo();
+    await runRelayLogs({
+      flags: new Map<string, string | boolean>([
+        ["read-url", "https://control.example/v1/log-sinks/abc/events"]
+      ]),
+      env: { SWITCHBOARD_LOG_ENCRYPTION_KEY: "test" },
+      io,
+      reader: async () => [
+        {
+          sequence: 1,
+          receivedAt: "2026-05-15T12:00:00.000Z",
+          event: "relay-infra-admission-failed",
+          details: {
+            error: { message: "Relay infra admission requires Acurast schedule.startTime from RPC" }
+          }
+        } as never
+      ]
+    });
+    const out = captured.log.join("\n");
+    assert.match(out, /relay-infra-admission-failed/);
+    assert.match(out, /requires Acurast schedule\.startTime from RPC/);
+  });
+
   it("requires --read-url", async () => {
     await assert.rejects(
       runRelayLogs({

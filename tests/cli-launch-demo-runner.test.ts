@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 
-import { resolveLaunchDemoEstimateRunner } from "../cli/src/index.js";
+import { resolveDeployRunner, resolveLaunchDemoEstimateRunner } from "../cli/src/index.js";
 
 describe("launch-demo runner resolution", () => {
   it("uses bundled internal helpers from a packaged CLI even inside a user project with matching scripts", async () => {
@@ -64,6 +64,64 @@ describe("launch-demo runner resolution", () => {
       assert.equal(runner.env.ACURAST_ENTRYPOINT, "src/server.ts");
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the source deploy runner for real launch-demo in checkout mode", async () => {
+    const root = await mkTempTree("switchboard-cli-source-deploy-");
+
+    try {
+      await writeFile(
+        path.join(root, "package.json"),
+        JSON.stringify({ scripts: { "switchboard:internal:deploy-runner": "tsx scripts/acurast/switchboard-deploy.ts" } })
+      );
+
+      const runner = await resolveDeployRunner(
+        ["switchboard:internal:deploy-runner", "--", "--yes", "--relay-url", "https://relay.test"],
+        { SWITCHBOARD_LAUNCH_DEMO: "true" },
+        { currentFile: path.join(root, "cli", "src", "index.ts"), workDir: "/tmp/demo-project" }
+      );
+
+      assert.equal(runner.command, "pnpm");
+      assert.deepEqual(runner.args, ["--silent", "switchboard:internal:deploy-runner", "--", "--yes", "--relay-url", "https://relay.test"]);
+      assert.equal(runner.cwd, root);
+      assert.equal(runner.env.SWITCHBOARD_WORK_DIR, "/tmp/demo-project");
+      assert.equal(runner.env.SWITCHBOARD_LAUNCH_DEMO, "true");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the packaged deploy runner for real launch-demo from dist", async () => {
+    const root = await mkTempTree("switchboard-cli-packaged-deploy-");
+    const workDir = await mkTempTree("switchboard-demo-project-");
+
+    try {
+      const distDir = path.join(root, "dist");
+      const internalDir = path.join(distDir, "internal");
+      const assetsDir = path.join(root, "assets");
+      const currentFile = path.join(distDir, "index.js");
+      const deployRunner = path.join(internalDir, "switchboard-deploy.js");
+      await mkdir(internalDir, { recursive: true });
+      await writeFile(currentFile, "");
+      await writeFile(deployRunner, "");
+
+      const runner = await resolveDeployRunner(
+        ["switchboard:internal:deploy-runner", "--", "--yes", "--relay-url", "https://relay.test"],
+        { SWITCHBOARD_LAUNCH_DEMO: "true" },
+        { currentFile, workDir }
+      );
+
+      assert.equal(runner.command, process.execPath);
+      assert.deepEqual(runner.args, [deployRunner, "--yes", "--relay-url", "https://relay.test"]);
+      assert.equal(runner.cwd, undefined);
+      assert.equal(runner.env.SWITCHBOARD_WORK_DIR, workDir);
+      assert.equal(runner.env.SWITCHBOARD_INTERNAL_BIN_DIR, internalDir);
+      assert.equal(runner.env.SWITCHBOARD_PACKAGED_ASSETS_DIR, assetsDir);
+      assert.equal(runner.env.SWITCHBOARD_LAUNCH_DEMO, "true");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(workDir, { recursive: true, force: true });
     }
   });
 });

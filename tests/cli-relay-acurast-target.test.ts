@@ -389,11 +389,40 @@ describe("prepareAcurastDeployContext", () => {
     );
     assert.equal(ctx.buildConfig.SWITCHBOARD_RELAY_HOSTNAME, "relay-d.switchboard.proof.computer");
     assert.equal(ctx.buildConfig.ENDPOINT_HOSTNAME, "relay-d.switchboard.proof.computer");
+    assert.equal(ctx.buildConfig.ACURAST_RPC, "wss://acurast.rpc.proof.computer");
     assert.match(ctx.buildConfig.PROCESSOR_ID, /^0x[0-9a-f]{64}$/);
     assert.equal(ctx.buildConfig.RELAY_URL, undefined);
     assert.equal(ctx.buildConfig.SESSION_ID, undefined);
+    assert.equal(ctx.runtimeEnv.ACURAST_RPC, undefined);
     assert.equal(ctx.runtimeEnv.SB_RELAY_INFRA_ADMISSION_TOKEN, "ADMISSION_TOKEN_VALUE");
     assert.ok(!JSON.stringify(ctx.buildConfig).includes("ADMISSION_TOKEN_VALUE"));
+  });
+
+  it("lets operators override the proof-infra Acurast RPC build config without runtime env slots", () => {
+    const proofInfraSpec = spec({
+      secrets: {
+        ...((baseSpec as Record<string, unknown>).secrets as Record<string, unknown>),
+        relayInfraAdmissionTokenEnv: "PROOF_RELAY_INFRA_ADMISSION_TOKEN"
+      },
+      relay: {
+        admissionMode: "proof-infra",
+        autoRegister: false,
+        bootstrapRelayUrl: "https://relay-a.switchboard.proof.computer",
+        enablePeerBackfill: false
+      } as Record<string, unknown>,
+      peers: []
+    });
+    const ctx = prepareAcurastDeployContext(proofInfraSpec, {
+      env: {
+        ...baseEnv,
+        ACURAST_RPC: "wss://custom.acurast.example",
+        PROOF_RELAY_INFRA_ADMISSION_TOKEN: "ADMISSION_TOKEN_VALUE"
+      }
+    });
+
+    assert.equal(ctx.buildConfig.ACURAST_RPC, "wss://custom.acurast.example");
+    assert.equal(ctx.runtimeEnv.ACURAST_RPC, undefined);
+    assert.equal(ctx.includeEnv.includes("ACURAST_RPC"), false);
   });
 
   it("requires PROOF_OPERATOR_ID (or --operator-id) when autoRegister=true", () => {
