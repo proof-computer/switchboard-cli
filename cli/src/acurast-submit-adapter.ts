@@ -23,6 +23,8 @@ import {
 
 const DEFAULT_MAINNET_RPC = "wss://archive.mainnet.acurast.com";
 const DEFAULT_CANARY_RPC = "wss://canarynet-ws-1.acurast-h-server-2.papers.tech";
+export const DEFAULT_ACURAST_IPFS_URL = "https://ipfs-proxy.acurast.prod.gke.papers.tech";
+export const DEFAULT_ACURAST_IPFS_API_KEY = "";
 const DEFAULT_ACURAST_MAX_NETWORK_REQUESTS = "1000";
 
 export interface AcurastSdkSubmitActionPayload {
@@ -314,18 +316,14 @@ async function submitPreparedSdkJob(
   prepared: PreparedSdkSubmit
 ): Promise<Record<string, unknown>> {
   const mnemonic = acurastMnemonic(input.env);
-  const ipfsEndpoint = requiredString(input.env.ACURAST_IPFS_URL, "ACURAST_IPFS_URL");
-  const ipfsApiKey = requiredString(input.env.ACURAST_IPFS_API_KEY, "ACURAST_IPFS_API_KEY");
+  const ipfs = acurastSdkIpfsUploadConfig(input.env);
   const wallet = await walletFromMnemonic(mnemonic, { name: "switchboard-cli" });
   let txHash: string | undefined;
   let deploymentId: string | undefined;
   await deployProject(prepared.config, prepared.job, {
     wallet,
     rpcEndpoint: acurastRpc(input.env),
-    ipfs: {
-      endpoint: ipfsEndpoint,
-      apiKey: ipfsApiKey
-    },
+    ipfs,
     envVars: prepared.envVars,
     statusCallback(status, data) {
       if (status === "Submit" && data && typeof data === "object") {
@@ -346,6 +344,13 @@ async function submitPreparedSdkJob(
     txHash,
     projectName: prepared.config.projectName,
     network: prepared.config.network
+  };
+}
+
+export function acurastSdkIpfsUploadConfig(env: Record<string, string | undefined>): { endpoint: string; apiKey: string } {
+  return {
+    endpoint: nonEmptyString(env.ACURAST_IPFS_URL) ?? DEFAULT_ACURAST_IPFS_URL,
+    apiKey: env.ACURAST_IPFS_API_KEY ?? DEFAULT_ACURAST_IPFS_API_KEY
   };
 }
 
@@ -510,6 +515,10 @@ function acurastNetwork(env: Record<string, string | undefined>): "mainnet" | "c
 
 function acurastRpc(env: Record<string, string | undefined>): string {
   return env.ACURAST_RPC ?? (acurastNetwork(env) === "canary" ? env.ACURAST_CANARY_RPC ?? DEFAULT_CANARY_RPC : DEFAULT_MAINNET_RPC);
+}
+
+function nonEmptyString(value: string | undefined): string | undefined {
+  return value && value.length > 0 ? value : undefined;
 }
 
 function acurastMnemonic(env: Record<string, string | undefined>): string {

@@ -12,9 +12,7 @@ import { ethers } from "ethers";
 import { getSwitchboardTarget } from "../../src/chains.js";
 import { normalizeDnsHostname } from "../../src/cloudflare-dns.js";
 import {
-  CANONICAL_CONSUMER_INGRESS_DOMAIN_POOL,
-  parseDomainPool,
-  selectDomainFromPool
+  CANONICAL_CONSUMER_INGRESS_DOMAIN_POOL
 } from "../../src/domain-pool.js";
 import { compactId, createWaitLogCoalescer, orange, statusLine, switchboardColorEnabled } from "../../cli/src/output.js";
 
@@ -45,9 +43,7 @@ export interface HarnessConfig {
   operatorRouteIntentUrl: string;
   managerId: string;
   hostname: string;
-  endpointHostnameExplicit: boolean;
   validationHostname: string;
-  validationHostnameExplicit: boolean;
   port: number;
   durationMinutes?: number;
   leaseSeconds?: number;
@@ -362,7 +358,7 @@ async function main(): Promise<void> {
     throw new Error(`Target ${config.targetName} does not define an expected chain ID; set CHAIN_ID`);
   }
 
-  let sessionId = ethers.hexlify(randomBytes(32));
+  let sessionId = "";
   const precreatedIntent = parsePrecreatedDeployIntentPayload();
   const precreatedGroup = parsePrecreatedDeployGroupPayload();
   if (precreatedIntent && precreatedGroup) {
@@ -423,13 +419,10 @@ async function main(): Promise<void> {
   await writeJson(metadataPath, {
     runId: config.runId,
     runDir: config.runDir,
-    hostname: config.hostname,
-    hostnames: {
-      public: config.hostname,
-      validation: config.validationHostname
-    },
-    sessionId,
     jobId,
+    endpointAllocation: config.hostname
+      ? { mode: "explicit", hostname: config.hostname, validationHostname: config.validationHostname || config.hostname }
+      : { mode: "relay-allocated" },
     deploymentIntent: {
       intentId: deploymentIntent.intentId,
       relayUrl: config.relayUrl,
@@ -477,8 +470,6 @@ async function main(): Promise<void> {
 
   console.log(deployStatus("info", "Run context", `run=${config.runId} relay=${config.relayUrl}`));
   console.log(deployStatus("info", "Selected processor", compactId(processor)));
-  console.log(deployStatus("info", "Session", compactId(sessionId)));
-  console.log(deployStatus("info", "Hostnames", `${config.hostname}; validation=${config.validationHostname}`));
   console.log(deployStatus("info", "Deployment intent", deploymentIntent.intentId));
 
   await assertRelayHealthy(config.relayUrl);
@@ -494,13 +485,12 @@ async function main(): Promise<void> {
       dns: dnsRecords,
       certificateAuthorization,
       session: {
-        sessionId,
+        ...(sessionId ? { sessionId } : {}),
         jobId,
         operatorId: config.operatorId,
         processor,
         processorId,
-        hostname: config.hostname,
-        validationHostname: config.validationHostname
+        ...deploymentSessionHostnames(config)
       }
     });
     throw error;
@@ -526,13 +516,9 @@ async function main(): Promise<void> {
         gatewayId: config.gatewayId,
         processor,
         processorId,
-        hostname: config.hostname,
-        validationHostname: config.validationHostname
+        ...deploymentSessionHostnames(config)
       },
-      hostnames: {
-        public: config.hostname,
-        validation: config.validationHostname
-      },
+      hostnames: deploymentReportHostnames(config),
       relay: {
         url: config.relayUrl
       },
@@ -582,12 +568,12 @@ async function main(): Promise<void> {
       deployment,
       schedule: deploymentSchedule,
       session: {
-        sessionId,
+        ...(sessionId ? { sessionId } : {}),
         jobId,
         operatorId: config.operatorId,
         processor,
         processorId,
-        hostname: config.hostname
+        ...deploymentSessionHostnames(config)
       },
       acurastInspection: await inspectAcurastDeployment(config, deployment.deploymentId).catch((inspectError) => ({
         error: safeError(inspectError)
@@ -626,23 +612,15 @@ async function main(): Promise<void> {
       deploymentIntent
     });
     sessionId = requiredStringField(funding, "sessionId");
-    const fundedHostname = stringField(funding, "endpointHostname");
-    if (fundedHostname) {
-      config.hostname = normalizeDnsHostname(fundedHostname);
-      const fundedValidationHostname = stringField(funding, "validationHostname");
-      if (fundedValidationHostname || !config.validationHostnameExplicit) {
-        config.validationHostname = normalizeDnsHostname(fundedValidationHostname || fundedHostname);
-      }
-      config.certificateHostnames = [config.hostname];
-      if (!config.dns.publicProbeModeExplicit && isCanonicalConsumerIngressHostname(config.hostname)) {
-        config.dns.publicProbeMode = "dns";
-        config.dns.curlDohUrl ??= "https://cloudflare-dns.com/dns-query";
-      }
-    }
+    applyDeploymentIntentHostnames(config, funding);
     console.log(deployStatus("ok", "Funded Hub session", `tx=${funding.txHash ?? "already-funded"}`));
-    console.log(deployStatus("info", "Endpoint hostname", config.hostname));
-    await refreshDeploymentIntentFunding(config, deploymentIntent);
-    dnsMaterialization = await waitForDeploymentIntentDnsPropagated(config, deploymentIntent, config.hostname);
+    const fundingRefresh = await refreshDeploymentIntentFunding(config, deploymentIntent);
+    applyDeploymentIntentHostnames(config, funding, fundingRefresh);
+    const deploymentIntentStatus = await readDeploymentIntent(config, deploymentIntent);
+    applyDeploymentIntentHostnames(config, funding, deploymentIntentStatus);
+    const allocatedHostnames = requireDeploymentHostnames(config, "funded deployment intent");
+    console.log(deployStatus("info", "Endpoint hostname", allocatedHostnames.hostname));
+    dnsMaterialization = await waitForDeploymentIntentDnsPropagated(config, deploymentIntent, allocatedHostnames.hostname);
 
     registration = await waitForRegistration(config, sessionId);
     console.log(deployStatus("ok", "Registered on Hub", registration.txHash ? `tx=${registration.txHash}` : "observed on-chain"));
@@ -749,8 +727,7 @@ async function main(): Promise<void> {
         operatorId: config.operatorId,
         processor,
         processorId,
-        hostname: config.hostname,
-        validationHostname: config.validationHostname
+        ...deploymentSessionHostnames(config)
       },
       runtime,
       acurastInspection: await inspectAcurastDeployment(config, deployment.deploymentId).catch((inspectError) => ({
@@ -760,6 +737,7 @@ async function main(): Promise<void> {
     throw error;
   }
 
+  const finalHostnames = requireDeploymentHostnames(config, "deployment report");
   const report = {
     ok: true,
     runId: config.runId,
@@ -771,12 +749,12 @@ async function main(): Promise<void> {
       operatorId: config.operatorId,
       processor,
       processorId,
-      hostname: config.hostname,
-      validationHostname: config.validationHostname
+      hostname: finalHostnames.hostname,
+      validationHostname: finalHostnames.validationHostname
     },
     hostnames: {
-      public: config.hostname,
-      validation: config.validationHostname
+      public: finalHostnames.hostname,
+      validation: finalHostnames.validationHostname
     },
     relay: {
       url: config.relayUrl
@@ -994,26 +972,21 @@ async function runDeploymentIntentGroup(
         deploymentIntent: groupMemberDeploymentIntent(group, bootstrap)
       });
       const sessionId = requiredStringField(funding, "sessionId");
-      const endpointHostname = stringField(funding, "endpointHostname");
-      if (endpointHostname) {
-        config.hostname = normalizeDnsHostname(endpointHostname);
-        const validationHostname = stringField(funding, "validationHostname");
-        if (validationHostname || !config.validationHostnameExplicit) {
-          config.validationHostname = normalizeDnsHostname(validationHostname || endpointHostname);
-        }
-        config.certificateHostnames = [config.hostname];
-        if (!config.dns.publicProbeModeExplicit && isCanonicalConsumerIngressHostname(config.hostname)) {
-          config.dns.publicProbeMode = "dns";
-          config.dns.curlDohUrl ??= "https://cloudflare-dns.com/dns-query";
-        }
-      }
-      await refreshDeploymentIntentFunding(config, groupMemberDeploymentIntent(group, bootstrap));
+      const memberDeploymentIntent = groupMemberDeploymentIntent(group, bootstrap);
+      applyDeploymentIntentHostnames(config, funding);
+      const fundingRefresh = await refreshDeploymentIntentFunding(config, memberDeploymentIntent);
+      applyDeploymentIntentHostnames(config, funding, fundingRefresh);
+      const deploymentIntentStatus = await readDeploymentIntent(config, memberDeploymentIntent);
+      applyDeploymentIntentHostnames(config, funding, deploymentIntentStatus);
+      const allocatedHostnames = requireDeploymentHostnames(config, `deployment intent group member ${bootstrap.memberId}`);
       fundedMembers.push({
         ...member,
         memberId: bootstrap.memberId,
         intentId: bootstrap.intentId,
         sessionId,
         funding,
+        endpointHostname: allocatedHostnames.hostname,
+        validationHostname: allocatedHostnames.validationHostname,
         operatorId: bootstrap.operatorId,
         processorId: bootstrap.processorId,
         processor: bootstrap.processor,
@@ -1021,7 +994,7 @@ async function runDeploymentIntentGroup(
       });
       fundedIntentIds.add(intentId);
       console.log(deployStatus("ok", "Funded HA member", `${bootstrap.memberId} session=${compactId(sessionId)}`));
-      dnsMaterialization ??= await waitForDeploymentIntentDnsPropagated(config, groupMemberDeploymentIntent(group, bootstrap), config.hostname);
+      dnsMaterialization ??= await waitForDeploymentIntentDnsPropagated(config, memberDeploymentIntent, allocatedHostnames.hostname);
     }
   };
   try {
@@ -1048,6 +1021,10 @@ async function runDeploymentIntentGroup(
     );
     console.log(deployStatus("ok", "Verified HTTPS route", `nonce=${publicProbe.nonce}`));
 
+    const primaryMemberHostnames = {
+      hostname: requiredStringField(fundedMembers[0], "endpointHostname"),
+      validationHostname: stringField(fundedMembers[0], "validationHostname") ?? requiredStringField(fundedMembers[0], "endpointHostname")
+    };
     const report = {
       ok: fundedMembers.length >= config.group!.minReady,
       runId: config.runId,
@@ -1070,12 +1047,12 @@ async function runDeploymentIntentGroup(
         operatorId: requiredStringField(fundedMembers[0], "operatorId"),
         processor: stringField(fundedMembers[0], "processor"),
         processorId: requiredStringField(fundedMembers[0], "processorId"),
-        hostname: config.hostname,
-        validationHostname: stringField(group.members[0], "validationHostname")
+        hostname: primaryMemberHostnames.hostname,
+        validationHostname: primaryMemberHostnames.validationHostname
       },
       hostnames: {
-        public: config.hostname,
-        validation: stringField(group.members[0], "validationHostname")
+        public: primaryMemberHostnames.hostname,
+        validation: primaryMemberHostnames.validationHostname
       },
       relay: { url: config.relayUrl },
       dnsMaterialization,
@@ -1187,40 +1164,35 @@ function loadConfig(flags: Map<string, string | boolean>): HarnessConfig {
 
   const cloudflareZoneNames = splitCsv(stringFlag(flags, "cloudflare-zone-names") ?? stringEnv("CLOUDFLARE_ZONE_NAMES") ?? "");
   const configuredIngressDomains = consumerIngressDomainsFromZones(cloudflareZoneNames);
-  const domainPool = parseDomainPool(
-    stringFlag(flags, "hostname-suffixes") ??
-      stringFlag(flags, "domain-pool") ??
-      stringEnv("SWITCHBOARD_DEPLOY_HOSTNAME_SUFFIXES") ??
-      stringEnv("SWITCHBOARD_DOMAIN_POOL"),
-    dnsEnabled ? defaultConsumerIngressDomainPool(configuredIngressDomains) : ["ingress.test"]
-  );
-  const hostnameSuffix = normalizeDnsHostname(
-    stringFlag(flags, "hostname-suffix") ??
-      stringEnv("SWITCHBOARD_DEPLOY_HOSTNAME_SUFFIX") ??
-      selectDomainFromPool(domainPool, runId)
-  );
-  assertConsumerIngressDomain(hostnameSuffix, "hostname suffix");
-  assertConsumerIngressDomainAllowed(hostnameSuffix, configuredIngressDomains, "hostname suffix");
   const explicitEndpointHostname =
     stringFlag(flags, "endpoint-hostname") ??
-    stringEnv("SWITCHBOARD_DEPLOY_ENDPOINT_HOSTNAME") ??
-    stringFlag(flags, "hostname") ??
-    stringEnv("SWITCHBOARD_DEPLOY_HOSTNAME");
+    stringEnv("SWITCHBOARD_DEPLOY_ENDPOINT_HOSTNAME");
   const explicitValidationHostname =
     stringFlag(flags, "validation-hostname") ??
     stringEnv("SWITCHBOARD_DEPLOY_VALIDATION_HOSTNAME");
-  const hostname = normalizeDnsHostname(explicitEndpointHostname ?? `switchboard-${runId}.${hostnameSuffix}`);
-  const validationHostname = normalizeDnsHostname(
-    explicitValidationHostname ?? `switchboard-${runId}-validation.${hostnameSuffix}`
-  );
+  const hostname = explicitEndpointHostname ? normalizeDnsHostname(explicitEndpointHostname) : "";
+  const validationHostname = explicitValidationHostname ? normalizeDnsHostname(explicitValidationHostname) : hostname;
+  if (explicitValidationHostname && !hostname) {
+    throw new Error("A validation hostname requires an explicit endpoint hostname; relay-allocated hostnames are learned after quote funding.");
+  }
+  if (certificateMode === "self-signed" && !hostname) {
+    throw new Error(
+      "Self-signed certificate mode requires --endpoint-hostname or SWITCHBOARD_DEPLOY_ENDPOINT_HOSTNAME. " +
+        "Relay-allocated hostnames are only available after quote funding; use --job-acme for public deploys."
+    );
+  }
   const defaultCertificateHostnames = hostname;
   const certificateHostnames = splitCsv(
     stringFlag(flags, "certificate-hostnames") ?? stringEnv("SWITCHBOARD_DEPLOY_CERTIFICATE_HOSTNAMES") ?? defaultCertificateHostnames
   ).map(normalizeDnsHostname);
-  assertConsumerIngressHostname(hostname, "hostname");
-  assertConsumerIngressHostname(validationHostname, "validation hostname");
-  assertConsumerIngressHostnameAllowed(hostname, configuredIngressDomains, "hostname");
-  assertConsumerIngressHostnameAllowed(validationHostname, configuredIngressDomains, "validation hostname");
+  if (hostname) {
+    assertConsumerIngressHostname(hostname, "hostname");
+    assertConsumerIngressHostnameAllowed(hostname, configuredIngressDomains, "hostname");
+  }
+  if (validationHostname) {
+    assertConsumerIngressHostname(validationHostname, "validation hostname");
+    assertConsumerIngressHostnameAllowed(validationHostname, configuredIngressDomains, "validation hostname");
+  }
   for (const certificateHostname of certificateHostnames) {
     assertConsumerIngressHostname(certificateHostname, "certificate hostname");
     assertConsumerIngressHostnameAllowed(certificateHostname, configuredIngressDomains, "certificate hostname");
@@ -1316,10 +1288,8 @@ function loadConfig(flags: Map<string, string | boolean>): HarnessConfig {
       process.env.SWITCHBOARD_DEPLOY_ROUTE_INTENT_URL ??
       "http://127.0.0.1:18080/route-intents",
     managerId: managerId ?? "",
-    hostname: normalizeDnsHostname(hostname),
-    endpointHostnameExplicit: Boolean(explicitEndpointHostname),
-    validationHostnameExplicit: Boolean(explicitValidationHostname),
-    validationHostname: normalizeDnsHostname(validationHostname),
+    hostname,
+    validationHostname,
     port: numberFlag(flags, "port", numberEnv("SWITCHBOARD_DEPLOY_PORT", 3443)),
     durationMinutes,
     leaseSeconds,
@@ -1435,25 +1405,9 @@ function consumerIngressDomainsFromZones(cloudflareZoneNames: string[]): string[
   return unique(cloudflareZoneNames.map((zoneName) => normalizeDnsHostname(zoneName)).filter(isConsumerIngressDomain));
 }
 
-function defaultConsumerIngressDomainPool(configuredIngressDomains: string[]): readonly string[] {
-  return configuredIngressDomains.length > 0 ? configuredIngressDomains : switchboardDomainPool;
-}
-
 function isConsumerIngressDomain(value: string): boolean {
   const labels = normalizeDnsHostname(value).split(".");
   return labels.length === 2 && labels[0] === "ingress" && labels[1].length > 0;
-}
-
-function assertConsumerIngressDomain(value: string, label: string): void {
-  if (!isConsumerIngressDomain(value)) {
-    throw new Error(`${label} must be an ingress.<tld> domain, got ${value}`);
-  }
-}
-
-function assertConsumerIngressDomainAllowed(value: string, configuredIngressDomains: string[], label: string): void {
-  if (configuredIngressDomains.length > 0 && !configuredIngressDomains.includes(value)) {
-    throw new Error(`${label} ${value} is outside configured ingress zones: ${configuredIngressDomains.join(", ")}`);
-  }
 }
 
 function assertConsumerIngressHostname(value: string, label: string): void {
@@ -1474,6 +1428,76 @@ function assertConsumerIngressHostnameAllowed(value: string, configuredIngressDo
 function isCanonicalConsumerIngressHostname(value: string): boolean {
   const hostname = normalizeDnsHostname(value);
   return switchboardDomainPool.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+}
+
+export function deploymentIntentHostnamesFromRecords(
+  funding: Record<string, unknown> | undefined,
+  status?: Record<string, unknown>
+): { hostname?: string; validationHostname?: string } {
+  const intent = objectField(status, "intent");
+  const endpointHostname =
+    stringField(intent, "endpointHostname") ??
+    stringField(status, "endpointHostname") ??
+    stringField(funding, "endpointHostname");
+  if (!endpointHostname) {
+    return {};
+  }
+  const validationHostname =
+    stringField(intent, "validationHostname") ??
+    stringField(status, "validationHostname") ??
+    stringField(funding, "validationHostname") ??
+    endpointHostname;
+  return {
+    hostname: normalizeDnsHostname(endpointHostname),
+    validationHostname: normalizeDnsHostname(validationHostname)
+  };
+}
+
+function applyDeploymentIntentHostnames(
+  config: HarnessConfig,
+  funding: Record<string, unknown> | undefined,
+  status?: Record<string, unknown>
+): boolean {
+  const hostnames = deploymentIntentHostnamesFromRecords(funding, status);
+  if (!hostnames.hostname) {
+    return false;
+  }
+  config.hostname = hostnames.hostname;
+  config.validationHostname = hostnames.validationHostname ?? hostnames.hostname;
+  config.certificateHostnames = [config.hostname];
+  if (!config.dns.publicProbeModeExplicit && isCanonicalConsumerIngressHostname(config.hostname)) {
+    config.dns.publicProbeMode = "dns";
+    config.dns.curlDohUrl ??= "https://cloudflare-dns.com/dns-query";
+  }
+  return true;
+}
+
+function requireDeploymentHostnames(config: HarnessConfig, label: string): { hostname: string; validationHostname: string } {
+  if (!config.hostname) {
+    throw new Error(`Relay did not allocate an endpoint hostname for ${label}`);
+  }
+  return {
+    hostname: config.hostname,
+    validationHostname: config.validationHostname || config.hostname
+  };
+}
+
+function deploymentSessionHostnames(config: HarnessConfig): { hostname?: string; validationHostname?: string } {
+  if (!config.hostname) {
+    return {};
+  }
+  return requireDeploymentHostnames(config, "deployment session");
+}
+
+function deploymentReportHostnames(config: HarnessConfig): { public: string; validation: string } | undefined {
+  if (!config.hostname) {
+    return undefined;
+  }
+  const hostnames = requireDeploymentHostnames(config, "deployment report");
+  return {
+    public: hostnames.hostname,
+    validation: hostnames.validationHostname
+  };
 }
 
 async function maybeAuthorizeCertificateHostnames(
@@ -1527,10 +1551,11 @@ async function createSelfSignedCertificate(config: HarnessConfig): Promise<{
   certBase64: string;
   keyBase64: string;
 }> {
+  const hostnames = requireDeploymentHostnames(config, "self-signed certificate");
   await mkdir(config.runDir, { recursive: true });
   const certPath = path.join(config.runDir, "tls.crt");
   const keyPath = path.join(config.runDir, "tls.key");
-  const san = unique([config.hostname, config.validationHostname, ...config.certificateHostnames]).map((hostname) => `DNS:${hostname}`).join(",");
+  const san = unique([hostnames.hostname, hostnames.validationHostname, ...config.certificateHostnames]).map((hostname) => `DNS:${hostname}`).join(",");
   await run("openssl", [
     "req",
     "-x509",
@@ -1545,7 +1570,7 @@ async function createSelfSignedCertificate(config: HarnessConfig): Promise<{
     "-out",
     certPath,
     "-subj",
-    `/CN=${config.hostname}`,
+    `/CN=${hostnames.hostname}`,
     "-addext",
     `subjectAltName=${san}`
   ]);

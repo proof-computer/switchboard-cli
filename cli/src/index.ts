@@ -93,6 +93,8 @@ import { contextAddCommand } from "./context/add.js";
 import { contextDnsClearCommand, contextDnsSetCommand } from "./context/dns.js";
 import { checkMnemonicSeed, checkSeedAddressMatch } from "./preflight/mnemonic-check.js";
 import {
+  DEFAULT_ACURAST_IPFS_API_KEY,
+  DEFAULT_ACURAST_IPFS_URL,
   submitAcurastSingleReplicaWithSdk,
   type AcurastSdkSubmitActionPayload
 } from "./acurast-submit-adapter.js";
@@ -110,10 +112,12 @@ import {
 import { printOpsUsage, runOpsSubcommand } from "./ops.js";
 import {
   DEFAULT_SWITCHBOARD_OPS_PROFILE,
+  SWITCHBOARD_CONTEXT_SECRET_FILE_ENV,
   SWITCHBOARD_OPS_PROFILE_ENV,
   loadContextSecretFile,
   loadSwitchboardOpsProfile,
-  normalizeSwitchboardProfileName
+  normalizeSwitchboardProfileName,
+  switchboardHomePaths
 } from "./switchboard-home.js";
 import {
   PROJECT_STATE_FILE,
@@ -303,7 +307,7 @@ export interface SwitchboardContextStore {
   contexts?: Record<string, SwitchboardContext>;
 }
 
-interface CliRuntime {
+export interface CliRuntime {
   projectRoot?: string;
   projectConfigPath?: string;
   projectStatePath?: string;
@@ -375,10 +379,12 @@ const REMOVED_CONTEXT_SET_FLAGS = [
   "operator-ssh-host",
   "control-plane-token-env"
 ];
+const ACURAST_IPFS_UPLOAD_ENV_VARS = ["ACURAST_IPFS_URL", "ACURAST_IPFS_API_KEY"] as const;
+type AcurastIpfsUploadEnvName = (typeof ACURAST_IPFS_UPLOAD_ENV_VARS)[number];
 
-async function main() {
-  const parsed = parseArgs(process.argv.slice(2));
-  const runtime = await loadCliRuntime(parsed.flags, parsed.command);
+export async function runSwitchboardCli(argv: readonly string[] = process.argv.slice(2), runtimeOverride?: CliRuntime): Promise<void> {
+  const parsed = parseArgs([...argv]);
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
 
   if (parsed.command === "operator-discover" && boolFlag(parsed.flags, "help")) {
     printOperatorDiscoverUsage();
@@ -1314,6 +1320,9 @@ async function preflightCommand(flags: Map<string, string | boolean>, runtime: C
     );
     addCheck("Acurast seed/address match", match.ok, match.detail);
   }
+  for (const envName of ACURAST_IPFS_UPLOAD_ENV_VARS) {
+    addCheck(acurastIpfsUploadCheckName(envName), true, acurastIpfsUploadEnvDetail(runtime, envName));
+  }
 
   const paymentMode = stringFlag(flags, "payment-mode") === "public-price" ? "public-price" : "quote";
   if (paymentMode === "quote") {
@@ -1727,6 +1736,10 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     demoProject
   });
   await saveProjectDeployment(runtime, output);
+  if (output.ok !== true) {
+    printOrWriteDeployReportFailure(flags, output, report, reportPath, "launch-demo");
+    throwHandledDeployReportFailure(report, reportPath, "launch-demo");
+  }
 
   writeOutput(flags, output, () => printDeployResult(output));
 }
@@ -5414,6 +5427,53 @@ function printDeployResult(output: any) {
   }
 }
 
+function printOrWriteDeployReportFailure(
+  flags: Map<string, string | boolean>,
+  output: Record<string, any>,
+  report: Record<string, any>,
+  reportPath: string,
+  action: "launch-demo" | "deploy"
+): void {
+  if (boolFlag(flags, "json")) {
+    writeOutput(flags, output, () => undefined);
+    return;
+  }
+  printDeployReportFailure(report, reportPath, action);
+}
+
+function printDeployReportFailure(report: Record<string, any>, reportPath: string, action: "launch-demo" | "deploy"): void {
+  const failure = deployReportFailureFields(report);
+  const summary = deployFailureSummary(`${failure.stage ?? ""}\n${failure.message ?? ""}`.toLowerCase());
+  console.error("");
+  console.error(sectionTitle(action === "launch-demo" ? "Demo did not complete" : "Deploy did not complete", process.stderr));
+  for (const line of formatRows([
+    { label: "Last stage", value: summary.stage },
+    { label: "Impact", value: summary.impact },
+    { label: "Error", value: failure.message ? firstLine(failure.message) : "report ok=false" },
+    { label: "Report", value: reportPath }
+  ])) {
+    console.error(line);
+  }
+}
+
+function throwHandledDeployReportFailure(report: Record<string, any>, reportPath: string, action: "launch-demo" | "deploy"): never {
+  const failure = deployReportFailureFields(report);
+  const label = action === "launch-demo" ? "Demo" : "Deploy";
+  const stage = failure.stage ? ` at ${failure.stage}` : "";
+  const detail = failure.message ? `: ${firstLine(failure.message)}` : "";
+  const error = new Error(`${label} did not complete${stage}${detail}. Report: ${reportPath}`);
+  markErrorOutputHandled(error);
+  throw error;
+}
+
+function deployReportFailureFields(report: Record<string, any>): { stage?: string; message?: string } {
+  const failure = report.failure && typeof report.failure === "object" ? report.failure as Record<string, unknown> : undefined;
+  return {
+    stage: stringRecordField(failure, "stage") ?? stringRecordField(report, "stage"),
+    message: stringRecordField(failure, "message") ?? stringRecordField(report, "message") ?? stringRecordField(report, "error")
+  };
+}
+
 function printHaMemberTable(members: Array<Record<string, unknown>>): void {
   const rows = members.map((member) => ({
     Member: stringRecordField(member, "member") ?? "",
@@ -7436,6 +7496,34 @@ function contextEnvDetail(runtime: CliRuntime, key: keyof SwitchboardContext, fa
   return typeof envName === "string" && envName.length > 0 ? `${envName} via context ${runtime.contextName}` : fallback;
 }
 
+function acurastIpfsUploadCheckName(envName: AcurastIpfsUploadEnvName): string {
+  return envName === "ACURAST_IPFS_URL" ? "Acurast IPFS endpoint" : "Acurast IPFS API key";
+}
+
+function acurastIpfsUploadEnvDetail(runtime: CliRuntime, envName: AcurastIpfsUploadEnvName): string {
+  if (optionalEnv(envName)) {
+    return `${envName} configured`;
+  }
+  const hint = `${envName} in ${builderContextSecretHint(runtime)} or shell environment`;
+  if (envName === "ACURAST_IPFS_URL") {
+    return `default ${DEFAULT_ACURAST_IPFS_URL}; override with ${hint}`;
+  }
+  return DEFAULT_ACURAST_IPFS_API_KEY.length > 0
+    ? `default configured; override with ${hint}`
+    : `default empty API key for Acurast IPFS proxy; override with ${hint}`;
+}
+
+function builderContextSecretHint(runtime: Pick<CliRuntime, "contextName">): string {
+  const explicit = optionalEnv(SWITCHBOARD_CONTEXT_SECRET_FILE_ENV);
+  if (explicit) {
+    return explicit;
+  }
+  if (runtime.contextName) {
+    return switchboardHomePaths({ contextName: runtime.contextName }).builderSecretFile;
+  }
+  return `${SWITCHBOARD_CONTEXT_SECRET_FILE_ENV} or ~/.switchboard/secrets/<context>.env`;
+}
+
 function nativePaymentSeedDetail(flags: Map<string, string | boolean>, runtime: CliRuntime): string {
   if (stringFlag(flags, "polkadot-seed")) {
     return "--polkadot-seed";
@@ -8288,7 +8376,7 @@ function isMainModule(): boolean {
 }
 
 if (isMainModule()) {
-  main().catch((error: unknown) => {
+  runSwitchboardCli().catch((error: unknown) => {
     if (!errorOutputHandled(error)) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[switchboard] ${message}`);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { assertNoRemovedPublicCommandFlags, printHelp, sanitizeOutputValue } from "../cli/src/index.js";
+import { assertNoRemovedPublicCommandFlags, printHelp, runSwitchboardCli, sanitizeOutputValue } from "../cli/src/index.js";
 
 function captureHelp(options?: { advanced?: boolean }): string {
   const originalLog = console.log;
@@ -51,6 +51,24 @@ describe("switchboard help", () => {
     assert.doesNotMatch(deployHelp, /--record-fulfillment/);
     assert.doesNotMatch(deployHelp, /--validator-mode/);
     assert.doesNotMatch(help, /--control-plane-token-env/);
+  });
+
+  it("can run compatibility help through the exported CLI runner", async () => {
+    const originalLog = console.log;
+    const lines: string[] = [];
+    console.log = (line?: unknown) => {
+      lines.push(String(line ?? ""));
+    };
+
+    try {
+      await runSwitchboardCli(["--help"], { contextStorePath: "/tmp/switchboard-test-contexts.json" });
+    } finally {
+      console.log = originalLog;
+    }
+
+    const help = lines.join("\n");
+    assert.match(help, /Switchboard, a PROOF project/);
+    assert.match(help, /switchboard launch-demo --yes-spend/);
   });
 
   it("rejects removed public deploy and status flags", () => {

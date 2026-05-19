@@ -137,6 +137,36 @@ describe("switchboard deploy helper script resolution", () => {
     }
   });
 
+  it("prefers relay readback hostnames over funding helper fallbacks", async () => {
+    const workDir = await mkdtemp(path.join(tmpdir(), "switchboard-workload-hostnames-"));
+
+    try {
+      const mod = await importDeployRunnerWithWorkDir(workDir);
+      const funding = {
+        endpointHostname: "e-funded.acurast.ingress.directory"
+      };
+      const status = {
+        ok: true,
+        intent: {
+          endpointHostname: "e-readback.acurast.ingress.directory",
+          validationHostname: "e-readback.acurast.ingress.directory"
+        }
+      };
+
+      assert.deepEqual(mod.deploymentIntentHostnamesFromRecords(funding, status), {
+        hostname: "e-readback.acurast.ingress.directory",
+        validationHostname: "e-readback.acurast.ingress.directory"
+      });
+      assert.deepEqual(mod.deploymentIntentHostnamesFromRecords(funding), {
+        hostname: "e-funded.acurast.ingress.directory",
+        validationHostname: "e-funded.acurast.ingress.directory"
+      });
+      assert.deepEqual(mod.deploymentIntentHostnamesFromRecords(undefined, { ok: true, intent: {} }), {});
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+
   it("parses and validates precreated deployment-intent payloads fail-closed", async () => {
     const workDir = await mkdtemp(path.join(tmpdir(), "switchboard-workload-precreated-"));
 
@@ -306,6 +336,10 @@ async function importDeployRunnerWithWorkDir(workDir: string): Promise<{
     input: { jobId: string; processorId: string }
   ) => Record<string, unknown>;
   buildDeploymentIntentGroupCreateBody: (config: Record<string, unknown>) => Record<string, unknown>;
+  deploymentIntentHostnamesFromRecords: (
+    funding: Record<string, unknown> | undefined,
+    status?: Record<string, unknown>
+  ) => { hostname?: string; validationHostname?: string };
   parsePrecreatedDeployIntentPayloadJson: (raw: string) => Record<string, any>;
   parsePrecreatedDeployGroupPayloadJson: (raw: string) => Record<string, any>;
   validatePrecreatedDeployIntentPayload: (

@@ -3,6 +3,9 @@ import path from "node:path";
 import { describe, it } from "node:test";
 
 import {
+  DEFAULT_ACURAST_IPFS_API_KEY,
+  DEFAULT_ACURAST_IPFS_URL,
+  acurastSdkIpfsUploadConfig,
   buildAcurastSdkEnvVars,
   buildAcurastSdkProjectConfig,
   type AcurastSdkSubmitActionPayload
@@ -78,5 +81,19 @@ describe("Acurast SDK submit adapter builders", () => {
       () => buildAcurastSdkEnvVars({ ACURAST_INCLUDE_ENV: "MISSING_TOKEN" }, actionPayload),
       /MISSING_TOKEN is listed in ACURAST_INCLUDE_ENV but is not set/
     );
+  });
+
+  it("mirrors acurast-cli IPFS upload defaults while allowing overrides", () => {
+    assert.deepEqual(acurastSdkIpfsUploadConfig({}), {
+      endpoint: DEFAULT_ACURAST_IPFS_URL,
+      apiKey: DEFAULT_ACURAST_IPFS_API_KEY
+    });
+    assert.deepEqual(acurastSdkIpfsUploadConfig({
+      ACURAST_IPFS_URL: "https://ipfs.example.test",
+      ACURAST_IPFS_API_KEY: "test-key"
+    }), {
+      endpoint: "https://ipfs.example.test",
+      apiKey: "test-key"
+    });
   });
 });

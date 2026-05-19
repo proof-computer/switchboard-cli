@@ -16,3 +16,6 @@ dist/acurast/
 .control-plane/
 .operator-host/
 *.log
+
+# Switchboard CLI
+.switchboard

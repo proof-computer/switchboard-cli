@@ -1,0 +1,12 @@
+{
+  "project": "switchboard-demo",
+  "context": "mainnet",
+  "acurast": {
+    "project": "switchboard-demo",
+    "network": "mainnet"
+  },
+  "deploy": {
+    "durationMinutes": 60,
+    "scheduleBufferMinutes": 10
+  }
+}

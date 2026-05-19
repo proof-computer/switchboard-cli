@@ -492,6 +492,65 @@ describe("switchboard launch-demo workflow shell", () => {
     });
   });
 
+  it("uses the Acurast IPFS proxy defaults when upload credentials are missing", async () => {
+    const operatorId = hex32("aa");
+    const processorId = hex32("11");
+    const report = launchDemoCapacityReport({ operatorId, gatewayId: "gateway-demo-missing-ipfs", processorId, routeStateAvailable: true });
+
+    await withControlPlane([report], async ({ baseUrl, manifestSigner, createIntentRequests }) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-launch-demo-missing-ipfs-"));
+      const demoPackage = await mkDemoPackage(cwd);
+      try {
+        const fakeBin = path.join(cwd, "fake-bin");
+        const runDir = path.join(cwd, "run");
+        const observedPath = path.join(cwd, "observed-runner.json");
+        await mkdir(fakeBin, { recursive: true });
+        await writeFakeNpm(path.join(fakeBin, "npm"));
+        await writeFakePnpm(path.join(fakeBin, "pnpm"), observedPath, {
+          ok: true,
+          deploymentId: "59400",
+          sessionId: `0x${"44".repeat(32)}`,
+          hostname: "e-demo-default-ipfs.acurast.ingress.test"
+        });
+        const result = await runCli(cwd, [
+          "launch-demo",
+          "--yes-spend",
+          "--json",
+          "--manifest-url",
+          `${baseUrl}/v1/network-manifest`,
+          "--manifest-signer",
+          manifestSigner,
+          "--relay-url",
+          baseUrl,
+          "--demo-package",
+          `file:${demoPackage}`,
+          "--operator-id",
+          operatorId,
+          "--processor",
+          processorId,
+          "--quote-preview-timeout-ms",
+          "1000",
+          "--run-dir",
+          runDir
+        ], {
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          SWITCHBOARD_FAKE_RUN_DIR: runDir,
+          SWITCHBOARD_FAKE_ACURAST_SDK_SUBMIT_JSON: JSON.stringify({ deploymentId: "59400", txHash: "0xdeploy" }),
+          ACURAST_IPFS_URL: "",
+          ACURAST_IPFS_API_KEY: ""
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.ok, true);
+        assert.equal(output.workflow.data.actionReceipts.at(-1).receipt.adapter, "acurast-sdk");
+        assert.equal(createIntentRequests.length, 1);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("runs the single-replica compatibility runner from deploy_action_required and records the runner receipt", async () => {
     const operatorId = hex32("aa");
     const processorId = hex32("11");
@@ -535,7 +594,9 @@ describe("switchboard launch-demo workflow shell", () => {
         ], {
           PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
           SWITCHBOARD_FAKE_RUN_DIR: runDir,
-          SWITCHBOARD_FAKE_ACURAST_SDK_SUBMIT_JSON: JSON.stringify({ deploymentId: "59401", txHash: "0xdeploy" })
+          SWITCHBOARD_FAKE_ACURAST_SDK_SUBMIT_JSON: JSON.stringify({ deploymentId: "59401", txHash: "0xdeploy" }),
+          ACURAST_IPFS_URL: "https://ipfs.example.test",
+          ACURAST_IPFS_API_KEY: "test-api-key"
         });
 
         assert.equal(result.code, 0, result.stderr);
@@ -555,6 +616,70 @@ describe("switchboard launch-demo workflow shell", () => {
         assert.equal(savedSnapshot.step, "complete");
         assert.equal(savedSnapshot.data.actionReceipts.at(-1).receipt.deploymentId, "59401");
         assert.equal(savedSnapshot.data.deploymentIntent.env.SWITCHBOARD_INTENT_TOKEN, "[redacted]");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("exits nonzero and does not print ready output when live launch-demo receives a failed SDK report", async () => {
+    const operatorId = hex32("aa");
+    const processorId = hex32("11");
+    const report = launchDemoCapacityReport({ operatorId, gatewayId: "gateway-demo-sdk-fail", processorId, routeStateAvailable: true });
+
+    await withControlPlane([report], async ({ baseUrl, manifestSigner, createIntentRequests }) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-launch-demo-sdk-fail-"));
+      const demoPackage = await mkDemoPackage(cwd);
+      try {
+        const fakeBin = path.join(cwd, "fake-bin");
+        const runDir = path.join(cwd, "run");
+        const observedPath = path.join(cwd, "observed-runner.json");
+        await mkdir(fakeBin, { recursive: true });
+        await writeFakeNpm(path.join(fakeBin, "npm"));
+        await writeFakePnpm(path.join(fakeBin, "pnpm"), observedPath, {
+          ok: true,
+          deploymentId: "59403",
+          sessionId: `0x${"44".repeat(32)}`,
+          hostname: "e-demo-sdk-fail.acurast.ingress.test"
+        });
+        const result = await runCli(cwd, [
+          "launch-demo",
+          "--yes-spend",
+          "--json",
+          "--manifest-url",
+          `${baseUrl}/v1/network-manifest`,
+          "--manifest-signer",
+          manifestSigner,
+          "--relay-url",
+          baseUrl,
+          "--demo-package",
+          `file:${demoPackage}`,
+          "--operator-id",
+          operatorId,
+          "--processor",
+          processorId,
+          "--quote-preview-timeout-ms",
+          "1000",
+          "--run-dir",
+          runDir
+        ], {
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          SWITCHBOARD_FAKE_RUN_DIR: runDir,
+          SWITCHBOARD_FAKE_ACURAST_SDK_SUBMIT_JSON: JSON.stringify({ ok: false, message: "runtime_https_not_ready" }),
+          ACURAST_IPFS_URL: "https://ipfs.example.test",
+          ACURAST_IPFS_API_KEY: "test-api-key"
+        });
+
+        assert.equal(result.code, 1);
+        assert.doesNotMatch(result.stderr, /Demo ready/);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.action, "launch-demo");
+        assert.equal(output.ok, false);
+        assert.equal(output.workflow.step, "failed");
+        assert.equal(output.requiredAction.kind, "acurast.deploy");
+        assert.equal(output.workflow.data.actionReceipts.at(-1).receipt.failure.stage, "acurast-deploy");
+        assert.equal(createIntentRequests.length, 1);
+        await assert.rejects(readFile(observedPath, "utf8"));
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -606,7 +731,9 @@ describe("switchboard launch-demo workflow shell", () => {
           runDir
         ], {
           PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
-          SWITCHBOARD_FAKE_RUN_DIR: runDir
+          SWITCHBOARD_FAKE_RUN_DIR: runDir,
+          ACURAST_IPFS_URL: "https://ipfs.example.test",
+          ACURAST_IPFS_API_KEY: "test-api-key"
         });
 
         assert.equal(result.code, 0, result.stderr);
