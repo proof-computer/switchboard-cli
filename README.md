@@ -108,7 +108,12 @@ Each catalog is verified under the `switchboard.service-catalog.v1` signature
 domain. Catalog references must name a trusted signer or pin the exact catalog
 response body with a `0x`-prefixed SHA-256 `digest`; when both are present,
 both are enforced. Catalog freshness limits are enforced before control-plane
-or relay endpoints are selected.
+URLs or relay endpoints are selected. Bootstrap-host env generation defaults
+role catalog `maxStaleSeconds` to 24 hours and accepts
+`PROOF_SERVICE_CATALOG_MAX_STALE_SECONDS`,
+`PROOF_CONTROL_API_SERVICE_CATALOG_MAX_STALE_SECONDS`, and
+`PROOF_RELAY_SERVICE_CATALOG_MAX_STALE_SECONDS` overrides for operator-managed
+mainnet hosts.
 
 Funding uses the registry address and chain ID from the verified manifest.
 Registry-bound signatures use the deployed `ProofIngress` EIP-712 domain,

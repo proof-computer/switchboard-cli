@@ -188,6 +188,37 @@ describe("switchboard bootstrap host", () => {
     assert.match(calls[0].input ?? "", /control\tPROOF_LOG_CREATE_TOKEN\tlog-create-token/);
     assert.match(calls[0].input ?? "", /control\tPROOF_CONTROL_PLANE_TOKEN\tcontrol-token/);
     assert.match(calls[0].input ?? "", /explorer\tPROOF_EXPLORER_RELAY_READ_TOKEN\tvalidation-token/);
+    const catalogRefs = catalogRefsFromRows(calls[0].input ?? "");
+    assert.equal(catalogRefs.controlApi.maxStaleSeconds, 86_400);
+    assert.equal(catalogRefs.relays.maxStaleSeconds, 86_400);
+  });
+
+  it("allows service catalog max-stale defaults and per-role overrides", async () => {
+    const { io } = makeIo();
+    const { runner, calls } = makeRunner();
+    await runBootstrapHostSubcommand({
+      flags: new Map<string, string | boolean>([
+        ["yes", true],
+        ["no-build", true],
+        ["no-push", true],
+        ["host", "ops@example.invalid"],
+        ["remote-dir", "/srv/switchboard"]
+      ]),
+      positionals: ["bootstrap", "host", "env", "apply"],
+      cwd: workDir,
+      env: {
+        ...env,
+        PROOF_SERVICE_CATALOG_MAX_STALE_SECONDS: "7200",
+        PROOF_CONTROL_API_SERVICE_CATALOG_MAX_STALE_SECONDS: "3600",
+        PROOF_RELAY_SERVICE_CATALOG_MAX_STALE_SECONDS: "5400"
+      },
+      io,
+      runner
+    });
+
+    const catalogRefs = catalogRefsFromRows(calls[0].input ?? "");
+    assert.equal(catalogRefs.controlApi.maxStaleSeconds, 3600);
+    assert.equal(catalogRefs.relays.maxStaleSeconds, 5400);
   });
 
   it("builds catalogs with the expected host defaults", async () => {
@@ -268,3 +299,11 @@ describe("switchboard bootstrap host", () => {
     assert.ok(calls[1].args.some((arg) => arg.endsWith(".control-plane/service-catalogs/")));
   });
 });
+
+function catalogRefsFromRows(input: string): { controlApi: { maxStaleSeconds: number }; relays: { maxStaleSeconds: number } } {
+  const row = input
+    .split("\n")
+    .find((line) => line.startsWith("control\tPROOF_NETWORK_MANIFEST_CATALOGS_JSON\t"));
+  assert.ok(row);
+  return JSON.parse(row.split("\t")[2]);
+}

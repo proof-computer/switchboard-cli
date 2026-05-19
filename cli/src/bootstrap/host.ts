@@ -24,6 +24,7 @@ const DEFAULT_SSH_CONFIG_FILE = "/dev/null";
 const DEFAULT_CATALOG_DIR = ".control-plane/service-catalogs";
 const DEFAULT_CATALOG_FILE = "service-catalogs.signed.json";
 const HUB_USDC = "0x0000053900000000000000000000000001200000";
+const DEFAULT_SERVICE_CATALOG_MAX_STALE_SECONDS = 86_400;
 
 const DEFAULTS = {
   chainId: "420420419",
@@ -558,18 +559,23 @@ async function buildEnvPlan(ctx: BootstrapHostContext): Promise<EnvPlan> {
   const platformJobsJson =
     val(env, "PROOF_PLATFORM_JOBS_JSON") ||
     platformJobsJsonFromRelays(relays, val(env, "PROOF_EXPLORER_PUBLIC_URL", val(env, "PROOF_EXPLORER_ENDPOINT")));
+  const defaultCatalogMaxStaleSeconds = catalogMaxStaleSeconds(env, "PROOF_SERVICE_CATALOG_MAX_STALE_SECONDS");
+  const controlApiCatalogMaxStaleSeconds =
+    catalogMaxStaleSeconds(env, "PROOF_CONTROL_API_SERVICE_CATALOG_MAX_STALE_SECONDS", defaultCatalogMaxStaleSeconds);
+  const relayCatalogMaxStaleSeconds =
+    catalogMaxStaleSeconds(env, "PROOF_RELAY_SERVICE_CATALOG_MAX_STALE_SECONDS", defaultCatalogMaxStaleSeconds);
   const catalogRefsJson = JSON.stringify({
     controlApi: {
       url: val(env, "PROOF_CONTROL_API_SERVICE_CATALOG_URL", `${controlPlaneUrl}/v1/service-catalogs/control-api`),
       signer: serviceCatalogSigner,
       required: true,
-      maxStaleSeconds: 86400
+      maxStaleSeconds: controlApiCatalogMaxStaleSeconds
     },
     relays: {
       url: val(env, "PROOF_RELAY_SERVICE_CATALOG_URL", `${controlPlaneUrl}/v1/service-catalogs/relay`),
       signer: serviceCatalogSigner,
       required: true,
-      maxStaleSeconds: 86400
+      maxStaleSeconds: relayCatalogMaxStaleSeconds
     }
   });
   const certificateAuthorizationToken =
@@ -816,6 +822,16 @@ function serializeEnvRows(rows: EnvRow[]): string {
 function val(env: NodeJS.ProcessEnv, key: string, fallback = ""): string {
   const value = env[key];
   return value && value.length > 0 ? value : fallback;
+}
+
+function catalogMaxStaleSeconds(env: NodeJS.ProcessEnv, key: string, fallback = DEFAULT_SERVICE_CATALOG_MAX_STALE_SECONDS): number {
+  const raw = val(env, key);
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${key} must be a non-negative integer number of seconds`);
+  }
+  return parsed;
 }
 
 function splitCsv(value: string): string[] {
