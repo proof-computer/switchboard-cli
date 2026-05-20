@@ -709,6 +709,7 @@ async function buildEnvPlan(ctx: BootstrapHostContext): Promise<EnvPlan> {
   emit("control", "PROOF_FULFILLMENT_SCHEDULER_AUTOSTART", "false");
   emit("control", "PROOF_FULFILLMENT_SCHEDULER_MIN_PERIOD_SECONDS", "14400");
   emit("control", "PROOF_FULFILLMENT_SCHEDULER_ALLOW_SHORT_PERIODS", "false");
+  emit("control", "PROOF_FULFILLMENT_SCHEDULER_FINAL_WINDOW_SETTLEMENT_ENABLED", "false");
 
   emit("operator", "HUB_ETH_RPC_URL", hubEthRpcUrl);
   emit("operator", "INGRESS_REGISTRY_ADDRESS", registryAddress);
