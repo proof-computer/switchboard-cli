@@ -187,10 +187,13 @@ describe("switchboard deploy pinned capacity selection", () => {
         assert.equal(output.env.ACURAST_SCRIPT_IMAGE_SHA256, "5ab35b90cd9a9f180656261ba400a135c4c01c2da4b74522118342f985c2d328");
         assert.equal(output.env.ACURAST_SCRIPT_FILES, "acurast.sh,switchboard-cargo-bootstrap.sh,switchboard-cargo-bootstrap.py,stunnel.conf,getifaddrs_override.c");
         assert.equal(output.env.ACURAST_REQUIRED_MODULES, "Shell");
+        assert.equal(output.env.ACURAST_MAX_COST_PER_EXECUTION, "100000000000");
+        assert.equal(output.env.SWITCHBOARD_QUOTE_CAP_AMOUNT, undefined);
         assert.equal(output.env.SSH_AUTH_KEYS, undefined);
         assert.equal(output.runtime.kind, "script");
         assert.equal(output.runtime.authorizedKeysPresent, false);
         assert.equal(output.workflow.input.runtime.kind, "script");
+        assert.equal(output.workflow.input.quoteCapAmount, undefined);
         assert.equal(output.workflow.input.validatorMode, "skip");
         assert.equal(output.workflow.snapshot.step, "capacity_selected");
       } finally {

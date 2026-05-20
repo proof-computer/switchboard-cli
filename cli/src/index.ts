@@ -1474,6 +1474,7 @@ exec "\${SWITCHBOARD_PYTHON_BIN:-python3}" "\${PYTHON_HELPER}" "\${MODE}"
 function sshTemplateBootstrapPython(): string {
   return `#!/usr/bin/env python3
 import base64
+import ipaddress
 import json
 import os
 import socket
@@ -1656,6 +1657,54 @@ def maybe_whitelist_url(bridge, url):
         log("network-whitelist-skipped", host=host, error=str(error))
 
 
+def split_csv(value):
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def public_ipv4(value):
+    try:
+        parsed = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return None
+    if parsed.version != 4:
+        return None
+    if parsed.is_loopback or parsed.is_private or parsed.is_link_local or parsed.is_multicast or parsed.is_unspecified:
+        return None
+    return str(parsed)
+
+
+def append_public_ip(values, value):
+    parsed = public_ipv4(value)
+    if parsed and parsed not in values:
+        values.append(parsed)
+
+
+def public_ip_from_url(bridge, url):
+    maybe_whitelist_url(bridge, url)
+    request = urllib.request.Request(url, headers={"accept": "text/plain"}, method="GET")
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return response.read().decode("utf8").strip()
+
+
+def discover_upstream_ips(config, bridge):
+    values = []
+    for name in ("SWITCHBOARD_UPSTREAM_IPS", "SWITCHBOARD_UPSTREAM_IP", "SWITCHBOARD_PUBLIC_IP", "ACURAST_PUBLIC_IP"):
+        for candidate in split_csv(config.get(name) or os.environ.get(name)):
+            append_public_ip(values, candidate)
+    urls = split_csv(config.get("SWITCHBOARD_PUBLIC_IP_URLS") or os.environ.get("SWITCHBOARD_PUBLIC_IP_URLS"))
+    if not urls:
+        urls = ["https://ifconfig.me/ip", "https://api.ipify.org"]
+    for url in urls:
+        if values:
+            break
+        try:
+            append_public_ip(values, public_ip_from_url(bridge, url))
+        except Exception as error:
+            log("upstream-ip-discovery-skipped", url=url, error=str(error))
+    log("upstream-ips-discovered", count=len(values), upstreamIps=values)
+    return values
+
+
 def intent_endpoint(config, suffix):
     relay_url = required(config, "SWITCHBOARD_RELAY_URL").rstrip("/")
     intent_id = urllib.parse.quote(required(config, "SWITCHBOARD_INTENT_ID"), safe="")
@@ -1678,7 +1727,7 @@ def post_health(config, state, details):
     return body
 
 
-def claim_intent(config, bridge, public_key, deployment):
+def claim_intent(config, bridge, public_key, deployment, upstream_ips):
     log("claim_start")
     token = required(config, "SWITCHBOARD_INTENT_TOKEN")
     status, body = request_json(
@@ -1688,7 +1737,7 @@ def claim_intent(config, bridge, public_key, deployment):
             "signerMode": "cargo-bridge-secp256k1",
             "publicKey": public_key,
             "deployment": deployment,
-            "upstreamIps": [],
+            "upstreamIps": upstream_ips,
             "source": {"runtime": {"kind": "cargo-shell", "deployment": deployment}},
         },
         token=token,
@@ -1874,10 +1923,11 @@ def prepare():
     deployment = bridge.deployment_id()
     log("bridge_connected")
     maybe_whitelist_url(bridge, required(config, "SWITCHBOARD_RELAY_URL"))
-    claim = claim_intent(config, bridge, public_key, deployment)
+    upstream_ips = discover_upstream_ips(config, bridge)
+    claim = claim_intent(config, bridge, public_key, deployment, upstream_ips)
     job_signer = claim.get("runtimeSigner")
     log("job-signer-ready", signerMode="cargo-bridge-secp256k1", jobSigner=job_signer)
-    post_health(config, "waiting_funding", {"runtimeSigner": job_signer})
+    post_health(config, "waiting_funding", {"runtimeSigner": job_signer, "upstreamIps": upstream_ips})
     wait_for_runtime_config(config)
     maybe_whitelist_url(bridge, required(config, "RELAY_URL"))
     register_ingress(config, bridge, job_signer)
@@ -3870,7 +3920,7 @@ function launchDemoWorkflowInputFromCli(input: {
     },
     durationSeconds: input.durationMinutes * 60,
     asset: input.manifestConfig.defaultAssetAddress,
-    quoteCapAmount: input.maxCostPerExecution,
+    quoteCapAmount: deployWorkflowQuoteCapAmount(input.flags),
     certificateMode: "job-acme",
     capacity: launchDemoWorkflowCapacity(input.selection),
     group: input.groupDeployEnabled ? {
@@ -4051,7 +4101,7 @@ function deployWorkflowInputFromCli(input: {
     entrypoint: stringFlag(input.flags, "entrypoint") ?? optionalEnv("ACURAST_ENTRYPOINT"),
     runtime: input.runtimeConfig,
     asset: input.manifestConfig.defaultAssetAddress,
-    quoteCapAmount: stringFlag(input.flags, "payment-amount") ?? input.maxCostPerExecution,
+    quoteCapAmount: deployWorkflowQuoteCapAmount(input.flags),
     certificateMode: input.certificateMode === "self-signed" ? "self-signed" : "job-acme",
     validatorMode: "skip",
     capacity,
@@ -4115,6 +4165,14 @@ function deployWorkflowAdapters(
     },
     store
   };
+}
+
+function deployWorkflowQuoteCapAmount(flags: Map<string, string | boolean>): string | undefined {
+  return (
+    stringFlag(flags, "payment-amount") ??
+    optionalEnv("SWITCHBOARD_QUOTE_CAP_AMOUNT") ??
+    optionalEnv("SWITCHBOARD_DEPLOY_EXPECTED_QUOTE_AMOUNT")
+  );
 }
 
 async function requestDeployWorkflowQuoteViaCliHelper(

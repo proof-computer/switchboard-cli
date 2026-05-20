@@ -98,12 +98,15 @@ describe("switchboard init --template ssh", () => {
       assert.match(pythonBootstrap, /signer_publicKey/);
       assert.match(pythonBootstrap, /signer_sign/);
       assert.match(pythonBootstrap, /network_whitelist/);
+      assert.match(pythonBootstrap, /discover_upstream_ips/);
+      assert.match(pythonBootstrap, /https:\/\/ifconfig\.me\/ip/);
       assert.match(pythonBootstrap, /\/runtime-signing\/claim/);
       assert.match(pythonBootstrap, /\/runtime-signing\/registration-challenge/);
       assert.match(pythonBootstrap, /\/runtime-signing\/registration/);
       assert.match(pythonBootstrap, /\/runtime-signing\/certificate-challenge/);
       assert.match(pythonBootstrap, /\/runtime-signing\/certificate/);
       assert.match(pythonBootstrap, /"signerMode": "cargo-bridge-secp256k1"/);
+      assert.match(pythonBootstrap, /"upstreamIps": upstream_ips/);
       assert.doesNotMatch(pythonBootstrap, /\/cargo\//);
       assert.match(pythonBootstrap, /python_start/);
       assert.match(pythonBootstrap, /bridge_connect_start/);
