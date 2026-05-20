@@ -99,6 +99,8 @@ describe("switchboard init --template ssh", () => {
       assert.match(pythonBootstrap, /signer_sign/);
       assert.match(pythonBootstrap, /network_whitelist/);
       assert.match(pythonBootstrap, /discover_upstream_ips/);
+      assert.match(pythonBootstrap, /hostname", "-I"/);
+      assert.match(pythonBootstrap, /"ip", "-4", "-o", "addr", "show", "scope", "global"/);
       assert.match(pythonBootstrap, /https:\/\/ifconfig\.me\/ip/);
       assert.match(pythonBootstrap, /\/runtime-signing\/claim/);
       assert.match(pythonBootstrap, /\/runtime-signing\/registration-challenge/);

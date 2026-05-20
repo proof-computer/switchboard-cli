@@ -1663,7 +1663,7 @@ def split_csv(value):
 
 def public_ipv4(value):
     try:
-        parsed = ipaddress.ip_address(str(value).strip())
+        parsed = ipaddress.ip_address(str(value).strip().split("/", 1)[0])
     except ValueError:
         return None
     if parsed.version != 4:
@@ -1679,6 +1679,49 @@ def append_public_ip(values, value):
         values.append(parsed)
 
 
+def upstream_ipv4(value):
+    try:
+        parsed = ipaddress.ip_address(str(value).strip().split("/", 1)[0])
+    except ValueError:
+        return None
+    if parsed.version != 4:
+        return None
+    if parsed.is_loopback or parsed.is_link_local or parsed.is_multicast or parsed.is_unspecified:
+        return None
+    return str(parsed)
+
+
+def append_upstream_ip(values, value):
+    parsed = upstream_ipv4(value)
+    if parsed and parsed not in values:
+        values.append(parsed)
+
+
+def command_output(args):
+    try:
+        return subprocess.check_output(args, text=True, timeout=3, stderr=subprocess.DEVNULL)
+    except Exception as error:
+        log("upstream-ip-local-discovery-skipped", command=" ".join(args), error=str(error))
+        return ""
+
+
+def local_interface_ips():
+    values = []
+    for candidate in command_output(["hostname", "-I"]).split():
+        append_upstream_ip(values, candidate)
+    for line in command_output(["ip", "-4", "-o", "addr", "show", "scope", "global"]).splitlines():
+        parts = line.split()
+        for index, part in enumerate(parts):
+            if part == "inet" and index + 1 < len(parts):
+                append_upstream_ip(values, parts[index + 1])
+    try:
+        for result in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM):
+            append_upstream_ip(values, result[4][0])
+    except Exception as error:
+        log("upstream-ip-hostname-discovery-skipped", error=str(error))
+    return values
+
+
 def public_ip_from_url(bridge, url):
     maybe_whitelist_url(bridge, url)
     request = urllib.request.Request(url, headers={"accept": "text/plain"}, method="GET")
@@ -1690,7 +1733,10 @@ def discover_upstream_ips(config, bridge):
     values = []
     for name in ("SWITCHBOARD_UPSTREAM_IPS", "SWITCHBOARD_UPSTREAM_IP", "SWITCHBOARD_PUBLIC_IP", "ACURAST_PUBLIC_IP"):
         for candidate in split_csv(config.get(name) or os.environ.get(name)):
-            append_public_ip(values, candidate)
+            append_upstream_ip(values, candidate)
+    if not values:
+        for candidate in local_interface_ips():
+            append_upstream_ip(values, candidate)
     urls = split_csv(config.get("SWITCHBOARD_PUBLIC_IP_URLS") or os.environ.get("SWITCHBOARD_PUBLIC_IP_URLS"))
     if not urls:
         urls = ["https://ifconfig.me/ip", "https://api.ipify.org"]
@@ -2576,7 +2622,9 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     groupDeployEnabled
   });
   const workflowStore = deployWorkflowStore(flags);
-  const workflow = new SwitchboardDeployWorkflow(workflowInput, deployWorkflowAdapters(workflowInput, workflowStore));
+  const workflow = new SwitchboardDeployWorkflow(workflowInput, deployWorkflowAdapters(workflowInput, workflowStore, {
+    helperEnv: contextRuntimeEnv(runtime)
+  }));
   const capacitySnapshot = await workflow.advanceOnce();
 
   if (boolFlag(flags, "dry-run")) {
@@ -4121,7 +4169,8 @@ function deployWorkflowInputFromCli(input: {
 
 function deployWorkflowAdapters(
   input: SwitchboardDeployWorkflowInput,
-  store?: ReturnType<typeof deployWorkflowStore>
+  store?: ReturnType<typeof deployWorkflowStore>,
+  options: { helperEnv?: Record<string, string | undefined> } = {}
 ): SwitchboardDeployWorkflowAdapters {
   const controlPlane = new SwitchboardControlPlaneClient({ relayUrl: input.relayUrl });
   return {
@@ -4152,10 +4201,10 @@ function deployWorkflowAdapters(
     },
     funding: {
       async requestQuote({ workflow, deploymentIntent, runtime }) {
-        return requestDeployWorkflowQuoteViaCliHelper(input, workflow, deploymentIntent, runtime);
+        return requestDeployWorkflowQuoteViaCliHelper(input, workflow, deploymentIntent, runtime, options.helperEnv);
       },
       async fundQuote({ workflow, deploymentIntent, quote, runtime }) {
-        return fundDeployWorkflowQuoteViaCliHelper(input, workflow, deploymentIntent, quote, runtime);
+        return fundDeployWorkflowQuoteViaCliHelper(input, workflow, deploymentIntent, quote, runtime, options.helperEnv);
       }
     },
     confirmation: {
@@ -4179,7 +4228,8 @@ async function requestDeployWorkflowQuoteViaCliHelper(
   input: SwitchboardDeployWorkflowInput,
   snapshot: SwitchboardDeployWorkflowSnapshot,
   deploymentIntent: DeploymentIntentBootstrap,
-  runtime: Record<string, unknown>
+  runtime: Record<string, unknown>,
+  helperEnv?: Record<string, string | undefined>
 ): Promise<QuoteResponse> {
   const helper = await resolveHubFundingHelper();
   const result = await runCliChild(helper.command, [
@@ -4198,7 +4248,7 @@ async function requestDeployWorkflowQuoteViaCliHelper(
     input.sessionLabel ?? `switchboard-${snapshot.workflowId}`
   ], {
     cwd: helper.cwd,
-    env: deployWorkflowFundingHelperEnv(input, snapshot, deploymentIntent, runtime),
+    env: deployWorkflowFundingHelperEnv(input, snapshot, deploymentIntent, runtime, helperEnv),
     stream: false
   });
   const dryRun = parseHelperJsonOutput(result.stdout, "Hub quote helper dry-run");
@@ -4228,7 +4278,8 @@ async function fundDeployWorkflowQuoteViaCliHelper(
   snapshot: SwitchboardDeployWorkflowSnapshot,
   deploymentIntent: DeploymentIntentBootstrap,
   quote: QuoteResponse,
-  runtime?: Record<string, unknown>
+  runtime?: Record<string, unknown>,
+  helperEnv?: Record<string, string | undefined>
 ): Promise<Record<string, unknown>> {
   const quoteFileDir = await mkdtemp(path.join(tmpdir(), "switchboard-workflow-quote-"));
   const quoteFile = path.join(quoteFileDir, "quote-response.json");
@@ -4254,7 +4305,7 @@ async function fundDeployWorkflowQuoteViaCliHelper(
     cwd: helper.cwd,
     env: deployWorkflowFundingHelperEnv(input, snapshot, deploymentIntent, runtime ?? {
       runtimeSigner: stringRecordField(snapshot.data.runtime, "runtimeSigner")
-    }),
+    }, helperEnv),
     stream: false
   });
   const funded = parseHelperJsonOutput(result.stdout, "Hub quote funding helper");
@@ -4278,13 +4329,15 @@ function deployWorkflowFundingHelperEnv(
   input: SwitchboardDeployWorkflowInput,
   snapshot: SwitchboardDeployWorkflowSnapshot,
   deploymentIntent: DeploymentIntentBootstrap,
-  runtime: Record<string, unknown>
+  runtime: Record<string, unknown>,
+  helperEnv: Record<string, string | undefined> = {}
 ): Record<string, string | undefined> {
   const capacity = snapshot.data.capacity && typeof snapshot.data.capacity === "object"
     ? snapshot.data.capacity as Record<string, unknown>
     : {};
   const runtimeSigner = stringRecordField(runtime, "runtimeSigner") ?? stringRecordField(snapshot.data.runtime, "runtimeSigner");
   return {
+    ...helperEnv,
     SWITCHBOARD_TARGET: input.target.name,
     INGRESS_REGISTRY_ADDRESS: input.target.registryAddress,
     HUB_ETH_RPC_URL: input.target.ethRpcUrl,
@@ -4892,7 +4945,9 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     selection
   });
   const workflowStore = deployWorkflowStore(flags);
-  const workflow = new SwitchboardDeployWorkflow(workflowInput, deployWorkflowAdapters(workflowInput, workflowStore));
+  const workflow = new SwitchboardDeployWorkflow(workflowInput, deployWorkflowAdapters(workflowInput, workflowStore, {
+    helperEnv: contextRuntimeEnv(runtime)
+  }));
   const capacitySnapshot = await workflow.advanceOnce();
   if (boolFlag(flags, "dry-run")) {
     const output = {
