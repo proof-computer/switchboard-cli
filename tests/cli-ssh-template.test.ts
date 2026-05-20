@@ -99,6 +99,10 @@ describe("switchboard init --template ssh", () => {
       assert.match(pythonBootstrap, /signer_sign/);
       assert.match(pythonBootstrap, /network_whitelist/);
       assert.match(pythonBootstrap, /discover_upstream_ips/);
+      assert.match(pythonBootstrap, /route_local_ips/);
+      assert.match(pythonBootstrap, /socket\.SOCK_DGRAM/);
+      assert.match(pythonBootstrap, /SWITCHBOARD_ROUTE_LOCAL_IP_TARGETS/);
+      assert.match(pythonBootstrap, /1\.1\.1\.1:443/);
       assert.match(pythonBootstrap, /hostname", "-I"/);
       assert.match(pythonBootstrap, /"ip", "-4", "-o", "addr", "show", "scope", "global"/);
       assert.match(pythonBootstrap, /https:\/\/ifconfig\.me\/ip/);

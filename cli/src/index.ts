@@ -1705,8 +1705,42 @@ def command_output(args):
         return ""
 
 
-def local_interface_ips():
+def route_target_endpoint(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.count(":") == 1:
+        host, port_text = text.rsplit(":", 1)
+        try:
+            return host.strip(), int(port_text)
+        except ValueError:
+            return None
+    return text, 443
+
+
+def route_local_ips(targets):
     values = []
+    for candidate in targets:
+        endpoint = route_target_endpoint(candidate)
+        if not endpoint:
+            continue
+        host, port = endpoint
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect((host, port))
+                append_upstream_ip(values, sock.getsockname()[0])
+        except Exception as error:
+            log("upstream-ip-route-discovery-skipped", target=candidate, error=str(error))
+    return values
+
+
+def local_interface_ips(config):
+    values = []
+    route_targets = split_csv(config.get("SWITCHBOARD_ROUTE_LOCAL_IP_TARGETS") or os.environ.get("SWITCHBOARD_ROUTE_LOCAL_IP_TARGETS"))
+    if not route_targets:
+        route_targets = ["1.1.1.1:443", "8.8.8.8:53"]
+    for candidate in route_local_ips(route_targets):
+        append_upstream_ip(values, candidate)
     for candidate in command_output(["hostname", "-I"]).split():
         append_upstream_ip(values, candidate)
     for line in command_output(["ip", "-4", "-o", "addr", "show", "scope", "global"]).splitlines():
@@ -1735,7 +1769,7 @@ def discover_upstream_ips(config, bridge):
         for candidate in split_csv(config.get(name) or os.environ.get(name)):
             append_upstream_ip(values, candidate)
     if not values:
-        for candidate in local_interface_ips():
+        for candidate in local_interface_ips(config):
             append_upstream_ip(values, candidate)
     urls = split_csv(config.get("SWITCHBOARD_PUBLIC_IP_URLS") or os.environ.get("SWITCHBOARD_PUBLIC_IP_URLS"))
     if not urls:
