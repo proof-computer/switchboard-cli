@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -26,6 +26,8 @@ const DEFAULT_CANARY_RPC = "wss://canarynet-ws-1.acurast-h-server-2.papers.tech"
 export const DEFAULT_ACURAST_IPFS_URL = "https://ipfs-proxy.acurast.prod.gke.papers.tech";
 export const DEFAULT_ACURAST_IPFS_API_KEY = "";
 const DEFAULT_ACURAST_MAX_NETWORK_REQUESTS = "1000";
+const ACURAST_SCRIPT_RUNTIME = "script";
+const SSH_AUTH_KEYS_ENV = "SSH_AUTH_KEYS";
 
 export interface AcurastSdkSubmitActionPayload {
   workflowId: string;
@@ -81,6 +83,8 @@ export function buildAcurastSdkProjectConfig(input: {
   processor: string;
 }): AcurastProjectConfig {
   const network = acurastNetwork(input.env);
+  const runtime = acurastRuntime(input.env);
+  const scriptRuntime = runtime === ACURAST_SCRIPT_RUNTIME;
   const executionMs = positiveInteger(input.env.ACURAST_EXECUTION_MS ?? "1200000", "ACURAST_EXECUTION_MS");
   const startDelayMs = nonNegativeInteger(input.env.ACURAST_START_DELAY_MS ?? "300000", "ACURAST_START_DELAY_MS");
   const maxAllowedStartDelayMs = nonNegativeInteger(
@@ -95,10 +99,18 @@ export function buildAcurastSdkProjectConfig(input: {
     input.env.ACURAST_MAX_COST_PER_EXECUTION ?? "40000000000",
     "ACURAST_MAX_COST_PER_EXECUTION"
   );
-  return {
+  const config: AcurastProjectConfig = {
     projectName: input.env.ACURAST_PROJECT_NAME ?? "switchboard-express",
     fileUrl: input.bundlePath,
-    entrypoint: path.basename(input.bundlePath),
+    entrypoint: scriptRuntime
+      ? requiredString(input.env.ACURAST_ENTRYPOINT, "ACURAST_ENTRYPOINT")
+      : path.basename(input.bundlePath),
+    image: scriptRuntime
+      ? {
+          url: requiredString(input.env.ACURAST_SCRIPT_IMAGE_URL, "ACURAST_SCRIPT_IMAGE_URL"),
+          sha256: requiredString(input.env.ACURAST_SCRIPT_IMAGE_SHA256, "ACURAST_SCRIPT_IMAGE_SHA256")
+        }
+      : undefined,
     network,
     onlyAttestedDevices: input.env.ACURAST_ONLY_ATTESTED_DEVICES !== "false",
     startAt: { msFromNow: startDelayMs },
@@ -129,10 +141,11 @@ export function buildAcurastSdkProjectConfig(input: {
     includeEnvironmentVariables: buildAcurastSdkEnvVars(input.env, undefined).map((item) => item.key),
     processorWhitelist: csv(input.env.ACURAST_PROCESSOR_WHITELIST),
     mutability: (input.env.ACURAST_MUTABILITY as ScriptMutability | undefined) ?? ScriptMutability.Immutable,
-    runtime: DeploymentRuntime.NodeJSWithBundle,
+    runtime: scriptRuntime ? DeploymentRuntime.Shell : DeploymentRuntime.NodeJSWithBundle,
     restartPolicy: RestartPolicy.OnFailure,
     enableDevtools: input.env.ACURAST_ENABLE_DEVTOOLS === "true"
   };
+  return config;
 }
 
 export function buildAcurastSdkEnvVars(
@@ -162,6 +175,7 @@ export function buildAcurastSdkEnvVars(
       SWITCHBOARD_DEMO_VERSION: env.SWITCHBOARD_DEMO_VERSION
     }));
   }
+  add(SSH_AUTH_KEYS_ENV, env[SSH_AUTH_KEYS_ENV]);
   for (const key of explicit) {
     const value = env[key];
     if (!value) {
@@ -220,7 +234,7 @@ async function prepareFakeSdkSubmit(input: AcurastSdkSubmitInput): Promise<Prepa
   const buildConfigPath = path.join(runDir, "acurast-config.json");
   const metadataPath = path.join(runDir, "metadata.json");
   const stageDir = path.resolve(input.env.ACURAST_STAGE_DIR ?? path.join(workDir, "dist/acurast/express-webserver"));
-  const bundlePath = path.join(stageDir, "dist/bundle.cjs");
+  const bundlePath = acurastRuntime(input.env) === ACURAST_SCRIPT_RUNTIME ? stageDir : path.join(stageDir, "dist/bundle.cjs");
   const envVars = buildAcurastSdkEnvVars(input.env, input.actionPayload);
   const config = buildAcurastSdkProjectConfig({
     env: input.env,
@@ -256,9 +270,15 @@ async function prepareSdkSubmit(input: AcurastSdkSubmitInput): Promise<PreparedS
   const buildConfigPath = path.join(runDir, "acurast-config.json");
   const metadataPath = path.join(runDir, "metadata.json");
   const stageDir = path.resolve(input.env.ACURAST_STAGE_DIR ?? path.join(workDir, "dist/acurast/express-webserver"));
-  const bundlePath = path.join(stageDir, "dist/bundle.cjs");
-  await rm(path.join(stageDir, "dist"), { recursive: true, force: true });
-  await mkdir(path.dirname(bundlePath), { recursive: true });
+  const scriptRuntime = acurastRuntime(input.env) === ACURAST_SCRIPT_RUNTIME;
+  const bundlePath = scriptRuntime ? stageDir : path.join(stageDir, "dist/bundle.cjs");
+  if (scriptRuntime) {
+    await rm(stageDir, { recursive: true, force: true });
+    await mkdir(stageDir, { recursive: true });
+  } else {
+    await rm(path.join(stageDir, "dist"), { recursive: true, force: true });
+    await mkdir(path.dirname(bundlePath), { recursive: true });
+  }
 
   const envVars = buildAcurastSdkEnvVars(input.env, input.actionPayload);
   const buildConfig = JSON.parse(envVars.find((item) => item.key === "SWITCHBOARD_CONFIG")?.value ?? "{}") as Record<string, unknown>;
@@ -280,13 +300,21 @@ async function prepareSdkSubmit(input: AcurastSdkSubmitInput): Promise<PreparedS
     capacity: input.actionPayload.capacity
   });
 
-  await buildBundle({
-    workDir,
-    entrypoint: requiredString(input.env.ACURAST_ENTRYPOINT, "ACURAST_ENTRYPOINT"),
-    bundlePath,
-    buildConfig
-  });
-  const encryptedCode = input.env.ACURAST_ENCRYPTED_CODE !== "false";
+  if (scriptRuntime) {
+    await stageScriptRuntimeFiles({
+      workDir,
+      stageDir,
+      files: acurastScriptFiles(input.env)
+    });
+  } else {
+    await buildBundle({
+      workDir,
+      entrypoint: requiredString(input.env.ACURAST_ENTRYPOINT, "ACURAST_ENTRYPOINT"),
+      bundlePath,
+      buildConfig
+    });
+  }
+  const encryptedCode = !scriptRuntime && input.env.ACURAST_ENCRYPTED_CODE !== "false";
   if (encryptedCode) {
     const codeKey = input.env[SWITCHBOARD_CODE_KEY_ENV] ?? generateSwitchboardCodeKey();
     input.env[SWITCHBOARD_CODE_KEY_ENV] = codeKey;
@@ -471,6 +499,36 @@ async function buildBundle(input: {
   }
 }
 
+async function stageScriptRuntimeFiles(input: {
+  workDir: string;
+  stageDir: string;
+  files: string[];
+}): Promise<void> {
+  for (const file of input.files) {
+    const normalized = normalizeScriptRuntimeFile(file);
+    const source = path.resolve(input.workDir, normalized);
+    const destination = path.join(input.stageDir, normalized);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await copyFile(source, destination);
+    if (normalized.endsWith(".sh")) {
+      await chmod(destination, 0o755);
+    }
+  }
+}
+
+function acurastScriptFiles(env: Record<string, string | undefined>): string[] {
+  const entrypoint = requiredString(env.ACURAST_ENTRYPOINT, "ACURAST_ENTRYPOINT");
+  return [...new Set([entrypoint, ...csv(env.ACURAST_SCRIPT_FILES)])];
+}
+
+function normalizeScriptRuntimeFile(file: string): string {
+  const normalized = path.normalize(file);
+  if (path.isAbsolute(normalized) || normalized === ".." || normalized.startsWith(`..${path.sep}`)) {
+    throw new Error(`ACURAST_SCRIPT_FILES entries must be relative project paths: ${file}`);
+  }
+  return normalized;
+}
+
 function validateActionPayload(payload: AcurastSdkSubmitActionPayload): void {
   if (!payload || typeof payload !== "object") {
     throw new Error("acurast.deploy action payload is required");
@@ -511,6 +569,14 @@ function acurastNetwork(env: Record<string, string | undefined>): "mainnet" | "c
     throw new Error(`Unsupported Acurast network: ${network}`);
   }
   return network;
+}
+
+function acurastRuntime(env: Record<string, string | undefined>): "node" | "script" {
+  const runtime = env.ACURAST_RUNTIME ?? "node";
+  if (runtime !== "node" && runtime !== ACURAST_SCRIPT_RUNTIME) {
+    throw new Error(`Unsupported Acurast runtime: ${runtime}`);
+  }
+  return runtime;
 }
 
 function acurastRpc(env: Record<string, string | undefined>): string {

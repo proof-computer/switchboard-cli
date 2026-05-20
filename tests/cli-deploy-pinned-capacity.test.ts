@@ -136,6 +136,69 @@ describe("switchboard deploy pinned capacity selection", () => {
     });
   });
 
+  it("dry-runs a generated SSH Script project without touching Acurast or Hub", async () => {
+    const operatorId = hex32("aa");
+    const processorId = hex32("11");
+    const processor = ss58(processorId);
+    const report = capacityReport({ operatorId, gatewayId: "gateway-ssh", processorId, routeStateAvailable: true });
+
+    await withControlPlane([report], async ({ baseUrl, manifestSigner }) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-ssh-project-"));
+      try {
+        const init = await runCli(cwd, [
+          "init",
+          "--template",
+          "ssh",
+          "--distro",
+          "ubuntu",
+          "--context",
+          "test",
+          "--json"
+        ]);
+        assert.equal(init.code, 0, init.stderr);
+        await writeContext(cwd, {
+          manifestUrl: `${baseUrl}/v1/network-manifest`,
+          manifestSigner,
+          operatorId,
+          relayUrl: baseUrl
+        });
+        const result = await runCli(cwd, [
+          "deploy",
+          "--dry-run",
+          "--json",
+          "--manifest-url",
+          `${baseUrl}/v1/network-manifest`,
+          "--manifest-signer",
+          manifestSigner,
+          "--relay-url",
+          baseUrl,
+          "--operator-id",
+          operatorId,
+          "--processor",
+          processor
+        ]);
+
+        assert.equal(result.code, 0, result.stderr);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.action, "deploy-dry-run");
+        assert.equal(output.env.ACURAST_RUNTIME, "script");
+        assert.equal(output.env.ACURAST_ENTRYPOINT, "acurast.sh");
+        assert.equal(output.env.ACURAST_SCRIPT_IMAGE_URL, "https://github.com/termux/proot-distro/releases/download/v4.30.1/ubuntu-questing-aarch64-pd-v4.30.1.tar.xz");
+        assert.equal(output.env.ACURAST_SCRIPT_IMAGE_SHA256, "5ab35b90cd9a9f180656261ba400a135c4c01c2da4b74522118342f985c2d328");
+        assert.equal(output.env.ACURAST_SCRIPT_FILES, "acurast.sh,switchboard-cargo-bootstrap.sh,switchboard-cargo-bootstrap.py,stunnel.conf,getifaddrs_override.c");
+        assert.equal(output.env.ACURAST_REQUIRED_MODULES, "Shell");
+        assert.equal(output.env.SSH_AUTH_KEYS, undefined);
+        assert.equal(output.runtime.kind, "script");
+        assert.equal(output.runtime.authorizedKeysPresent, false);
+        assert.equal(output.workflow.input.runtime.kind, "script");
+        assert.equal(output.workflow.input.validatorMode, "skip");
+        assert.equal(output.workflow.snapshot.step, "capacity_selected");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("does not auto-select when a gateway is explicitly pinned", async () => {
     const operatorId = hex32("aa");
     const processor = ss58(hex32("11"));

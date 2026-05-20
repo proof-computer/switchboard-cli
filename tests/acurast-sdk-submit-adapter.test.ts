@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import { describe, it } from "node:test";
+import { DeploymentRuntime } from "@acurast/sdk/types";
 
 import {
   DEFAULT_ACURAST_IPFS_API_KEY,
@@ -59,6 +60,31 @@ describe("Acurast SDK submit adapter builders", () => {
     assert.equal(config.execution.maxExecutionTimeInMs, 1200000);
   });
 
+  it("maps Switchboard script runtime to Acurast Shell with a pinned image", () => {
+    const config = buildAcurastSdkProjectConfig({
+      env: {
+        ACURAST_RUNTIME: "script",
+        ACURAST_NETWORK: "mainnet",
+        ACURAST_PROJECT_NAME: "switchboard-ssh",
+        ACURAST_ENTRYPOINT: "acurast.sh",
+        ACURAST_SCRIPT_IMAGE_URL: "https://example.test/ubuntu.tar.xz",
+        ACURAST_SCRIPT_IMAGE_SHA256: "abc123",
+        ACURAST_MAX_NETWORK_REQUESTS: "1000"
+      },
+      bundlePath: path.join("/tmp", "script-stage"),
+      processor: actionPayload.capacity.processor!
+    });
+
+    assert.equal(config.projectName, "switchboard-ssh");
+    assert.equal(config.fileUrl, path.join("/tmp", "script-stage"));
+    assert.equal(config.entrypoint, "acurast.sh");
+    assert.equal(config.runtime, DeploymentRuntime.Shell);
+    assert.deepEqual(config.image, {
+      url: "https://example.test/ubuntu.tar.xz",
+      sha256: "abc123"
+    });
+  });
+
   it("carries precreated deployment-intent env and explicit included env", () => {
     const envVars = buildAcurastSdkEnvVars({
       PORT: "3000",
@@ -74,6 +100,15 @@ describe("Acurast SDK submit adapter builders", () => {
     assert.equal(switchboardConfig.SWITCHBOARD_INTENT_TOKEN, "job-secret");
     assert.equal(switchboardConfig.SWITCHBOARD_DEMO_VERSION, "0.1.0");
     assert.equal(byKey.get("EXTRA_TOKEN"), "extra-secret");
+  });
+
+  it("includes SSH authorized keys as encrypted Acurast env when provided", () => {
+    const envVars = buildAcurastSdkEnvVars({
+      SSH_AUTH_KEYS: "ssh-ed25519 AAAATEST user@example"
+    }, actionPayload);
+    const byKey = new Map(envVars.map((item) => [item.key, item.value]));
+
+    assert.equal(byKey.get("SSH_AUTH_KEYS"), "ssh-ed25519 AAAATEST user@example");
   });
 
   it("rejects missing explicit included env without falling back to CLI harness inputs", () => {

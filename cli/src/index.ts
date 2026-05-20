@@ -4,11 +4,12 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ApiPromise, WsProvider } from "@polkadot/api";
+import { CUSTOM_TYPES, RequiredModules } from "@acurast/sdk/types";
 import { u8aToHex } from "@polkadot/util";
 import { decodeAddress, mnemonicGenerate } from "@polkadot/util-crypto";
 import { ethers } from "ethers";
@@ -34,6 +35,7 @@ import type { QuoteResponse } from "../../../switchboard-sdk/src/funding.js";
 import { SwitchboardControlPlaneClient, type DeploymentIntentBootstrap, type DeploymentIntentGroupBootstrap } from "../../../switchboard-sdk/src/control-plane.js";
 import {
   discoverManagerProcessors,
+  rpcForAcurastNetwork,
   selectReadyProcessors,
   type AcurastNetwork,
   type ProcessorInfo
@@ -151,6 +153,20 @@ const DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION = "40000000000";
 const DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS = 900;
 const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.8";
 const LAUNCH_DEMO_ENTRYPOINT = "src/server.ts";
+const SSH_TEMPLATE_NAME = "ssh";
+const SSH_TEMPLATE_DISTRO = "ubuntu";
+const SSH_TEMPLATE_ENTRYPOINT = "acurast.sh";
+const SSH_TEMPLATE_BOOTSTRAP = "switchboard-cargo-bootstrap.sh";
+const SSH_TEMPLATE_BOOTSTRAP_PY = "switchboard-cargo-bootstrap.py";
+const SSH_TEMPLATE_STUNNEL_CONFIG = "stunnel.conf";
+const SSH_TEMPLATE_GETIFADDRS_OVERRIDE = "getifaddrs_override.c";
+const SSH_TEMPLATE_AUTHORIZED_KEYS = "authorized_keys";
+const SSH_TEMPLATE_AUTHORIZED_KEYS_EXAMPLE = "authorized_keys.example";
+const SSH_AUTH_KEYS_ENV = "SSH_AUTH_KEYS";
+const ACURAST_SCRIPT_RUNTIME = "script";
+const ACURAST_NODE_RUNTIME = "node";
+export const ACURAST_UBUNTU_SCRIPT_IMAGE_URL = "https://github.com/termux/proot-distro/releases/download/v4.30.1/ubuntu-questing-aarch64-pd-v4.30.1.tar.xz";
+export const ACURAST_UBUNTU_SCRIPT_IMAGE_SHA256 = "5ab35b90cd9a9f180656261ba400a135c4c01c2da4b74522118342f985c2d328";
 const ANSI_ESCAPE_PATTERN = /\u001b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 export const PROOF_NETWORK_MANIFEST_URL = "https://control.switchboard.proof.computer/v1/network-manifest";
 export const PROOF_NETWORK_MANIFEST_SIGNER = "5EpwnRzamXpqWo3jW9h4ecSJHL9LBjR6jTMW5Wzw6p9nMTh7";
@@ -254,8 +270,19 @@ interface SwitchboardProjectConfig {
   acurast?: {
     project?: string;
     network?: string;
+    runtime?: string;
     stageDir?: string;
     entrypoint?: string;
+    scriptImage?: {
+      url?: string;
+      sha256?: string;
+    };
+    scriptFiles?: string[];
+  };
+  ssh?: {
+    distro?: string;
+    authorizedKeysFile?: string;
+    user?: string;
   };
   deploy?: {
     hostname?: string;
@@ -1042,6 +1069,15 @@ async function projectInitCommand(flags: Map<string, string | boolean>) {
     throw new Error(`${SWITCHBOARD_PROJECT_CONFIG_FILE} already exists. Pass --force to overwrite.`);
   }
 
+  const template = stringFlag(flags, "template");
+  if (template && template !== SSH_TEMPLATE_NAME) {
+    throw new Error(`Unsupported project template: ${template}. Supported templates: ${SSH_TEMPLATE_NAME}`);
+  }
+  if (template === SSH_TEMPLATE_NAME) {
+    await projectInitSshTemplateCommand(flags, { cwd, configPath, force });
+    return;
+  }
+
   const projectName = stringFlag(flags, "project") ?? stringFlag(flags, "name") ?? path.basename(cwd);
   const endpointHostname = normalizeHostnameForCli(stringFlag(flags, "endpoint") ?? stringFlag(flags, "hostname"));
   const config: SwitchboardProjectConfig = {
@@ -1100,6 +1136,869 @@ async function projectInitCommand(flags: Map<string, string | boolean>) {
       console.log(`Endpoint: ${endpointHostname}`);
     }
   });
+}
+
+async function projectInitSshTemplateCommand(
+  flags: Map<string, string | boolean>,
+  options: { cwd: string; configPath: string; force: boolean }
+): Promise<void> {
+  const distro = stringFlag(flags, "distro") ?? SSH_TEMPLATE_DISTRO;
+  if (distro !== SSH_TEMPLATE_DISTRO) {
+    throw new Error(`Unsupported SSH template distro: ${distro}. Supported distros: ${SSH_TEMPLATE_DISTRO}`);
+  }
+
+  const projectName = stringFlag(flags, "project") ?? stringFlag(flags, "name") ?? path.basename(options.cwd);
+  const endpointHostname = normalizeHostnameForCli(stringFlag(flags, "endpoint") ?? stringFlag(flags, "hostname"));
+  const authorizedKeysSource = stringFlag(flags, "ssh-public-key-file");
+  const config: SwitchboardProjectConfig = {
+    project: projectName,
+    context: stringFlag(flags, "context") ?? switchboardContextEnv(),
+    endpoint: endpointHostname
+      ? {
+          id: stringFlag(flags, "endpoint-id") ?? endpointHostname,
+          hostname: endpointHostname
+        }
+      : undefined,
+    acurast: {
+      project: stringFlag(flags, "acurast-project") ?? projectName,
+      network: stringFlag(flags, "acurast-network") ?? "mainnet",
+      runtime: ACURAST_SCRIPT_RUNTIME,
+      stageDir: stringFlag(flags, "acurast-stage-dir") ?? "dist/acurast/ssh",
+      entrypoint: SSH_TEMPLATE_ENTRYPOINT,
+      scriptImage: {
+        url: ACURAST_UBUNTU_SCRIPT_IMAGE_URL,
+        sha256: ACURAST_UBUNTU_SCRIPT_IMAGE_SHA256
+      },
+      scriptFiles: [
+        SSH_TEMPLATE_ENTRYPOINT,
+        SSH_TEMPLATE_BOOTSTRAP,
+        SSH_TEMPLATE_BOOTSTRAP_PY,
+        SSH_TEMPLATE_STUNNEL_CONFIG,
+        SSH_TEMPLATE_GETIFADDRS_OVERRIDE
+      ]
+    },
+    ssh: {
+      distro,
+      authorizedKeysFile: SSH_TEMPLATE_AUTHORIZED_KEYS,
+      user: "root"
+    },
+    deploy: {
+      hostname: endpointHostname,
+      durationMinutes: numberFlag(flags, "duration-minutes", "SWITCHBOARD_DEPLOY_DURATION_MINUTES", DEFAULT_DEPLOY_DURATION_MINUTES),
+      scheduleBufferMinutes: numberFlag(
+        flags,
+        "schedule-buffer-minutes",
+        "SWITCHBOARD_DEPLOY_SCHEDULE_BUFFER_MINUTES",
+        DEFAULT_DEPLOY_SCHEDULE_BUFFER_MINUTES
+      ),
+      operatorId: stringFlag(flags, "operator-id"),
+      processor: stringFlag(flags, "processor"),
+      paymentMode: stringFlag(flags, "payment-mode") ?? (boolFlag(flags, "quote") ? "quote" : undefined),
+      quote: boolFlag(flags, "quote") || undefined
+    }
+  };
+  pruneUndefined(config);
+
+  await mkdir(options.cwd, { recursive: true });
+  await mkdir(path.join(options.cwd, SWITCHBOARD_PROJECT_STATE_DIR), { recursive: true });
+  await writeJsonFile(options.configPath, config);
+  await writeTemplateFile(path.join(options.cwd, SSH_TEMPLATE_ENTRYPOINT), sshTemplateEntrypoint(), options.force, 0o755);
+  await writeTemplateFile(path.join(options.cwd, SSH_TEMPLATE_BOOTSTRAP), sshTemplateBootstrap(), options.force, 0o755);
+  await writeTemplateFile(path.join(options.cwd, SSH_TEMPLATE_BOOTSTRAP_PY), sshTemplateBootstrapPython(), options.force, 0o755);
+  await writeTemplateFile(path.join(options.cwd, SSH_TEMPLATE_STUNNEL_CONFIG), sshTemplateStunnelConfig(), options.force);
+  await writeTemplateFile(path.join(options.cwd, SSH_TEMPLATE_GETIFADDRS_OVERRIDE), sshTemplateGetifaddrsOverride(), options.force);
+  await writeTemplateFile(path.join(options.cwd, SSH_TEMPLATE_AUTHORIZED_KEYS_EXAMPLE), sshAuthorizedKeysExample(), options.force);
+  if (authorizedKeysSource) {
+    const keys = await readAuthorizedKeysFile(path.resolve(authorizedKeysSource));
+    await writeTemplateFile(path.join(options.cwd, SSH_TEMPLATE_AUTHORIZED_KEYS), `${keys}\n`, options.force);
+  }
+  await ensureGitignoreEntries(options.cwd, [SWITCHBOARD_PROJECT_STATE_DIR, "dist/", ".acurast/", ".env", ".env.*"]);
+
+  const files = [
+    SWITCHBOARD_PROJECT_CONFIG_FILE,
+    SSH_TEMPLATE_ENTRYPOINT,
+    SSH_TEMPLATE_BOOTSTRAP,
+    SSH_TEMPLATE_BOOTSTRAP_PY,
+    SSH_TEMPLATE_STUNNEL_CONFIG,
+    SSH_TEMPLATE_GETIFADDRS_OVERRIDE,
+    SSH_TEMPLATE_AUTHORIZED_KEYS_EXAMPLE,
+    authorizedKeysSource ? SSH_TEMPLATE_AUTHORIZED_KEYS : undefined
+  ].filter((item): item is string => Boolean(item));
+  const output = {
+    ok: true,
+    action: "project-init",
+    template: SSH_TEMPLATE_NAME,
+    distro,
+    projectRoot: options.cwd,
+    configPath: options.configPath,
+    stateDir: path.join(options.cwd, SWITCHBOARD_PROJECT_STATE_DIR),
+    files,
+    config,
+    next: [
+      `cd ${options.cwd}`,
+      `switchboard deploy --dry-run --json`,
+      `switchboard deploy --yes`
+    ]
+  };
+  writeOutput(flags, output, () => {
+    console.log("Switchboard SSH project initialized");
+    console.log(`Project: ${projectName}`);
+    console.log(`Config: ${options.configPath}`);
+    console.log(`Distro: ${distro}`);
+    console.log(`Entrypoint: ${SSH_TEMPLATE_ENTRYPOINT}`);
+    console.log(`Authorized keys: ${authorizedKeysSource ? SSH_TEMPLATE_AUTHORIZED_KEYS : `${SSH_TEMPLATE_AUTHORIZED_KEYS} (create before live deploy)`}`);
+    console.log("Next:");
+    console.log(`  cd ${options.cwd}`);
+    console.log("  switchboard deploy --dry-run --json");
+  });
+}
+
+async function writeTemplateFile(filePath: string, contents: string, force: boolean, mode?: number): Promise<void> {
+  if (!force && await fileExists(filePath)) {
+    throw new Error(`${filePath} already exists. Pass --force to overwrite.`);
+  }
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, contents, "utf8");
+  if (mode !== undefined) {
+    await chmod(filePath, mode);
+  }
+}
+
+async function readAuthorizedKeysFile(filePath: string): Promise<string> {
+  const lines = (await readFile(filePath, "utf8"))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+  if (lines.length === 0) {
+    throw new Error(`${filePath} does not contain any SSH public keys`);
+  }
+  return lines.join("\n");
+}
+
+function sshTemplateEntrypoint(): string {
+  return `#!/bin/sh
+set -eu
+
+PORT="\${PORT:-3000}"
+SWITCHBOARD_RUN_DIR="\${SWITCHBOARD_RUN_DIR:-/run/switchboard}"
+SCRIPT_PATH="$0"
+case "\${SCRIPT_PATH}" in
+  */*) SCRIPT_DIR="\${SCRIPT_PATH%/*}" ;;
+  *) SCRIPT_DIR="." ;;
+esac
+if [ -z "\${SCRIPT_DIR}" ]; then
+  SCRIPT_DIR="/"
+fi
+BOOTSTRAP_SCRIPT="\${BOOTSTRAP_SCRIPT:-\${SCRIPT_DIR}/${SSH_TEMPLATE_BOOTSTRAP}}"
+STUNNEL_TEMPLATE="\${STUNNEL_TEMPLATE:-\${SCRIPT_DIR}/${SSH_TEMPLATE_STUNNEL_CONFIG}}"
+STUNNEL_CONFIG="\${SWITCHBOARD_RUN_DIR}/stunnel.conf"
+GETIFADDRS_OVERRIDE_SO="\${GETIFADDRS_OVERRIDE_SO:-/usr/local/lib/switchboard-getifaddrs-override.so}"
+DROPBEAR_PID=""
+STUNNEL_PID=""
+
+bootstrap_log() {
+  SB_BOOT_EVENT="$1"
+  if [ -z "\${SB_BOOT_LOG_URL:-}" ] || ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+  SB_BOOT_PAYLOAD="$(printf '{"event":"%s","source":"switchboard-cargo-shell"}' "\${SB_BOOT_EVENT}")" || return 0
+  curl -fsS --max-time 5 -X POST -H 'content-type: application/json' --data "\${SB_BOOT_PAYLOAD}" "\${SB_BOOT_LOG_URL}" >/dev/null 2>&1 || true
+}
+
+on_exit() {
+  bootstrap_log exit
+  if [ -n "\${DROPBEAR_PID}" ]; then
+    kill "\${DROPBEAR_PID}" 2>/dev/null || true
+  fi
+  if [ -n "\${STUNNEL_PID}" ]; then
+    kill "\${STUNNEL_PID}" 2>/dev/null || true
+  fi
+}
+
+trap on_exit 0
+bootstrap_log entrypoint_start
+
+: "\${${SSH_AUTH_KEYS_ENV}:?${SSH_AUTH_KEYS_ENV} must contain at least one SSH public key}"
+
+/bin/sh "\${BOOTSTRAP_SCRIPT}"
+if [ -f "\${GETIFADDRS_OVERRIDE_SO}" ]; then
+  LD_PRELOAD="\${GETIFADDRS_OVERRIDE_SO}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
+  export LD_PRELOAD
+  mkdir -p /etc/profile.d
+  printf 'export LD_PRELOAD=%s\${LD_PRELOAD:+:$LD_PRELOAD}\\n' "\${GETIFADDRS_OVERRIDE_SO}" > /etc/profile.d/switchboard-ifaddrs-shim.sh
+fi
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "missing required command: $1" >&2
+    exit 78
+  fi
+}
+
+require_command dropbear
+require_command dropbearkey
+require_command sed
+STUNNEL_BIN="\${STUNNEL_BIN:-$(command -v stunnel || command -v stunnel4 || true)}"
+if [ -z "\${STUNNEL_BIN}" ]; then
+  echo "missing required command: stunnel" >&2
+  exit 78
+fi
+
+mkdir -p "\${SWITCHBOARD_RUN_DIR}"
+chmod 700 "\${SWITCHBOARD_RUN_DIR}"
+
+mkdir -p /etc/dropbear /root/.ssh
+rm -f /etc/dropbear/dropbear_*_host_key
+dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null 2>&1 || true
+dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key >/dev/null 2>&1 || true
+dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1 || true
+chmod 700 /root/.ssh
+printf '%s\\n' "\${${SSH_AUTH_KEYS_ENV}}" > /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+bootstrap_log dropbear_start
+dropbear -F -E -s -g -p 127.0.0.1:22 &
+DROPBEAR_PID="$!"
+sed "s/@PORT@/\${PORT}/g" "\${STUNNEL_TEMPLATE}" > "\${STUNNEL_CONFIG}"
+bootstrap_log stunnel_start
+"\${STUNNEL_BIN}" "\${STUNNEL_CONFIG}" &
+STUNNEL_PID="$!"
+bootstrap_log ready_start
+/bin/sh "\${BOOTSTRAP_SCRIPT}" ready
+wait "\${STUNNEL_PID}"
+`;
+}
+
+function sshTemplateBootstrap(): string {
+  return `#!/bin/sh
+set -eu
+
+MODE="\${1:-prepare}"
+SCRIPT_PATH="$0"
+case "\${SCRIPT_PATH}" in
+  */*) SCRIPT_DIR="\${SCRIPT_PATH%/*}" ;;
+  *) SCRIPT_DIR="." ;;
+esac
+if [ -z "\${SCRIPT_DIR}" ]; then
+  SCRIPT_DIR="/"
+fi
+SWITCHBOARD_RUN_DIR="\${SWITCHBOARD_RUN_DIR:-/run/switchboard}"
+PYTHON_HELPER="\${PYTHON_HELPER:-\${SCRIPT_DIR}/${SSH_TEMPLATE_BOOTSTRAP_PY}}"
+GETIFADDRS_OVERRIDE_C="\${GETIFADDRS_OVERRIDE_C:-\${SCRIPT_DIR}/${SSH_TEMPLATE_GETIFADDRS_OVERRIDE}}"
+GETIFADDRS_OVERRIDE_SO="\${GETIFADDRS_OVERRIDE_SO:-/usr/local/lib/switchboard-getifaddrs-override.so}"
+
+bootstrap_log() {
+  SB_BOOT_EVENT="$1"
+  if [ -z "\${SB_BOOT_LOG_URL:-}" ] || ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+  SB_BOOT_PAYLOAD="$(printf '{"event":"%s","source":"switchboard-cargo-shell"}' "\${SB_BOOT_EVENT}")" || return 0
+  curl -fsS --max-time 5 -X POST -H 'content-type: application/json' --data "\${SB_BOOT_PAYLOAD}" "\${SB_BOOT_LOG_URL}" >/dev/null 2>&1 || true
+}
+
+ensure_curl() {
+  if command -v curl >/dev/null 2>&1; then
+    bootstrap_log curl_ready
+    return
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends \\
+    ca-certificates \\
+    curl
+  bootstrap_log curl_ready
+}
+
+ensure_apt_deps() {
+  bootstrap_log apt_deps_start
+  if command -v python3 >/dev/null 2>&1 &&
+     command -v openssl >/dev/null 2>&1 &&
+     command -v gcc >/dev/null 2>&1 &&
+     (command -v stunnel >/dev/null 2>&1 || command -v stunnel4 >/dev/null 2>&1) &&
+     command -v dropbear >/dev/null 2>&1 &&
+     command -v dropbearkey >/dev/null 2>&1; then
+    bootstrap_log apt_deps_done
+    bootstrap_log dropbear_deps_done
+    bootstrap_log stunnel_deps_done
+    return
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends \\
+    dropbear \\
+    openssl \\
+    gcc \\
+    libc6-dev \\
+    python3 \\
+    stunnel4
+  bootstrap_log apt_deps_done
+  bootstrap_log dropbear_deps_done
+  bootstrap_log stunnel_deps_done
+}
+
+ensure_python_runtime() {
+  bootstrap_log python_runtime_start
+  mkdir -p "\${SWITCHBOARD_RUN_DIR}"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "missing required command: python3" >&2
+    exit 78
+  fi
+  SWITCHBOARD_PYTHON_BIN="$(command -v python3)"
+  export SWITCHBOARD_PYTHON_BIN
+  bootstrap_log python_runtime_done
+}
+
+ensure_getifaddrs_override() {
+  if [ -f "\${GETIFADDRS_OVERRIDE_SO}" ]; then
+    bootstrap_log shim_ready
+    return
+  fi
+  if [ ! -f "\${GETIFADDRS_OVERRIDE_C}" ]; then
+    echo "missing getifaddrs override source: \${GETIFADDRS_OVERRIDE_C}" >&2
+    exit 78
+  fi
+  mkdir -p "\$(dirname "\${GETIFADDRS_OVERRIDE_SO}")"
+  gcc -shared -fPIC -o "\${GETIFADDRS_OVERRIDE_SO}" "\${GETIFADDRS_OVERRIDE_C}"
+  chmod 755 "\${GETIFADDRS_OVERRIDE_SO}"
+  bootstrap_log shim_ready
+}
+
+ensure_curl
+ensure_apt_deps
+ensure_getifaddrs_override
+ensure_python_runtime
+exec "\${SWITCHBOARD_PYTHON_BIN:-python3}" "\${PYTHON_HELPER}" "\${MODE}"
+`;
+}
+
+function sshTemplateBootstrapPython(): string {
+  return `#!/usr/bin/env python3
+import base64
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+STATE_PATH = Path(os.environ.get("SWITCHBOARD_BOOTSTRAP_STATE", "/run/switchboard/bootstrap-state.json"))
+TLS_CERT_PATH = Path(os.environ.get("SWITCHBOARD_TLS_CERT", "/run/switchboard/tls.crt"))
+TLS_KEY_PATH = Path(os.environ.get("SWITCHBOARD_TLS_KEY", "/run/switchboard/tls.key"))
+REMOTE_BOOT_EVENTS = {
+    "python_start",
+    "bridge_connect_start",
+    "bridge_connected",
+    "claim_start",
+    "claim_done",
+    "registration_start",
+    "registration_done",
+    "certificate_start",
+    "certificate_written",
+    "health_ready",
+}
+
+
+def remote_log(event):
+    if event not in REMOTE_BOOT_EVENTS:
+        return
+    url = os.environ.get("SB_BOOT_LOG_URL")
+    if not url:
+        return
+    try:
+        data = json.dumps({"event": event, "source": "switchboard-cargo-python"}, separators=(",", ":")).encode("utf8")
+        request = urllib.request.Request(url, data=data, headers={"content-type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            response.read()
+    except Exception:
+        return
+
+
+def log(event, **details):
+    record = {"event": event, **{k: v for k, v in details.items() if v is not None}}
+    print(json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)
+    remote_log(event)
+
+
+def fail(message):
+    log("switchboard-cargo-bootstrap-failed", error=message)
+    raise SystemExit(message)
+
+
+def strip_0x(value):
+    value = str(value)
+    return value[2:] if value.startswith(("0x", "0X")) else value
+
+
+class Bridge:
+    def __init__(self, socket_name):
+        if not socket_name:
+            fail("BRIDGE_SOCKET is required for Cargo bridge signing")
+        self.socket_name = socket_name
+        self.counter = 0
+
+    @classmethod
+    def from_env(cls):
+        return cls(os.environ.get("BRIDGE_SOCKET"))
+
+    def call(self, method, params=None):
+        self.counter += 1
+        request = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or [],
+            "id": str(self.counter),
+        }
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            if self.socket_name.startswith("/"):
+                sock.connect(self.socket_name)
+            else:
+                sock.connect("\\0" + self.socket_name)
+            sock.sendall((json.dumps(request, separators=(",", ":")) + "\\n").encode("utf8"))
+            chunks = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"\\n" in chunk:
+                    break
+        response = json.loads(b"".join(chunks).decode("utf8").strip())
+        if response.get("error"):
+            raise RuntimeError(f"Cargo bridge {method} failed: {response['error']}")
+        return response.get("result")
+
+    def public_key(self):
+        result = self.call("signer_publicKey", [{"curve": "secp256k1"}])
+        key = result.get("publicKey") if isinstance(result, dict) else None
+        if not key:
+            fail("Cargo bridge signer_publicKey did not return secp256k1 publicKey")
+        return key
+
+    def deployment_id(self):
+        return self.call("deployment_id", [])
+
+    def sign_digest(self, digest):
+        result = self.call("signer_sign", [{"curve": "secp256k1", "bytes": strip_0x(digest)}])
+        signature = result.get("bytes") if isinstance(result, dict) else None
+        if not signature:
+            fail("Cargo bridge signer_sign did not return signature bytes")
+        return signature
+
+    def whitelist_host(self, host):
+        return self.call("network_whitelist", [{"host": host}])
+
+
+def load_config():
+    raw = os.environ.get("SWITCHBOARD_CONFIG") or os.environ.get("PROOF_INGRESS_CONFIG")
+    if not raw:
+        fail("SWITCHBOARD_CONFIG is required")
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        raw = base64.b64decode(raw).decode("utf8")
+    parsed = json.loads(raw)
+    return {str(k): str(v) for k, v in parsed.items() if v is not None}
+
+
+def save_state(state):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, sort_keys=True), encoding="utf8")
+    os.chmod(STATE_PATH, 0o600)
+
+
+def load_state():
+    if not STATE_PATH.exists():
+        return {"config": load_config()}
+    return json.loads(STATE_PATH.read_text(encoding="utf8"))
+
+
+def required(config, name):
+    value = config.get(name)
+    if not value:
+        fail(f"{name} is required")
+    return value
+
+
+def request_json(method, url, body=None, token=None, timeout=120):
+    headers = {"accept": "application/json"}
+    data = None
+    if body is not None:
+        headers["content-type"] = "application/json"
+        data = json.dumps(body, separators=(",", ":")).encode("utf8")
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf8")
+            return response.status, json.loads(text) if text else {}
+    except urllib.error.HTTPError as error:
+        text = error.read().decode("utf8")
+        try:
+            payload = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            payload = {"body": text}
+        return error.code, payload
+
+
+def maybe_whitelist_url(bridge, url):
+    host = urllib.parse.urlparse(url).hostname
+    if not host:
+        return
+    try:
+        bridge.whitelist_host(host)
+        log("network-whitelisted", host=host)
+    except Exception as error:
+        log("network-whitelist-skipped", host=host, error=str(error))
+
+
+def intent_endpoint(config, suffix):
+    relay_url = required(config, "SWITCHBOARD_RELAY_URL").rstrip("/")
+    intent_id = urllib.parse.quote(required(config, "SWITCHBOARD_INTENT_ID"), safe="")
+    return f"{relay_url}/v1/deployment-intents/{intent_id}{suffix}"
+
+
+def post_health(config, state, details):
+    relay_url = required(config, "SWITCHBOARD_RELAY_URL").rstrip("/")
+    intent_id = required(config, "SWITCHBOARD_INTENT_ID")
+    token = required(config, "SWITCHBOARD_INTENT_TOKEN")
+    status, body = request_json(
+        "POST",
+        f"{relay_url}/v1/deployment-intents/{intent_id}/health",
+        {"state": state, "details": details},
+        token=token,
+        timeout=int(config.get("SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", "60000")) / 1000,
+    )
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"health report failed: {status} {body}")
+    return body
+
+
+def claim_intent(config, bridge, public_key, deployment):
+    log("claim_start")
+    token = required(config, "SWITCHBOARD_INTENT_TOKEN")
+    status, body = request_json(
+        "POST",
+        intent_endpoint(config, "/runtime-signing/claim"),
+        {
+            "signerMode": "cargo-bridge-secp256k1",
+            "publicKey": public_key,
+            "deployment": deployment,
+            "upstreamIps": [],
+            "source": {"runtime": {"kind": "cargo-shell", "deployment": deployment}},
+        },
+        token=token,
+        timeout=int(config.get("SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", "60000")) / 1000,
+    )
+    if status < 200 or status >= 300:
+        fail(f"deployment intent claim failed: {status} {body}")
+    runtime_signer = body.get("runtimeSigner") or (((body.get("intent") or {}).get("public") or {}).get("runtimeSigner"))
+    if not runtime_signer:
+        fail("deployment intent runtime signing claim did not return runtimeSigner")
+    log("claim_done")
+    log("deployment-intent-claimed", intentId=required(config, "SWITCHBOARD_INTENT_ID"), runtimeSigner=runtime_signer)
+    return body
+
+
+def fetch_runtime_config(config):
+    relay_url = required(config, "SWITCHBOARD_RELAY_URL").rstrip("/")
+    intent_id = required(config, "SWITCHBOARD_INTENT_ID")
+    token = required(config, "SWITCHBOARD_INTENT_TOKEN")
+    timeout = int(config.get("SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", "60000")) / 1000
+    status, body = request_json("GET", f"{relay_url}/v1/deployment-intents/{intent_id}/runtime-config", token=token, timeout=timeout)
+    if status == 202:
+        return body
+    if status < 200 or status >= 300 or not body.get("ok"):
+        fail(f"runtime config failed: {status} {body}")
+    return body
+
+
+def apply_runtime_config(config, runtime):
+    runtime_config = runtime.get("config") or {}
+    mapping = {
+        "relayUrl": "RELAY_URL",
+        "chainId": "CHAIN_ID",
+        "registryAddress": "INGRESS_REGISTRY_ADDRESS",
+        "sessionId": "SESSION_ID",
+        "jobId": "JOB_ID",
+        "operatorId": "OPERATOR_ID",
+        "processorId": "PROCESSOR_ID",
+        "gatewayId": "GATEWAY_ID",
+        "endpointHostname": "ENDPOINT_HOSTNAME",
+    }
+    for source, target in mapping.items():
+        if runtime_config.get(source) is not None:
+            config[target] = str(runtime_config[source])
+    config["SWITCHBOARD_CERTIFICATE_MODE"] = str(runtime_config.get("certificateMode") or "job-acme")
+    certificate_hostnames = runtime_config.get("certificateHostnames") or [runtime_config.get("endpointHostname")]
+    config["SWITCHBOARD_CERTIFICATE_HOSTNAMES"] = ",".join(str(item) for item in certificate_hostnames if item)
+
+
+def wait_for_runtime_config(config):
+    retry_ms = int(config.get("SWITCHBOARD_INTENT_POLL_MS") or config.get("SWITCHBOARD_REGISTRATION_RETRY_MS") or "30000")
+    max_attempts = int(config.get("SWITCHBOARD_INTENT_MAX_ATTEMPTS") or "0")
+    attempt = 1
+    while max_attempts == 0 or attempt <= max_attempts:
+        runtime = fetch_runtime_config(config)
+        if runtime.get("ok") and runtime.get("config"):
+            apply_runtime_config(config, runtime)
+            post_health(config, "config_received", {
+                "sessionId": config.get("SESSION_ID"),
+                "endpointHostname": config.get("ENDPOINT_HOSTNAME"),
+            })
+            return runtime
+        state = runtime.get("state")
+        log("deployment-intent-waiting", attempt=attempt, state=state)
+        post_health(config, "waiting_quote" if state == "waiting_quote" else "waiting_funding", {"attempt": attempt})
+        time.sleep(retry_ms / 1000)
+        attempt += 1
+    fail("runtime config was not ready before max attempts")
+
+
+def register_ingress(config, bridge, job_signer):
+    log("registration_start")
+    post_health(config, "registering", {"attempt": 1})
+    token = required(config, "SWITCHBOARD_INTENT_TOKEN")
+    status, challenge = request_json(
+        "POST",
+        intent_endpoint(config, "/runtime-signing/registration-challenge"),
+        {},
+        token=token,
+        timeout=int(config.get("SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", "60000")) / 1000,
+    )
+    if status < 200 or status >= 300:
+        fail(f"registration challenge failed: {status} {challenge}")
+    registration = challenge.get("registration")
+    digest = challenge.get("digest")
+    if not registration or not digest:
+        fail("registration challenge response was missing registration or digest")
+    signature = bridge.sign_digest(digest)
+    status, body = request_json(
+        "POST",
+        intent_endpoint(config, "/runtime-signing/registration"),
+        {"registration": registration, "signature": signature},
+        token=token,
+        timeout=int(config.get("CONTRACT_CALL_TIMEOUT_MS", "120000")) / 1000,
+    )
+    if status < 200 or status >= 300:
+        fail(f"relay registration failed: {status} {body}")
+    post_health(config, "registered", {"sessionId": config.get("SESSION_ID")})
+    log("registration_done")
+    log("registration-succeeded", relayResponse=body)
+
+
+def create_csr(hostname):
+    with tempfile.TemporaryDirectory() as tempdir:
+        key_path = Path(tempdir) / "tls.key"
+        csr_path = Path(tempdir) / "tls.csr"
+        subprocess.run([
+            "openssl",
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            f"/CN={hostname}",
+            "-addext",
+            f"subjectAltName=DNS:{hostname}",
+            "-keyout",
+            str(key_path),
+            "-out",
+            str(csr_path),
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return key_path.read_text(encoding="utf8"), csr_path.read_text(encoding="utf8")
+
+
+def request_certificates(config, bridge, job_signer):
+    if config.get("SWITCHBOARD_CERTIFICATE_MODE") != "job-acme":
+        return []
+    log("certificate_start")
+    hostnames = [item.strip().lower() for item in config.get("SWITCHBOARD_CERTIFICATE_HOSTNAMES", "").split(",") if item.strip()]
+    if not hostnames:
+        hostnames = [required(config, "ENDPOINT_HOSTNAME").strip().lower()]
+    certs = []
+    token = required(config, "SWITCHBOARD_INTENT_TOKEN")
+    for hostname in hostnames:
+        post_health(config, "certificate_requesting", {"stage": "certificate_request", "hostnames": hostnames})
+        private_key, csr = create_csr(hostname)
+        status, challenge = request_json(
+            "POST",
+            intent_endpoint(config, "/runtime-signing/certificate-challenge"),
+            {"hostname": hostname, "csrPem": csr},
+            token=token,
+            timeout=int(config.get("SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", "60000")) / 1000,
+        )
+        if status < 200 or status >= 300:
+            fail(f"certificate challenge failed for {hostname}: {status} {challenge}")
+        certificate_request = challenge.get("certificateRequest")
+        digest = challenge.get("digest")
+        if not certificate_request or not digest:
+            fail(f"certificate challenge response was missing certificateRequest or digest for {hostname}")
+        signature = bridge.sign_digest(digest)
+        status, body = request_json(
+            "POST",
+            intent_endpoint(config, "/runtime-signing/certificate"),
+            {"certificateRequest": certificate_request, "csrPem": csr, "signature": signature},
+            token=token,
+            timeout=int(config.get("SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS", "360000")) / 1000,
+        )
+        if status < 200 or status >= 300:
+            fail(f"relay certificate request failed for {hostname}: {status} {body}")
+        certificate_pem = body.get("certificatePem")
+        if not certificate_pem:
+            fail(f"relay certificate response did not include certificatePem for {hostname}")
+        certs.append({"hostname": hostname, "cert": certificate_pem, "key": private_key, "relayResponse": body})
+        log("certificate-issued", hostname=hostname, issuer=body.get("issuer"), notAfter=body.get("notAfter"))
+    return certs
+
+
+def write_tls_certificate(cert):
+    TLS_CERT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TLS_CERT_PATH.write_text(cert["cert"], encoding="utf8")
+    TLS_KEY_PATH.write_text(cert["key"], encoding="utf8")
+    os.chmod(TLS_CERT_PATH, 0o644)
+    os.chmod(TLS_KEY_PATH, 0o600)
+    log("certificate_written")
+
+
+def prepare():
+    config = load_config()
+    log("bridge_connect_start")
+    bridge = Bridge.from_env()
+    public_key = bridge.public_key()
+    deployment = bridge.deployment_id()
+    log("bridge_connected")
+    maybe_whitelist_url(bridge, required(config, "SWITCHBOARD_RELAY_URL"))
+    claim = claim_intent(config, bridge, public_key, deployment)
+    job_signer = claim.get("runtimeSigner")
+    log("job-signer-ready", signerMode="cargo-bridge-secp256k1", jobSigner=job_signer)
+    post_health(config, "waiting_funding", {"runtimeSigner": job_signer})
+    wait_for_runtime_config(config)
+    maybe_whitelist_url(bridge, required(config, "RELAY_URL"))
+    register_ingress(config, bridge, job_signer)
+    certs = request_certificates(config, bridge, job_signer)
+    if certs:
+        write_tls_certificate(certs[0])
+    save_state({"config": config, "jobSigner": job_signer, "certificates": [{"hostname": cert["hostname"]} for cert in certs]})
+
+
+def ready():
+    state = load_state()
+    config = state.get("config") or load_config()
+    post_health(config, "ready", {
+        "sessionId": config.get("SESSION_ID"),
+        "endpointHostname": config.get("ENDPOINT_HOSTNAME"),
+        "protocol": "https",
+        "applicationProtocol": "ssh",
+        "port": int(os.environ.get("PORT", "3000")),
+        "certificateHostnames": [item.strip() for item in config.get("SWITCHBOARD_CERTIFICATE_HOSTNAMES", "").split(",") if item.strip()],
+    })
+    log("health_ready")
+    log("switchboard-cargo-ready", endpointHostname=config.get("ENDPOINT_HOSTNAME"))
+
+
+def bridge_smoke():
+    bridge = Bridge.from_env()
+    public_key = bridge.public_key()
+    signature = bridge.sign_digest("0x" + "11" * 32)
+    print(json.dumps({"publicKey": public_key, "signature": signature}, sort_keys=True))
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "prepare"
+    log("python_start", mode=mode)
+    if mode == "prepare":
+        prepare()
+    elif mode == "ready":
+        ready()
+    elif mode == "bridge-smoke":
+        bridge_smoke()
+    else:
+        fail(f"unsupported bootstrap mode: {mode}")
+
+
+if __name__ == "__main__":
+    main()
+`;
+}
+
+function sshTemplateGetifaddrsOverride(): string {
+  return `#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+
+int getifaddrs(struct ifaddrs **ifap) {
+    struct ifaddrs *ifa = calloc(1, sizeof(struct ifaddrs));
+    if (!ifa) return -1;
+
+    ifa->ifa_next = NULL;
+    ifa->ifa_name = strdup("lo");
+    ifa->ifa_flags = IFF_UP | IFF_RUNNING | IFF_LOOPBACK;
+
+    struct sockaddr_in *addr = calloc(1, sizeof(struct sockaddr_in));
+    if (!addr) {
+        free(ifa->ifa_name);
+        free(ifa);
+        return -1;
+    }
+    addr->sin_family = AF_INET;
+    addr->sin_addr.s_addr = htonl(0x7f000001);
+    ifa->ifa_addr = (struct sockaddr *)addr;
+
+    struct sockaddr_in *netmask = calloc(1, sizeof(struct sockaddr_in));
+    if (!netmask) {
+        free(ifa->ifa_addr);
+        free(ifa->ifa_name);
+        free(ifa);
+        return -1;
+    }
+    netmask->sin_family = AF_INET;
+    netmask->sin_addr.s_addr = htonl(0xff000000);
+    ifa->ifa_netmask = (struct sockaddr *)netmask;
+
+    *ifap = ifa;
+    return 0;
+}
+
+void freeifaddrs(struct ifaddrs *ifa) {
+    while (ifa) {
+        struct ifaddrs *next = ifa->ifa_next;
+        free(ifa->ifa_name);
+        free(ifa->ifa_addr);
+        free(ifa->ifa_netmask);
+        free(ifa);
+        ifa = next;
+    }
+}
+`;
+}
+
+function sshTemplateStunnelConfig(): string {
+  return `foreground = yes
+pid = /tmp/stunnel.pid
+
+[ssh]
+accept = 0.0.0.0:@PORT@
+connect = 127.0.0.1:22
+cert = /run/switchboard/tls.crt
+key = /run/switchboard/tls.key
+`;
+}
+
+function sshAuthorizedKeysExample(): string {
+  return `# Add one or more SSH public keys here, then save as ${SSH_TEMPLATE_AUTHORIZED_KEYS}.
+# Example:
+# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexampleexampleexampleexampleexample user@example
+`;
 }
 
 async function projectShowCommand(flags: Map<string, string | boolean>, runtime: CliRuntime) {
@@ -2071,6 +2970,7 @@ async function selectLaunchDemoCapacity(input: {
   operatorId?: string;
   gatewayId?: string;
   processor?: string;
+  requiredModules?: string[];
 }): Promise<LaunchDemoCapacitySelection> {
   const relayUrls = input.relayUrls?.length ? input.relayUrls : [input.relayUrl];
   const reports = await readLaunchDemoCapabilityReports(relayUrls);
@@ -2152,7 +3052,13 @@ async function selectLaunchDemoCapacity(input: {
     }
   }
 
-  if (candidates.length < input.processorCount) {
+  const filteredCandidates = await filterAcurastModuleCapableMembers(candidates, {
+    network: input.network,
+    requiredModules: input.requiredModules,
+    errors
+  });
+
+  if (filteredCandidates.length < input.processorCount) {
     const reason = errors.length > 0 ? ` Checked: ${errors.slice(0, 5).join("; ")}` : "";
     const pinned = [
       input.operatorId ? `operator ${input.operatorId}` : undefined,
@@ -2161,10 +3067,10 @@ async function selectLaunchDemoCapacity(input: {
     ].filter(Boolean).join(", ");
     const scope = pinned ? ` for ${pinned}` : "";
     const source = relayUrls.length === 1 ? relayUrls[0] : `${relayUrls.length} control relays`;
-    throw new Error(`Only ${candidates.length}/${input.processorCount} launch-demo processors are currently available from ${source}${scope}.${reason}`);
+    throw new Error(`Only ${filteredCandidates.length}/${input.processorCount} launch-demo processors are currently available from ${source}${scope}.${reason}`);
   }
 
-  const selectedMembers = selectLaunchDemoCandidatePool(candidates, input.processorCount);
+  const selectedMembers = selectLaunchDemoCandidatePool(filteredCandidates, input.processorCount);
   const selectedGateways = new Set(selectedMembers.map((member) => member.gatewayId));
   if (input.processorCount > 1 && selectedGateways.size < 2) {
     throw new Error(`launch-demo --ha requires selected members across at least two gateways; selected ${selectedGateways.size}`);
@@ -2229,8 +3135,10 @@ function capabilityReportProcessorReadiness(processor: string): ProcessorInfo {
 async function selectDeployCapacity(input: {
   relayUrl: string;
   relayUrls?: string[];
+  network: AcurastNetwork;
   operatorId?: string;
   gatewayId?: string;
+  requiredModules?: string[];
 }): Promise<LaunchDemoCapacitySelection> {
   const requestedOperatorId = input.operatorId?.toLowerCase();
   const reports = await readLaunchDemoCapabilityReports(input.relayUrls?.length ? input.relayUrls : [input.relayUrl]);
@@ -2283,8 +3191,13 @@ async function selectDeployCapacity(input: {
     }
   }
 
-  candidates.sort(compareLaunchDemoMembers);
-  const selected = candidates[0];
+  const filteredCandidates = await filterAcurastModuleCapableMembers(candidates, {
+    network: input.network,
+    requiredModules: input.requiredModules,
+    errors
+  });
+  filteredCandidates.sort(compareLaunchDemoMembers);
+  const selected = filteredCandidates[0];
   if (!selected) {
     const request = [
       input.operatorId ? `operator ${input.operatorId}` : undefined,
@@ -2299,8 +3212,10 @@ async function selectDeployCapacity(input: {
 export async function selectPinnedDeployCapacity(input: {
   relayUrl: string;
   relayUrls?: string[];
+  network: AcurastNetwork;
   operatorId: string;
   processor: string;
+  requiredModules?: string[];
 }): Promise<LaunchDemoCapacitySelection> {
   const requestedOperatorId = input.operatorId.toLowerCase();
   const requestedProcessorId = processorRefToId(input.processor);
@@ -2353,8 +3268,13 @@ export async function selectPinnedDeployCapacity(input: {
     candidates.push(member);
   }
 
-  candidates.sort(compareLaunchDemoMembers);
-  const selected = candidates[0];
+  const filteredCandidates = await filterAcurastModuleCapableMembers(candidates, {
+    network: input.network,
+    requiredModules: input.requiredModules,
+    errors
+  });
+  filteredCandidates.sort(compareLaunchDemoMembers);
+  const selected = filteredCandidates[0];
   if (!selected) {
     const checked = errors.length > 0 ? ` Checked: ${errors.slice(0, 5).join("; ")}` : "";
     throw new Error(
@@ -2362,6 +3282,55 @@ export async function selectPinnedDeployCapacity(input: {
     );
   }
   return launchDemoSelectionFromMembers([selected]);
+}
+
+async function filterAcurastModuleCapableMembers(
+  members: LaunchDemoMemberSelection[],
+  input: {
+    network: AcurastNetwork;
+    requiredModules?: string[];
+    errors?: string[];
+  }
+): Promise<LaunchDemoMemberSelection[]> {
+  const requiredModules = [...new Set((input.requiredModules ?? []).filter((module) => module.length > 0))];
+  if (requiredModules.length === 0 || members.length === 0) {
+    return members;
+  }
+
+  const api = await ApiPromise.create({
+    provider: new WsProvider(rpcForAcurastNetwork(input.network)),
+    noInitWarn: true,
+    types: { ...CUSTOM_TYPES }
+  });
+  await api.isReady;
+  try {
+    const marketplace = (api.query as any).acurastMarketplace;
+    if (!marketplace?.storedAdvertisementRestriction) {
+      throw new Error("Acurast marketplace advertisement restrictions are unavailable on this network");
+    }
+    const restrictions = await marketplace.storedAdvertisementRestriction.multi(members.map((member) => member.processor));
+    return members.filter((member, index) => {
+      const availableModules = acurastAvailableModulesFromRestriction(restrictions[index]?.toJSON());
+      const missing = requiredModules.filter((module) => !availableModules.includes(module));
+      if (missing.length === 0) {
+        return true;
+      }
+      input.errors?.push(
+        `${member.gatewayId}/${member.processor}: missing Acurast module(s) ${missing.join(", ")}; advertised ${availableModules.join(", ") || "none"}`
+      );
+      return false;
+    });
+  } finally {
+    await api.disconnect().catch(() => undefined);
+  }
+}
+
+function acurastAvailableModulesFromRestriction(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return [];
+  }
+  const modules = (value as Record<string, unknown>).availableModules;
+  return Array.isArray(modules) ? modules.map(String) : [];
 }
 
 export function selectLaunchDemoMembers(candidates: LaunchDemoMemberSelection[], processorCount: number): LaunchDemoMemberSelection[] {
@@ -2972,6 +3941,75 @@ function deployGatewayOverride(flags: Map<string, string | boolean>): string | u
   );
 }
 
+type DeployRuntimeConfig =
+  | { kind: "node" }
+  | {
+      kind: "script";
+      entrypoint: string;
+      image: { url: string; sha256: string };
+      scriptFiles: string[];
+      authorizedKeysFile?: string;
+      authorizedKeys?: string;
+      authorizedKeysPresent: boolean;
+    };
+
+async function resolveDeployRuntimeConfig(
+  flags: Map<string, string | boolean>,
+  options: { dryRun: boolean; projectRoot?: string }
+): Promise<DeployRuntimeConfig> {
+  const runtime = stringFlag(flags, "runtime") ?? optionalEnv("ACURAST_RUNTIME") ?? ACURAST_NODE_RUNTIME;
+  if (runtime !== ACURAST_NODE_RUNTIME && runtime !== ACURAST_SCRIPT_RUNTIME) {
+    throw new Error(`Unsupported deploy runtime: ${runtime}. Supported runtimes: ${ACURAST_NODE_RUNTIME}, ${ACURAST_SCRIPT_RUNTIME}`);
+  }
+  if (runtime === ACURAST_NODE_RUNTIME) {
+    return { kind: "node" };
+  }
+
+  const entrypointFlag = stringFlag(flags, "entrypoint") ?? optionalEnv("ACURAST_ENTRYPOINT");
+  const entrypoint = scriptEntrypointName(entrypointFlag, options.projectRoot);
+  const imageUrl = stringFlag(flags, "script-image-url") ?? optionalEnv("ACURAST_SCRIPT_IMAGE_URL");
+  const imageSha256 = stringFlag(flags, "script-image-sha256") ?? optionalEnv("ACURAST_SCRIPT_IMAGE_SHA256");
+  if (!imageUrl || !imageSha256) {
+    throw new Error("Script runtime requires --script-image-url and --script-image-sha256, or acurast.scriptImage in switchboard.json.");
+  }
+
+  const scriptFiles = splitCsv(stringFlag(flags, "script-files") ?? optionalEnv("ACURAST_SCRIPT_FILES") ?? entrypoint);
+  const authorizedKeysFile = stringFlag(flags, "ssh-public-key-file") ?? optionalEnv("SWITCHBOARD_SSH_PUBLIC_KEY_FILE");
+  let authorizedKeys: string | undefined;
+  if (authorizedKeysFile && await fileExists(authorizedKeysFile)) {
+    authorizedKeys = await readAuthorizedKeysFile(authorizedKeysFile);
+  } else if (!options.dryRun) {
+    throw new Error("Script SSH deploy requires --ssh-public-key-file or ssh.authorizedKeysFile in switchboard.json before live deploy.");
+  }
+
+  return {
+    kind: "script",
+    entrypoint,
+    image: {
+      url: imageUrl,
+      sha256: imageSha256
+    },
+    scriptFiles,
+    authorizedKeysFile,
+    authorizedKeys,
+    authorizedKeysPresent: Boolean(authorizedKeys)
+  };
+}
+
+function scriptEntrypointName(entrypoint: string | undefined, projectRoot: string | undefined): string {
+  const value = entrypoint ?? SSH_TEMPLATE_ENTRYPOINT;
+  if (!path.isAbsolute(value)) {
+    return value;
+  }
+  if (projectRoot) {
+    const relative = path.relative(projectRoot, value);
+    if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+      return relative;
+    }
+  }
+  return path.basename(value);
+}
+
 function deployWorkflowInputFromCli(input: {
   relayUrl: string;
   manifestConfig: CliNetworkConfig;
@@ -2980,6 +4018,7 @@ function deployWorkflowInputFromCli(input: {
   certificateMode: string;
   maxCostPerExecution: string;
   operatorId: string;
+  runtimeConfig?: DeployRuntimeConfig;
   processor?: string;
   processorId?: string;
   gatewayId?: string;
@@ -3010,6 +4049,7 @@ function deployWorkflowInputFromCli(input: {
     },
     durationSeconds: input.durationMinutes * 60,
     entrypoint: stringFlag(input.flags, "entrypoint") ?? optionalEnv("ACURAST_ENTRYPOINT"),
+    runtime: input.runtimeConfig,
     asset: input.manifestConfig.defaultAssetAddress,
     quoteCapAmount: stringFlag(input.flags, "payment-amount") ?? input.maxCostPerExecution,
     certificateMode: input.certificateMode === "self-signed" ? "self-signed" : "job-acme",
@@ -3586,7 +4626,7 @@ function argValue(args: string[], name: string): string | undefined {
 }
 
 async function deployCommand(flags: Map<string, string | boolean>, runtime: CliRuntime) {
-  if (!boolFlag(flags, "yes") && optionalEnv("SWITCHBOARD_ASSUME_YES") !== "true" && optionalEnv("SWITCHBOARD_DEPLOY_ASSUME_YES") !== "true") {
+  if (!boolFlag(flags, "dry-run") && !boolFlag(flags, "yes") && optionalEnv("SWITCHBOARD_ASSUME_YES") !== "true" && optionalEnv("SWITCHBOARD_DEPLOY_ASSUME_YES") !== "true") {
     throw new Error("Refusing to run deployment without --yes");
   }
   if (!stringFlag(flags, "entrypoint") && !optionalEnv("ACURAST_ENTRYPOINT")) {
@@ -3594,6 +4634,10 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
       "switchboard deploy is for project workloads. The bundled demo moved to `switchboard launch-demo --yes-spend`; configure acurast.entrypoint in switchboard.json or pass --entrypoint for project deploys."
     );
   }
+  const deployRuntimeConfig = await resolveDeployRuntimeConfig(flags, {
+    dryRun: boolFlag(flags, "dry-run"),
+    projectRoot: runtime.projectRoot
+  });
 
   const manifestConfig = await resolveCliNetworkConfig(flags);
   for (const flag of ["hostname", "hostname-suffix", "hostname-suffixes", "domain-pool", "validation-hostname", "certificate-hostnames"]) {
@@ -3620,6 +4664,8 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
   if (scheduleBufferMinutes < 0) {
     throw new Error("schedule-buffer-minutes must be a non-negative integer");
   }
+  const acurastNetwork = launchDemoAcurastNetwork(flags);
+  const requiredAcurastModules = deployRuntimeConfig.kind === "script" && !boolFlag(flags, "dry-run") ? [RequiredModules.Shell] : [];
   const explicitOperatorId = stringFlag(flags, "operator-id") ?? optionalEnv("SWITCHBOARD_OPERATOR_ID") ?? optionalEnv("OPERATOR_ID");
   const explicitProcessor = stringFlag(flags, "processor") ?? optionalEnv("SWITCHBOARD_DEPLOY_PROCESSOR");
   const explicitGatewayId = deployGatewayOverride(flags);
@@ -3634,30 +4680,37 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     selection = await selectPinnedDeployCapacity({
       relayUrl,
       relayUrls,
+      network: acurastNetwork,
       operatorId: explicitOperatorId,
-      processor: explicitProcessor
+      processor: explicitProcessor,
+      requiredModules: requiredAcurastModules
     });
   } else if (routeActivationMode === "relay-reconciled" && explicitOperatorId && !explicitGatewayId) {
     selection = await selectDeployCapacity({
       relayUrl,
       relayUrls,
-      operatorId: explicitOperatorId
+      network: acurastNetwork,
+      operatorId: explicitOperatorId,
+      requiredModules: requiredAcurastModules
     });
   } else if (routeActivationMode === "relay-reconciled" && explicitGatewayId && !explicitOperatorId) {
     selection = await selectDeployCapacity({
       relayUrl,
       relayUrls,
-      gatewayId: explicitGatewayId
+      network: acurastNetwork,
+      gatewayId: explicitGatewayId,
+      requiredModules: requiredAcurastModules
     });
   } else if (!explicitOperatorId) {
     selection = await selectLaunchDemoCapacity({
         relayUrl,
         relayUrls,
-        network: stringFlag(flags, "network") === "canary" ? "canary" : "mainnet",
+        network: acurastNetwork,
         durationMinutes,
         scheduleBufferMinutes,
         processorCount: 1,
-        minReady: 1
+        minReady: 1,
+        requiredModules: requiredAcurastModules
     });
   }
   const operatorId = explicitOperatorId ?? selection?.operatorId;
@@ -3752,7 +4805,15 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     PROOF_CONTROL_PLANE_URL: operationRelayUrl,
     PAYMENT_ASSET_ADDRESS: manifestConfig.defaultAssetAddress,
     PROOF_QUOTE_DEFAULT_ASSET: manifestConfig.defaultAssetAddress,
-    ACURAST_ENTRYPOINT: stringFlag(flags, "entrypoint") ?? optionalEnv("ACURAST_ENTRYPOINT"),
+    SWITCHBOARD_WORK_DIR: runtime.projectRoot,
+    ACURAST_ENTRYPOINT: deployRuntimeConfig.kind === "script" ? deployRuntimeConfig.entrypoint : stringFlag(flags, "entrypoint") ?? optionalEnv("ACURAST_ENTRYPOINT"),
+    ACURAST_STAGE_DIR: stringFlag(flags, "stage-dir") ?? optionalEnv("ACURAST_STAGE_DIR"),
+    ACURAST_RUNTIME: deployRuntimeConfig.kind,
+    ACURAST_SCRIPT_IMAGE_URL: deployRuntimeConfig.kind === "script" ? deployRuntimeConfig.image.url : undefined,
+    ACURAST_SCRIPT_IMAGE_SHA256: deployRuntimeConfig.kind === "script" ? deployRuntimeConfig.image.sha256 : undefined,
+    ACURAST_SCRIPT_FILES: deployRuntimeConfig.kind === "script" ? deployRuntimeConfig.scriptFiles.join(",") : undefined,
+    ACURAST_REQUIRED_MODULES: deployRuntimeConfig.kind === "script" ? RequiredModules.Shell : undefined,
+    [SSH_AUTH_KEYS_ENV]: deployRuntimeConfig.kind === "script" ? deployRuntimeConfig.authorizedKeys : undefined,
     SWITCHBOARD_DEPLOY_PROCESSOR: explicitProcessor ?? selection?.processor,
     ACURAST_INSTANT_MATCH_PROCESSORS: explicitProcessor ?? optionalEnv("ACURAST_INSTANT_MATCH_PROCESSORS") ?? selection?.processor,
     ACURAST_MANAGER_ID: stringFlag(flags, "manager-id") ?? optionalEnv("ACURAST_MANAGER_ID") ?? selection?.managerId
@@ -3765,6 +4826,7 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     certificateMode,
     maxCostPerExecution,
     operatorId,
+    runtimeConfig: deployRuntimeConfig,
     processor: childEnv.SWITCHBOARD_DEPLOY_PROCESSOR,
     processorId: selection?.processorId,
     gatewayId: selectedGatewayId,
@@ -3783,6 +4845,7 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
       relayUrl: operationRelayUrl,
       relayCandidates: relayUrls,
       env: childEnv,
+      runtime: deployRuntimeConfig,
       manifest: {
         url: manifestConfig.manifestUrl,
         signer: manifestConfig.signer,
@@ -3833,7 +4896,8 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
     childEnv,
     runtime,
     action: "deploy",
-    json: boolFlag(flags, "json")
+    json: boolFlag(flags, "json"),
+    workDir: runtime.projectRoot
   });
   const output = deployOutput(report, reportPath, {
     relayUrl: operationRelayUrl,
@@ -7409,9 +8473,14 @@ function applyRuntimeDefaults(
   }
   setString("project", project?.acurast?.project);
   setString("network", project?.acurast?.network);
+  setString("runtime", project?.acurast?.runtime);
+  setString("script-image-url", project?.acurast?.scriptImage?.url);
+  setString("script-image-sha256", project?.acurast?.scriptImage?.sha256);
+  setString("script-files", project?.acurast?.scriptFiles?.join(","));
   setString("stage-dir", project?.acurast?.stageDir ? resolveProjectPath(runtime.projectRoot, project.acurast.stageDir) : undefined);
   if (useProjectDeployDefaults) {
     setString("entrypoint", project?.acurast?.entrypoint ? resolveProjectPath(runtime.projectRoot, project.acurast.entrypoint) : undefined);
+    setString("ssh-public-key-file", project?.ssh?.authorizedKeysFile ? resolveProjectPath(runtime.projectRoot, project.ssh.authorizedKeysFile) : undefined);
   }
 
   const context = runtime.context;
@@ -8229,9 +9298,12 @@ ${advanced ? "  switchboard session refund --session-id <bytes32> --yes\n" : ""}
 
 Project config:
   switchboard init --project <name> --endpoint <hostname> --context <name>
+  switchboard init --template ssh --distro ubuntu --project-dir ./switchboard-ssh-demo
   switchboard project show
   Directory-local config is stored in switchboard.json. Deployment state,
   latest report pointers, and local caches are stored in .switchboard/.
+  The SSH template generates an inspectable Script/Cargo project whose
+  bootstrap uses the Cargo bridge signer for registration and job-ACME.
 
 Contexts:
   switchboard context add mainnet
@@ -8349,6 +9421,10 @@ Deploy defaults:
   --yes                            Required; spends ACU and the configured Hub payment asset
   --dry-run                        Print the deploy runner command without side effects
   --entrypoint <path>              Required unless switchboard.json has acurast.entrypoint
+  --runtime <node|script>          Default node; script maps to Acurast Cargo Shell
+  --script-image-url <url>         Required for script runtime unless switchboard.json sets acurast.scriptImage.url
+  --script-image-sha256 <sha256>   Required for script runtime unless switchboard.json sets acurast.scriptImage.sha256
+  --ssh-public-key-file <path>     Authorized SSH public keys for Script SSH templates
   Canonical hostname               Relay-allocated under ingress.<tld>
   --relay-url <url>                Default ${DEFAULT_CONTROL_PLANE_URL}
   Operator/manager/processor       Auto-selected from live operator capacity unless pinned
