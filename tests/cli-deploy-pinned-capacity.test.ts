@@ -202,48 +202,86 @@ describe("switchboard deploy pinned capacity selection", () => {
     });
   });
 
-  it("does not auto-select when a gateway is explicitly pinned", async () => {
+  it("selects report-backed capacity for gateway-pinned deploys before creating intents", async () => {
     const operatorId = hex32("aa");
-    const processor = ss58(hex32("11"));
-    let capacityRequests = 0;
-
-    await withControlPlane([], async ({ baseUrl, manifestSigner }) => {
-      const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-explicit-gateway-"));
-      try {
-        const entrypoint = path.join(cwd, "index.ts");
-        await writeFile(entrypoint, "console.log('hello switchboard');\n", "utf8");
-        const result = await runCli(cwd, [
-          "deploy",
-          "--yes",
-          "--dry-run",
-          "--json",
-          "--manifest-url",
-          `${baseUrl}/v1/network-manifest`,
-          "--manifest-signer",
-          manifestSigner,
-          "--relay-url",
-          baseUrl,
-          "--entrypoint",
-          entrypoint,
-          "--operator-id",
-          operatorId,
-          "--processor",
-          processor,
-          "--gateway-id",
-          "gateway-explicit"
-        ]);
-
-        assert.equal(result.code, 0, result.stderr);
-        const output = JSON.parse(result.stdout);
-        assert.equal(output.env.SWITCHBOARD_DEPLOY_GATEWAY_ID, "gateway-explicit");
-        assert.equal(output.env.SWITCHBOARD_DEPLOY_CAPABILITY_REPORT_ID, undefined);
-        assert.equal(capacityRequests, 0);
-      } finally {
-        await rm(cwd, { recursive: true, force: true });
+    const processorId = hex32("11");
+    const processor = ss58(processorId);
+    const cases = [
+      {
+        name: "gateway-only",
+        args: ["--gateway-id", "gateway-explicit"],
+        reports: [
+          capacityReport({ operatorId: hex32("bb"), gatewayId: "gateway-other", processorId: hex32("22"), routeStateAvailable: true }),
+          capacityReport({ operatorId, gatewayId: "gateway-explicit", processorId, routeStateAvailable: true })
+        ]
+      },
+      {
+        name: "operator-gateway",
+        args: ["--operator-id", operatorId, "--gateway-id", "gateway-explicit"],
+        reports: [
+          capacityReport({ operatorId: hex32("bb"), gatewayId: "gateway-explicit", processorId: hex32("22"), routeStateAvailable: true }),
+          capacityReport({ operatorId, gatewayId: "gateway-explicit", processorId, routeStateAvailable: true })
+        ]
+      },
+      {
+        name: "operator-processor-gateway",
+        args: ["--operator-id", operatorId, "--processor", processor, "--gateway-id", "gateway-explicit"],
+        reports: [
+          capacityReport({ operatorId, gatewayId: "gateway-other", processorId, routeStateAvailable: true }),
+          capacityReport({ operatorId, gatewayId: "gateway-explicit", processorId, routeStateAvailable: true })
+        ]
       }
-    }, () => {
-      capacityRequests += 1;
-    });
+    ];
+
+    for (const testCase of cases) {
+      await withControlPlane(testCase.reports, async ({ baseUrl, manifestSigner, createIntentRequests }) => {
+        const cwd = await mkdtemp(path.join(tmpdir(), `switchboard-${testCase.name}-deploy-`));
+        try {
+          const fakeBin = path.join(cwd, "fake-bin");
+          const runDir = path.join(cwd, "run");
+          await mkdir(fakeBin, { recursive: true });
+          await writeFakePnpm(path.join(fakeBin, "pnpm"), path.join(cwd, "observed-runner.json"), {
+            ok: true,
+            deploymentId: "59450",
+            sessionId: `0x${"22".repeat(32)}`,
+            hostname: `e-${testCase.name}.acurast.ingress.test`
+          });
+          const entrypoint = path.join(cwd, "index.ts");
+          await writeFile(entrypoint, "console.log('hello switchboard');\n", "utf8");
+          const result = await runCli(cwd, [
+            "deploy",
+            "--yes",
+            "--json",
+            "--manifest-url",
+            `${baseUrl}/v1/network-manifest`,
+            "--manifest-signer",
+            manifestSigner,
+            "--relay-url",
+            baseUrl,
+            "--entrypoint",
+            entrypoint,
+            "--run-dir",
+            runDir,
+            ...testCase.args
+          ], {
+            PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+            SWITCHBOARD_FAKE_ACURAST_SDK_SUBMIT_JSON: JSON.stringify({ deploymentId: "59450", txHash: "0xdeploy" })
+          });
+
+          assert.equal(result.code, 0, `${testCase.name}: ${result.stderr}`);
+          assert.equal(createIntentRequests.length, 1);
+          assert.equal(createIntentRequests[0].operatorId, operatorId);
+          assert.equal(createIntentRequests[0].gatewayId, "gateway-explicit");
+          assert.equal(createIntentRequests[0].processorId, processorId);
+          const output = JSON.parse(result.stdout);
+          assert.equal(output.workflow.input.capacity.gatewayId, "gateway-explicit");
+          assert.equal(output.workflow.input.capacity.processorId, processorId);
+          assert.equal(output.workflow.input.capacity.operatorId, operatorId);
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    }
   });
 
   it("fails before deploy runner execution when no route-state allocation matches", async () => {
@@ -276,7 +314,8 @@ describe("switchboard deploy pinned capacity selection", () => {
         ]);
 
         assert.notEqual(result.code, 0);
-        assert.match(result.stderr, /No route-state-capable operator capacity matched pinned operator/);
+        assert.match(result.stderr, /No route-state-capable deploy capacity matched operator/);
+        assert.match(result.stderr, /processor/);
         assert.match(result.stderr, /route-state polling unavailable/);
       } finally {
         await rm(cwd, { recursive: true, force: true });

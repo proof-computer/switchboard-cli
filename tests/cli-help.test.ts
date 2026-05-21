@@ -32,7 +32,13 @@ describe("switchboard help", () => {
     assert.doesNotMatch(help, /Decrypt encrypted job logs/);
     assert.doesNotMatch(help, /log-sink/);
     assert.match(help, /Operator setup:/);
+    assert.match(help, /--generate-report-seed/);
+    assert.match(help, /--prepare-admission/);
+    assert.match(help, /--admission-file <path>/);
+    assert.match(help, /--payout-address <0xaddress>/);
+    assert.match(help, /--processor-file <path>/);
     assert.match(help, /Operator status and upgrade:/);
+    assert.match(help, /--capability-token-env <env>/);
     assert.match(help, /PROOF-required and admin commands are hidden/);
     assert.doesNotMatch(help, /Advanced session commands:/);
     assert.doesNotMatch(help, /PROOF ops commands:/);

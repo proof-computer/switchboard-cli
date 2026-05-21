@@ -172,6 +172,8 @@ export const PROOF_NETWORK_MANIFEST_URL = "https://control.switchboard.proof.com
 export const PROOF_NETWORK_MANIFEST_SIGNER = "5EpwnRzamXpqWo3jW9h4ecSJHL9LBjR6jTMW5Wzw6p9nMTh7";
 export const PROOF_MAINNET_RECORDER_COORDINATOR_ADDRESS = "0xd4dFB4AD9A4a2AfF56CCBe479F661b84947287A5";
 const INTERNAL_DEPLOY_RUNNER_SCRIPT = "switchboard:internal:deploy-runner";
+const DEPLOY_WORKFLOW_SNAPSHOT_FILE = "switchboard-deploy-workflow.snapshot.json";
+const DEPLOY_WORKFLOW_PRIVATE_SNAPSHOT_FILE = "switchboard-deploy-workflow.private.json";
 const ERC20_METADATA_ABI = [
   "function symbol() view returns (string)",
   "function decimals() view returns (uint8)"
@@ -198,6 +200,8 @@ export type CommandName =
   | "session-refundable"
   | "launch-demo"
   | "deploy"
+  | "deploy-status"
+  | "deploy-resume"
   | "deployment-status"
   | "hostname-attach"
   | "hostname-remove"
@@ -529,6 +533,16 @@ export async function runSwitchboardCli(argv: readonly string[] = process.argv.s
 
   if (parsed.command === "deploy") {
     await deployCommand(flags, runtime);
+    return;
+  }
+
+  if (parsed.command === "deploy-status") {
+    await deployWorkflowStatusCommand(flags, runtime);
+    return;
+  }
+
+  if (parsed.command === "deploy-resume") {
+    await deployWorkflowResumeCommand(flags, runtime);
     return;
   }
 
@@ -3270,9 +3284,14 @@ async function selectDeployCapacity(input: {
   network: AcurastNetwork;
   operatorId?: string;
   gatewayId?: string;
+  processor?: string;
   requiredModules?: string[];
 }): Promise<LaunchDemoCapacitySelection> {
   const requestedOperatorId = input.operatorId?.toLowerCase();
+  const requestedProcessorId = input.processor ? processorRefToId(input.processor) : undefined;
+  if (input.processor && !requestedProcessorId) {
+    throw new Error(`Cannot normalize pinned processor ${input.processor}; expected a 32-byte hex processor ID or SS58 processor address.`);
+  }
   const reports = await readLaunchDemoCapabilityReports(input.relayUrls?.length ? input.relayUrls : [input.relayUrl]);
   const errors: string[] = [];
   const candidates: LaunchDemoMemberSelection[] = [];
@@ -3296,9 +3315,16 @@ async function selectDeployCapacity(input: {
       errors.push(`${report.operator.gatewayId}: no processors in capability report`);
       continue;
     }
-    for (const processor of processors) {
+    const matchingProcessors = requestedProcessorId
+      ? processors.filter((processor) => processor.processorId === requestedProcessorId)
+      : processors;
+    if (matchingProcessors.length === 0) {
+      errors.push(`${report.operator.gatewayId}: requested processor ${input.processor} not in capability report`);
+      continue;
+    }
+    for (const processor of matchingProcessors) {
       const operatorId = report.operator.operatorId.toLowerCase();
-      const processorRef = processor.address ?? processor.processorId;
+      const processorRef = requestedProcessorId ? input.processor ?? processor.address ?? processor.processorId : processor.address ?? processor.processorId;
       candidates.push({
         memberId: `member-${candidates.length + 1}`,
         operatorId,
@@ -3333,8 +3359,9 @@ async function selectDeployCapacity(input: {
   if (!selected) {
     const request = [
       input.operatorId ? `operator ${input.operatorId}` : undefined,
-      input.gatewayId ? `gateway ${input.gatewayId}` : undefined
-    ].filter(Boolean).join(" and ") || "available operator capacity";
+      input.gatewayId ? `gateway ${input.gatewayId}` : undefined,
+      input.processor ? `processor ${input.processor}` : undefined
+    ].filter(Boolean).join(", ") || "available operator capacity";
     const checked = errors.length > 0 ? ` Checked: ${errors.slice(0, 5).join("; ")}` : "";
     throw new Error(`No route-state-capable deploy capacity matched ${request}.${checked}`);
   }
@@ -3347,73 +3374,18 @@ export async function selectPinnedDeployCapacity(input: {
   network: AcurastNetwork;
   operatorId: string;
   processor: string;
+  gatewayId?: string;
   requiredModules?: string[];
 }): Promise<LaunchDemoCapacitySelection> {
-  const requestedOperatorId = input.operatorId.toLowerCase();
-  const requestedProcessorId = processorRefToId(input.processor);
-  if (!requestedProcessorId) {
-    throw new Error(`Cannot normalize pinned processor ${input.processor}; expected a 32-byte hex processor ID or SS58 processor address.`);
-  }
-
-  const reports = await readLaunchDemoCapabilityReports(input.relayUrls?.length ? input.relayUrls : [input.relayUrl]);
-  const errors: string[] = [];
-  const candidates: LaunchDemoMemberSelection[] = [];
-
-  for (const stored of reports) {
-    const report = stored.report;
-    if (report.operator.operatorId.toLowerCase() !== requestedOperatorId) {
-      continue;
-    }
-    const reason = launchDemoReportEligibilityReason(report);
-    if (reason) {
-      errors.push(`${report.operator.gatewayId}: ${reason}`);
-      continue;
-    }
-    const processor = expandedReportProcessors(report).find((candidate) => candidate.processorId === requestedProcessorId);
-    if (!processor) {
-      errors.push(`${report.operator.gatewayId}: pinned processor not in capability report`);
-      continue;
-    }
-
-    const operatorId = report.operator.operatorId.toLowerCase();
-    const member: LaunchDemoMemberSelection = {
-      memberId: "member-1",
-      operatorId,
-      gatewayId: report.operator.gatewayId,
-      managerId: processor.managerId,
-      processor: input.processor,
-      processorId: requestedProcessorId,
-      readiness: {
-        processor: input.processor,
-        heartbeatMs: Date.now(),
-        heartbeatIso: new Date().toISOString(),
-        heartbeatAgeSeconds: 0,
-        version: "capability-report"
-      },
-      reportId: report.reportId,
-      reportExpiresAt: report.expiresAt,
-      publicAddresses: report.gateway.publicAddresses,
-      activeRouteCount: report.gateway.activeRouteCount,
-      routeCapacity: report.gateway.routeCapacity,
-      sourceRelayUrl: stored.sourceRelayUrl
-    };
-    candidates.push(member);
-  }
-
-  const filteredCandidates = await filterAcurastModuleCapableMembers(candidates, {
+  return selectDeployCapacity({
+    relayUrl: input.relayUrl,
+    relayUrls: input.relayUrls,
     network: input.network,
-    requiredModules: input.requiredModules,
-    errors
+    operatorId: input.operatorId,
+    gatewayId: input.gatewayId,
+    processor: input.processor,
+    requiredModules: input.requiredModules
   });
-  filteredCandidates.sort(compareLaunchDemoMembers);
-  const selected = filteredCandidates[0];
-  if (!selected) {
-    const checked = errors.length > 0 ? ` Checked: ${errors.slice(0, 5).join("; ")}` : "";
-    throw new Error(
-      `No route-state-capable operator capacity matched pinned operator ${input.operatorId} and processor ${input.processor}.${checked}`
-    );
-  }
-  return launchDemoSelectionFromMembers([selected]);
 }
 
 async function filterAcurastModuleCapableMembers(
@@ -4427,16 +4399,23 @@ function deployWorkflowStore(flags: Map<string, string | boolean>): { save(snaps
   const reportPath = deploymentReportPath(flags);
   const snapshotDir = runDir ?? (reportPath ? path.dirname(path.resolve(reportPath)) : undefined);
   if (!snapshotDir) return undefined;
+  return deployWorkflowStoreForDir(snapshotDir);
+}
+
+function deployWorkflowStoreForDir(snapshotDir: string): { save(snapshot: SwitchboardDeployWorkflowSnapshot): Promise<void> } {
   return {
     async save(snapshot: SwitchboardDeployWorkflowSnapshot): Promise<void> {
-      await writeDeployWorkflowSnapshot(snapshotDir, redactDeployWorkflowSnapshot(snapshot));
+      await writeDeployWorkflowSnapshots(snapshotDir, snapshot);
     }
   };
 }
 
-async function writeDeployWorkflowSnapshot(dir: string, snapshot: SwitchboardDeployWorkflowSnapshot): Promise<void> {
+async function writeDeployWorkflowSnapshots(dir: string, snapshot: SwitchboardDeployWorkflowSnapshot): Promise<void> {
   await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, "switchboard-deploy-workflow.snapshot.json"), `${JSON.stringify(jsonSafeOutput(redactDeployWorkflowSnapshot(snapshot)), null, 2)}\n`, "utf8");
+  await writeFile(path.join(dir, DEPLOY_WORKFLOW_SNAPSHOT_FILE), `${JSON.stringify(jsonSafeOutput(redactDeployWorkflowSnapshot(snapshot)), null, 2)}\n`, "utf8");
+  const privatePath = path.join(dir, DEPLOY_WORKFLOW_PRIVATE_SNAPSHOT_FILE);
+  await writeFile(privatePath, `${JSON.stringify(jsonSafeOutput(snapshot), null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await chmod(privatePath, 0o600);
 }
 
 async function saveDeployWorkflowSnapshot(
@@ -4448,7 +4427,570 @@ async function saveDeployWorkflowSnapshot(
     await store.save(snapshot);
     return;
   }
-  await writeDeployWorkflowSnapshot(path.dirname(path.resolve(reportPath)), snapshot);
+  await writeDeployWorkflowSnapshots(path.dirname(path.resolve(reportPath)), snapshot);
+}
+
+interface DeployWorkflowStateSource {
+  kind: "run-dir" | "report" | "snapshot" | "latest-report";
+  runDir?: string;
+  reportPath?: string;
+  snapshotPath: string;
+  privateSnapshotPath?: string;
+}
+
+interface LoadedDeployWorkflowState {
+  snapshot: SwitchboardDeployWorkflowSnapshot;
+  report?: Record<string, any>;
+  source: DeployWorkflowStateSource;
+  loadedSnapshotPath: string;
+  loadedPrivate: boolean;
+  tokenHydrated: boolean;
+  warnings: string[];
+}
+
+interface DeployWorkflowStatusOutput {
+  action: "deploy-status" | "deploy-resume";
+  ok: boolean;
+  phase: string;
+  workflowId: string;
+  nextAction: string;
+  warnings: string[];
+  schedule?: Record<string, unknown>;
+  readbacks: Record<string, unknown>;
+  reportPath?: string;
+}
+
+async function deployWorkflowStatusCommand(flags: Map<string, string | boolean>, runtime: CliRuntime): Promise<void> {
+  const loaded = await loadDeployWorkflowState(flags, runtime);
+  const status = await buildDeployWorkflowStatusOutput(loaded, flags, "deploy-status");
+  writeOutput(flags, status, () => printDeployWorkflowStatus(status));
+}
+
+async function deployWorkflowResumeCommand(flags: Map<string, string | boolean>, runtime: CliRuntime): Promise<void> {
+  if (!boolFlag(flags, "yes") && optionalEnv("SWITCHBOARD_ASSUME_YES") !== "true" && optionalEnv("SWITCHBOARD_DEPLOY_ASSUME_YES") !== "true") {
+    throw new Error("Refusing to resume deployment without --yes.");
+  }
+  const loaded = await loadDeployWorkflowState(flags, runtime);
+  if (loaded.snapshot.input.deploymentMode === "group") {
+    throw new Error("switchboard deploy resume supports single-replica workflows only; HA/group resume is not supported yet.");
+  }
+  assertDeployWorkflowHasPrivateIntentToken(loaded);
+
+  const snapshot = snapshotForResume(loaded.snapshot);
+  const runDir = deployWorkflowRunDir(loaded);
+  const workflowStore = deployWorkflowStoreForDir(runDir);
+  const workflow = new SwitchboardDeployWorkflow(snapshot.input, deployWorkflowAdapters(snapshot.input, workflowStore, {
+    helperEnv: contextRuntimeEnv(runtime)
+  }), snapshot);
+  const resumeEnv = deployWorkflowResumeEnv(snapshot, loaded, runtime, runDir);
+
+  let finalSnapshot: SwitchboardDeployWorkflowSnapshot;
+  if (snapshot.step === "deploy_action_required") {
+    const result = await runDeployWorkflowCompatibilityRunner({
+      workflow,
+      workflowStore,
+      childArgs: [INTERNAL_DEPLOY_RUNNER_SCRIPT, "--", "--yes", "--run-dir", runDir],
+      childEnv: resumeEnv,
+      runtime,
+      action: "deploy",
+      json: boolFlag(flags, "json"),
+      workDir: runtime.projectRoot
+    });
+    finalSnapshot = result.workflowSnapshot;
+    loaded.report = result.report;
+    loaded.source.reportPath = result.reportPath;
+  } else {
+    finalSnapshot = await runDeployWorkflowResumeToTerminalOrBlocked({
+      workflow,
+      allowLateFunding: boolFlag(flags, "allow-late-funding"),
+      report: loaded.report,
+      env: resumeEnv
+    });
+    await saveDeployWorkflowSnapshot(finalSnapshot, workflowStore, deployWorkflowReportPath(loaded, runDir));
+    await writeDeployWorkflowReportFromSnapshot(finalSnapshot, loaded, deployWorkflowReportPath(loaded, runDir));
+  }
+
+  loaded.snapshot = finalSnapshot;
+  const status = await buildDeployWorkflowStatusOutput(loaded, flags, "deploy-resume");
+  writeOutput(flags, status, () => printDeployWorkflowStatus(status));
+}
+
+function resolveDeployWorkflowStateSource(flags: Map<string, string | boolean>, runtime: CliRuntime): DeployWorkflowStateSource {
+  const runDir = stringFlag(flags, "run-dir");
+  const report = stringFlag(flags, "report");
+  const snapshot = stringFlag(flags, "snapshot");
+  const choices = [runDir, report, snapshot].filter((value): value is string => Boolean(value));
+  if (choices.length > 1) {
+    throw new Error("Use only one of --run-dir, --report, or --snapshot for deploy workflow recovery.");
+  }
+  if (runDir) {
+    const resolved = path.resolve(runDir);
+    return {
+      kind: "run-dir",
+      runDir: resolved,
+      reportPath: path.join(resolved, "report.json"),
+      snapshotPath: path.join(resolved, DEPLOY_WORKFLOW_SNAPSHOT_FILE),
+      privateSnapshotPath: path.join(resolved, DEPLOY_WORKFLOW_PRIVATE_SNAPSHOT_FILE)
+    };
+  }
+  if (report) {
+    const reportPath = path.resolve(report);
+    const dir = path.dirname(reportPath);
+    return {
+      kind: "report",
+      runDir: dir,
+      reportPath,
+      snapshotPath: path.join(dir, DEPLOY_WORKFLOW_SNAPSHOT_FILE),
+      privateSnapshotPath: path.join(dir, DEPLOY_WORKFLOW_PRIVATE_SNAPSHOT_FILE)
+    };
+  }
+  if (snapshot) {
+    const snapshotPath = path.resolve(snapshot);
+    const dir = path.dirname(snapshotPath);
+    return {
+      kind: "snapshot",
+      runDir: dir,
+      reportPath: path.join(dir, "report.json"),
+      snapshotPath,
+      privateSnapshotPath: path.basename(snapshotPath) === DEPLOY_WORKFLOW_SNAPSHOT_FILE
+        ? path.join(dir, DEPLOY_WORKFLOW_PRIVATE_SNAPSHOT_FILE)
+        : undefined
+    };
+  }
+  const latestReport = stringRecordField(runtime.projectState, "latestReport");
+  if (latestReport) {
+    const reportPath = path.resolve(runtime.projectRoot ?? process.cwd(), latestReport);
+    const dir = path.dirname(reportPath);
+    return {
+      kind: "latest-report",
+      runDir: dir,
+      reportPath,
+      snapshotPath: path.join(dir, DEPLOY_WORKFLOW_SNAPSHOT_FILE),
+      privateSnapshotPath: path.join(dir, DEPLOY_WORKFLOW_PRIVATE_SNAPSHOT_FILE)
+    };
+  }
+  throw new Error("Missing deploy workflow source. Pass --run-dir, --report, or --snapshot.");
+}
+
+async function loadDeployWorkflowState(flags: Map<string, string | boolean>, runtime: CliRuntime): Promise<LoadedDeployWorkflowState> {
+  const source = resolveDeployWorkflowStateSource(flags, runtime);
+  const warnings: string[] = [];
+  const report = source.reportPath && await fileExists(source.reportPath)
+    ? await readDeployWorkflowJsonFile(source.reportPath)
+    : undefined;
+  const privateAvailable = source.privateSnapshotPath ? await fileExists(source.privateSnapshotPath) : false;
+  const preferredSnapshotPath = privateAvailable ? source.privateSnapshotPath as string : source.snapshotPath;
+  let loadedSnapshotPath = preferredSnapshotPath;
+  let loadedPrivate = privateAvailable && preferredSnapshotPath === source.privateSnapshotPath;
+  let snapshot: SwitchboardDeployWorkflowSnapshot | undefined;
+  if (await fileExists(preferredSnapshotPath)) {
+    snapshot = await readDeployWorkflowJsonFile(preferredSnapshotPath) as SwitchboardDeployWorkflowSnapshot;
+  } else if (report?.workflow && typeof report.workflow === "object" && !Array.isArray(report.workflow)) {
+    snapshot = report.workflow as SwitchboardDeployWorkflowSnapshot;
+    loadedSnapshotPath = source.reportPath ?? preferredSnapshotPath;
+    loadedPrivate = false;
+  }
+  if (!snapshot) {
+    throw new Error(`No deploy workflow snapshot found at ${preferredSnapshotPath}`);
+  }
+  if (snapshot.version !== 1 || !snapshot.workflowId || !snapshot.input || !snapshot.data) {
+    throw new Error(`Invalid deploy workflow snapshot at ${loadedSnapshotPath}`);
+  }
+  if (!loadedPrivate && source.privateSnapshotPath) {
+    warnings.push(`Private workflow snapshot not found at ${source.privateSnapshotPath}; resume needs an unredacted local intent token.`);
+  }
+  const tokenHydrated = hydrateDeployWorkflowSnapshotFromReport(snapshot, report);
+  return { snapshot, report, source, loadedSnapshotPath, loadedPrivate, tokenHydrated, warnings };
+}
+
+async function readDeployWorkflowJsonFile(filePath: string): Promise<Record<string, any>> {
+  return JSON.parse(await readFile(filePath, "utf8")) as Record<string, any>;
+}
+
+function hydrateDeployWorkflowSnapshotFromReport(
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  report: Record<string, any> | undefined
+): boolean {
+  if (deployWorkflowIntentToken(snapshot)) {
+    return false;
+  }
+  const token =
+    stringRecordField(report?.deploymentIntent?.localSecret, "cliToken") ??
+    stringRecordField(report?.deploymentIntent, "cliToken");
+  if (!token || token === "[redacted]") {
+    return false;
+  }
+  hydrateDeploymentIntentToken(recordValue(snapshot.data.deploymentIntent), snapshot, token);
+  hydrateDeploymentIntentToken(recordValue(snapshot.requiredAction?.payload?.deploymentIntent), snapshot, token);
+  return true;
+}
+
+function hydrateDeploymentIntentToken(intent: Record<string, any>, snapshot: SwitchboardDeployWorkflowSnapshot, token: string): void {
+  if (Object.keys(intent).length === 0) return;
+  intent.cliToken = token;
+  const intentId = stringRecordField(intent, "intentId") ?? deployWorkflowIntentId(snapshot);
+  intent.env = {
+    ...recordValue(intent.env),
+    SWITCHBOARD_RELAY_URL: stringRecordField(intent.env, "SWITCHBOARD_RELAY_URL") ?? snapshot.input.relayUrl,
+    SWITCHBOARD_INTENT_ID: stringRecordField(intent.env, "SWITCHBOARD_INTENT_ID") ?? intentId,
+    SWITCHBOARD_INTENT_TOKEN: token
+  };
+  const raw = recordValue(intent.raw);
+  if (Object.keys(raw).length > 0) {
+    raw.cliToken = token;
+    raw.job = {
+      ...recordValue(raw.job),
+      token,
+      env: {
+        ...recordValue(recordValue(raw.job).env),
+        SWITCHBOARD_RELAY_URL: stringRecordField(recordValue(raw.job).env, "SWITCHBOARD_RELAY_URL") ?? snapshot.input.relayUrl,
+        SWITCHBOARD_INTENT_ID: stringRecordField(recordValue(raw.job).env, "SWITCHBOARD_INTENT_ID") ?? intentId,
+        SWITCHBOARD_INTENT_TOKEN: token
+      }
+    };
+    intent.raw = raw;
+  }
+}
+
+function assertDeployWorkflowHasPrivateIntentToken(loaded: LoadedDeployWorkflowState): void {
+  const intentId = deployWorkflowIntentId(loaded.snapshot);
+  if (!intentId || deployWorkflowIntentToken(loaded.snapshot)) {
+    return;
+  }
+  throw new Error(
+    `Missing unredacted deployment intent token for ${intentId}. Expected ${loaded.source.privateSnapshotPath ?? DEPLOY_WORKFLOW_PRIVATE_SNAPSHOT_FILE} or report.json with deploymentIntent.localSecret.cliToken.`
+  );
+}
+
+function deployWorkflowIntentRecord(snapshot: SwitchboardDeployWorkflowSnapshot): Record<string, any> {
+  const dataIntent = recordValue(snapshot.data.deploymentIntent);
+  if (stringRecordField(dataIntent, "intentId") || stringRecordField(dataIntent, "cliToken")) {
+    return dataIntent;
+  }
+  return recordValue(snapshot.requiredAction?.payload?.deploymentIntent);
+}
+
+function deployWorkflowIntentId(snapshot: SwitchboardDeployWorkflowSnapshot): string | undefined {
+  return stringRecordField(deployWorkflowIntentRecord(snapshot), "intentId");
+}
+
+function deployWorkflowIntentToken(snapshot: SwitchboardDeployWorkflowSnapshot): string | undefined {
+  const token = stringRecordField(deployWorkflowIntentRecord(snapshot), "cliToken");
+  return token && token !== "[redacted]" ? token : undefined;
+}
+
+function snapshotForResume(snapshot: SwitchboardDeployWorkflowSnapshot): SwitchboardDeployWorkflowSnapshot {
+  const clone = structuredClone(snapshot);
+  if (clone.step === "failed" && clone.requiredAction?.kind === "acurast.deploy") {
+    clone.step = "deploy_action_required";
+  }
+  return clone;
+}
+
+function deployWorkflowRunDir(loaded: LoadedDeployWorkflowState): string {
+  return loaded.source.runDir ?? path.dirname(path.resolve(loaded.source.reportPath ?? loaded.loadedSnapshotPath));
+}
+
+function deployWorkflowReportPath(loaded: LoadedDeployWorkflowState, runDir = deployWorkflowRunDir(loaded)): string {
+  return loaded.source.reportPath ?? stringRecordField(loaded.snapshot.data, "reportPath") ?? path.join(runDir, "report.json");
+}
+
+function deployWorkflowResumeEnv(
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  loaded: LoadedDeployWorkflowState,
+  runtime: CliRuntime,
+  runDir: string
+): Record<string, string | undefined> {
+  const input = snapshot.input;
+  const capacity = recordValue(snapshot.data.capacity) as SwitchboardCapacitySelection;
+  const scriptRuntime = input.runtime?.kind === "script";
+  return {
+    ...publicDeployRunnerSafetyEnv(),
+    SWITCHBOARD_DEPLOY_RUN_DIR: runDir,
+    SWITCHBOARD_DEPLOY_RELAY_URL: input.relayUrl,
+    RELAY_URL: input.relayUrl,
+    PROOF_CONTROL_PLANE_URL: input.relayUrl,
+    SWITCHBOARD_TARGET: input.target.name,
+    INGRESS_REGISTRY_ADDRESS: input.target.registryAddress,
+    HUB_ETH_RPC_URL: input.target.ethRpcUrl,
+    HUB_SUBSTRATE_WS_URL: input.target.substrateWsUrl,
+    CHAIN_ID: input.target.chainId,
+    PAYMENT_ASSET_ADDRESS: input.asset,
+    PROOF_QUOTE_DEFAULT_ASSET: input.asset,
+    OPERATOR_ID: capacity.operatorId,
+    PROCESSOR_ID: capacity.processorId,
+    GATEWAY_ID: capacity.gatewayId,
+    SWITCHBOARD_OPERATOR_ID: capacity.operatorId,
+    SWITCHBOARD_DEPLOY_PROCESSOR: capacity.processor,
+    SWITCHBOARD_DEPLOY_GATEWAY_ID: capacity.gatewayId,
+    ACURAST_INSTANT_MATCH_PROCESSORS: capacity.processor,
+    ACURAST_MANAGER_ID: capacity.managerId,
+    SWITCHBOARD_WORK_DIR: runtime.projectRoot,
+    ACURAST_ENTRYPOINT: stringRecordField(input.runtime, "entrypoint") ?? input.entrypoint,
+    ACURAST_RUNTIME: scriptRuntime ? "script" : "node",
+    ACURAST_SCRIPT_IMAGE_URL: scriptRuntime ? stringRecordField(recordValue(input.runtime?.image), "url") : undefined,
+    ACURAST_SCRIPT_IMAGE_SHA256: scriptRuntime ? stringRecordField(recordValue(input.runtime?.image), "sha256") : undefined,
+    ACURAST_SCRIPT_FILES: scriptRuntime
+      ? (Array.isArray(input.runtime?.scriptFiles) ? input.runtime.scriptFiles.filter((item): item is string => typeof item === "string").join(",") : undefined)
+      : undefined,
+    ACURAST_REQUIRED_MODULES: scriptRuntime ? RequiredModules.Shell : undefined,
+    [SSH_AUTH_KEYS_ENV]: scriptRuntime ? stringRecordField(input.runtime, "authorizedKeys") : undefined,
+    SWITCHBOARD_QUOTE_CAP_AMOUNT: input.quoteCapAmount,
+    SWITCHBOARD_DEPLOY_DURATION_MINUTES: String(Math.ceil(input.durationSeconds / 60)),
+    SWITCHBOARD_DEPLOY_CERTIFICATE_MODE: input.certificateMode,
+    SWITCHBOARD_DEPLOY_ROUTE_ACTIVATION_MODE: "relay-reconciled",
+    SWITCHBOARD_DEPLOY_VALIDATOR_MODE: input.validatorMode,
+    SWITCHBOARD_DEPLOY_REPORT_PATH: deployWorkflowReportPath(loaded, runDir)
+  };
+}
+
+async function runDeployWorkflowResumeToTerminalOrBlocked(input: {
+  workflow: SwitchboardDeployWorkflow;
+  allowLateFunding: boolean;
+  report?: Record<string, any>;
+  env: Record<string, string | undefined>;
+}): Promise<SwitchboardDeployWorkflowSnapshot> {
+  const { pollMs, timeoutMs } = deployWorkflowPollingConfig(input.env);
+  const startedAt = Date.now();
+  let snapshot = input.workflow.snapshot;
+  while (!["complete", "failed", "deploy_action_required", "funding_action_required"].includes(snapshot.step)) {
+    if ((snapshot.step === "quote_ready" || snapshot.step === "funding_action_required") && !input.allowLateFunding) {
+      const late = lateFundingWarning(snapshot, input.report);
+      if (late) {
+        throw new Error(`${late} Re-run with --allow-late-funding only if you intentionally want to fund expired evidence.`);
+      }
+    }
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error(`Timed out waiting for deploy workflow to advance from ${snapshot.step} after ${timeoutMs}ms`);
+    }
+    const before = snapshot.step;
+    snapshot = await input.workflow.advanceOnce();
+    if (snapshot.step === before) {
+      await sleep(pollMs);
+    }
+  }
+  return snapshot;
+}
+
+async function writeDeployWorkflowReportFromSnapshot(
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  loaded: LoadedDeployWorkflowState,
+  reportPath: string
+): Promise<void> {
+  const report = {
+    ...(loaded.report ?? {}),
+    ok: snapshot.step === "complete",
+    workflowId: snapshot.workflowId,
+    workflow: redactDeployWorkflowSnapshot(snapshot),
+    workflowEvents: redactDeployWorkflowSnapshot(snapshot).events,
+    requiredAction: snapshot.requiredAction ? redactDeployWorkflowSnapshot(snapshot).requiredAction : undefined
+  };
+  mergeDeployWorkflowCompletionIntoReport(report, redactDeployWorkflowSnapshot(snapshot));
+  await mkdir(path.dirname(reportPath), { recursive: true });
+  await writeFile(reportPath, `${JSON.stringify(jsonSafeOutput(report), null, 2)}\n`, "utf8");
+  loaded.report = report;
+  loaded.source.reportPath = reportPath;
+}
+
+async function buildDeployWorkflowStatusOutput(
+  loaded: LoadedDeployWorkflowState,
+  flags: Map<string, string | boolean>,
+  action: "deploy-status" | "deploy-resume"
+): Promise<DeployWorkflowStatusOutput> {
+  const warnings = [...loaded.warnings];
+  if (loaded.tokenHydrated) {
+    warnings.push("Hydrated the unredacted deployment intent token from report.json localSecret.");
+  }
+  const schedule = deployWorkflowScheduleSummary(loaded.snapshot, loaded.report);
+  warnings.push(...deployWorkflowScheduleWarnings(schedule));
+  const intentReadback = await readDeployWorkflowIntentStatus(loaded).catch((error) => {
+    warnings.push(`Could not read deployment intent status: ${safeErrorMessage(error)}`);
+    return undefined;
+  });
+  const phase = normalizedDeployWorkflowPhase(loaded.snapshot);
+  return {
+    action,
+    ok: phase !== "failed",
+    phase,
+    workflowId: loaded.snapshot.workflowId,
+    nextAction: deployWorkflowNextAction(loaded.snapshot, loaded, flags, schedule),
+    warnings,
+    schedule,
+    readbacks: deployWorkflowReadbacks(loaded.snapshot, loaded.report, intentReadback),
+    reportPath: deployWorkflowReportPath(loaded)
+  };
+}
+
+async function readDeployWorkflowIntentStatus(loaded: LoadedDeployWorkflowState): Promise<Record<string, unknown> | undefined> {
+  const intentId = deployWorkflowIntentId(loaded.snapshot);
+  if (!intentId) return undefined;
+  const token = deployWorkflowIntentToken(loaded.snapshot);
+  if (!token) return undefined;
+  const client = new SwitchboardControlPlaneClient({ relayUrl: loaded.snapshot.input.relayUrl });
+  return client.readDeploymentIntent(intentId, { cliToken: token });
+}
+
+function normalizedDeployWorkflowPhase(snapshot: SwitchboardDeployWorkflowSnapshot): string {
+  switch (snapshot.step) {
+    case "initialized":
+      return "initialized";
+    case "capacity_selected":
+      return "capacity selected";
+    case "intent_created":
+      return "intent created";
+    case "deploy_action_required":
+      return "intent created";
+    case "deploy_submitted":
+      return "deploy submitted";
+    case "runtime_claimed":
+      return "runtime claimed";
+    case "quote_ready":
+      return "quote ready";
+    case "funding_action_required":
+      return "funding needed";
+    case "funding_submitted":
+      return "funding submitted";
+    case "dns_propagated":
+      return "dns propagated";
+    case "route_active":
+      return "route active";
+    case "registration_observed":
+      return "registration observed";
+    case "validation_observed":
+      return "validation observed";
+    case "complete":
+      return "complete";
+    case "failed":
+      return "failed";
+  }
+}
+
+function deployWorkflowNextAction(
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  loaded: LoadedDeployWorkflowState,
+  flags: Map<string, string | boolean>,
+  schedule?: Record<string, unknown>
+): string {
+  const source = deployWorkflowSourceArg(loaded);
+  const resume = `${SWITCHBOARD_CLI} deploy resume --yes ${source}`.trim();
+  if (snapshot.step === "complete") return "No action required.";
+  if (snapshot.step === "failed" && !snapshot.requiredAction) return `Inspect ${deployWorkflowReportPath(loaded)} and rerun deploy when the failure is resolved.`;
+  if ((snapshot.step === "quote_ready" || snapshot.step === "funding_action_required") && lateFundingWarningFromSummary(schedule)) {
+    return `${resume} --allow-late-funding`;
+  }
+  if (snapshot.step === "deploy_action_required" || snapshot.requiredAction?.kind === "acurast.deploy") {
+    return resume;
+  }
+  if (snapshot.step === "funding_action_required") {
+    return resume;
+  }
+  if (!deployWorkflowIntentToken(snapshot) && deployWorkflowIntentId(snapshot)) {
+    return `Restore ${loaded.source.privateSnapshotPath ?? DEPLOY_WORKFLOW_PRIVATE_SNAPSHOT_FILE} or pass --report with deploymentIntent.localSecret.cliToken.`;
+  }
+  return resume;
+}
+
+function deployWorkflowSourceArg(loaded: LoadedDeployWorkflowState): string {
+  if (loaded.source.kind === "snapshot") return `--snapshot ${shellSingleQuote(loaded.loadedSnapshotPath)}`;
+  if (loaded.source.reportPath) return `--report ${shellSingleQuote(loaded.source.reportPath)}`;
+  return `--run-dir ${shellSingleQuote(deployWorkflowRunDir(loaded))}`;
+}
+
+function deployWorkflowReadbacks(
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  report: Record<string, any> | undefined,
+  intentStatus: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  const intent = recordValue(intentStatus?.intent);
+  return jsonSafeOutput({
+    intent: intentStatus,
+    deployment: snapshot.data.deployment ?? report?.deployment,
+    runtime: Object.keys(recordValue(snapshot.data.runtime)).length > 0
+      ? snapshot.data.runtime
+      : {
+          runtimeSigner: stringRecordField(intent, "runtimeSigner"),
+          upstreamIps: Array.isArray(intent.upstreamIps) ? intent.upstreamIps : undefined
+        },
+    quote: snapshot.data.quote ?? report?.quote,
+    funding: recordValue(intent.funding).status ? intent.funding : snapshot.data.fundingStatus ?? snapshot.data.funding ?? report?.funding,
+    route: intentStatus?.route ?? intent.route ?? snapshot.data.routeStatus ?? snapshot.data.route ?? report?.route,
+    registration: snapshot.data.intentStatus,
+    validation: snapshot.data.validation ?? report?.validation
+  });
+}
+
+function deployWorkflowScheduleSummary(
+  snapshot: SwitchboardDeployWorkflowSnapshot,
+  report: Record<string, any> | undefined
+): Record<string, unknown> | undefined {
+  const snapshotSchedule = recordValue(recordValue(snapshot.data.deployment).schedule);
+  const reportSchedule = recordValue(recordValue(report?.lifecycle).schedule);
+  const schedule = Object.keys(snapshotSchedule).length > 0 ? snapshotSchedule : reportSchedule;
+  if (Object.keys(schedule).length === 0) return undefined;
+  const startMs = normalizeScheduleTimestampMs(schedule.startTime);
+  const endMs = normalizeScheduleTimestampMs(schedule.endTime);
+  const maxStartDelayMs = normalizeDurationMs(schedule.maxStartDelay);
+  const latestStartMs = startMs !== undefined && maxStartDelayMs !== undefined ? startMs + maxStartDelayMs : undefined;
+  return {
+    ...schedule,
+    startIso: startMs ? new Date(startMs).toISOString() : undefined,
+    endIso: endMs ? new Date(endMs).toISOString() : undefined,
+    latestStartIso: latestStartMs ? new Date(latestStartMs).toISOString() : undefined,
+    startWindowExpired: latestStartMs !== undefined ? Date.now() > latestStartMs : undefined,
+    endExpired: endMs !== undefined ? Date.now() > endMs : undefined
+  };
+}
+
+function deployWorkflowScheduleWarnings(schedule: Record<string, unknown> | undefined): string[] {
+  const warnings: string[] = [];
+  if (!schedule) return warnings;
+  if (schedule.startWindowExpired === true) {
+    warnings.push(`Acurast start window expired at ${stringRecordField(schedule, "latestStartIso") ?? "unknown time"}.`);
+  }
+  if (schedule.endExpired === true) {
+    warnings.push(`Acurast end time passed at ${stringRecordField(schedule, "endIso") ?? "unknown time"}.`);
+  }
+  return warnings;
+}
+
+function lateFundingWarning(snapshot: SwitchboardDeployWorkflowSnapshot, report: Record<string, any> | undefined): string | undefined {
+  return lateFundingWarningFromSummary(deployWorkflowScheduleSummary(snapshot, report));
+}
+
+function lateFundingWarningFromSummary(schedule: Record<string, unknown> | undefined): string | undefined {
+  if (!schedule) return undefined;
+  if (schedule.endExpired === true) {
+    return `Refusing late funding because the Acurast end time passed at ${stringRecordField(schedule, "endIso") ?? "unknown time"}.`;
+  }
+  if (schedule.startWindowExpired === true) {
+    return `Refusing late funding because the Acurast start window expired at ${stringRecordField(schedule, "latestStartIso") ?? "unknown time"}.`;
+  }
+  return undefined;
+}
+
+function normalizeScheduleTimestampMs(value: unknown): number | undefined {
+  const numeric = typeof value === "number" ? value : typeof value === "string" && /^[0-9]+$/.test(value) ? Number(value) : undefined;
+  if (!numeric || !Number.isFinite(numeric)) return undefined;
+  return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
+}
+
+function normalizeDurationMs(value: unknown): number | undefined {
+  const numeric = typeof value === "number" ? value : typeof value === "string" && /^[0-9]+$/.test(value) ? Number(value) : undefined;
+  if (numeric === undefined || !Number.isFinite(numeric)) return undefined;
+  return numeric;
+}
+
+function printDeployWorkflowStatus(status: DeployWorkflowStatusOutput): void {
+  console.log(sectionTitle(status.action === "deploy-resume" ? "Deploy resume" : "Deploy status"));
+  printOutputRows([
+    { label: "Workflow", value: status.workflowId },
+    { label: "Phase", value: status.phase },
+    { label: "Report", value: status.reportPath },
+    { label: "Next", value: status.nextAction }
+  ]);
+  for (const warning of status.warnings) {
+    console.log(statusLine("warn", "Warning", warning));
+  }
 }
 
 function requireDeployWorkflowAcurastAction(snapshot: SwitchboardDeployWorkflowSnapshot): WorkflowRequiredAction {
@@ -4815,35 +5357,15 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
   const explicitProcessor = stringFlag(flags, "processor") ?? optionalEnv("SWITCHBOARD_DEPLOY_PROCESSOR");
   const explicitGatewayId = deployGatewayOverride(flags);
   const routeActivationMode = "relay-reconciled";
-  const shouldSelectPinnedCapacity =
-    routeActivationMode === "relay-reconciled" &&
-    Boolean(explicitOperatorId) &&
-    Boolean(explicitProcessor) &&
-    !explicitGatewayId;
   let selection: LaunchDemoCapacitySelection | undefined;
-  if (shouldSelectPinnedCapacity && explicitOperatorId && explicitProcessor) {
-    selection = await selectPinnedDeployCapacity({
-      relayUrl,
-      relayUrls,
-      network: acurastNetwork,
-      operatorId: explicitOperatorId,
-      processor: explicitProcessor,
-      requiredModules: requiredAcurastModules
-    });
-  } else if (routeActivationMode === "relay-reconciled" && explicitOperatorId && !explicitGatewayId) {
+  if (routeActivationMode === "relay-reconciled" && (explicitOperatorId || explicitGatewayId || explicitProcessor)) {
     selection = await selectDeployCapacity({
       relayUrl,
       relayUrls,
       network: acurastNetwork,
       operatorId: explicitOperatorId,
-      requiredModules: requiredAcurastModules
-    });
-  } else if (routeActivationMode === "relay-reconciled" && explicitGatewayId && !explicitOperatorId) {
-    selection = await selectDeployCapacity({
-      relayUrl,
-      relayUrls,
-      network: acurastNetwork,
       gatewayId: explicitGatewayId,
+      processor: explicitProcessor,
       requiredModules: requiredAcurastModules
     });
   } else if (!explicitOperatorId) {
@@ -7737,6 +8259,10 @@ function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
+function recordValue(value: unknown): Record<string, any> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
+}
+
 function stringRecordField(record: unknown, name: string): string | undefined {
   if (!record || typeof record !== "object") {
     return undefined;
@@ -9016,6 +9542,12 @@ function normalizeCommand(positionals: string[]): CommandName {
       return "ops";
     }
   }
+  if (positionals.length === 2 && positionals[0] === "deploy" && positionals[1] === "status") {
+    return "deploy-status";
+  }
+  if (positionals.length === 2 && positionals[0] === "deploy" && positionals[1] === "resume") {
+    return "deploy-resume";
+  }
   if (positionals.length >= 1 && positionals[0] === "ops") {
     return "ops";
   }
@@ -9363,6 +9895,10 @@ Public beta deployer commands:
           Launch the bundled demo on current live operator capacity.
   deploy
           Deploy a project workload from switchboard.json or --entrypoint.
+  deploy status
+          Read local deploy workflow/report state and print the next recovery action.
+  deploy resume
+          Resume a single-replica deploy workflow from local private state.
   status
           Diagnose a deployment from its report.
   claimable
@@ -9515,13 +10051,20 @@ Operator setup:
   switchboard operator setup --manager-address <address> --manager-id <id>
   --management-address <address>   Alias for --manager-address
   --public-address <ip-or-host>    Default fetched with curl --ipv4 https://ifconfig.me/ip
+  --processor-file <path>          Read processor include list from JSON, CSV, or newline text
+  --payout-address <0xaddress>     Operator payout recipient to advertise
+  --generate-report-seed           Generate and store a new local sr25519 report seed
+  --prepare-admission              Write redacted operator-admission-request.json for PROOF admission
+  --admission-file <path>          Apply a PROOF-issued admission bundle
   --env-file <path>                Default .operator-host/operator.env
   --image-registry <registry/ns>   Default ghcr.io/proof-computer/switchboard-gateway
   --image-tag <tag>                Default latest
   --skip-install                   Do not install Docker/Compose if missing
   --skip-compose                   Write config but do not launch compose
   --route-state-url <url>          Default control-plane route-state polling URL when OPERATOR_ID is known
+  --route-state-token-env <env>    Env var containing route-state bearer token
   --local-build                    Build local repo images instead of pulling prebuilt images
+  --local-only                     Allow lab setup without relay admission/reporting material
   --dry-run                        Print checks and planned actions only
 
 Operator discover:
@@ -9545,6 +10088,7 @@ Operator status and upgrade:
   --env-file <path>                Env file, default .operator-host/operator.env
   --gateway-agent-url <url>        Status check URL, default http://127.0.0.1:18080
   --capability-url <url>           Relay capability lookup URL
+  --capability-token-env <env>     Env var containing relay capability read/write token
   --dry-run                        For upgrade, print docker compose commands only
   --keep-image-override            For upgrade, keep old/custom image env overrides
 
@@ -9584,6 +10128,9 @@ Deploy defaults:
   --quote                          Default; fund through a signed deployment-intent quote
   --payment-mode <mode>            quote only
   --report <path>                  Deployment report JSON to diagnose
+  --run-dir <path>                 Deploy run directory for workflow snapshots
+  --snapshot <path>                Deploy workflow snapshot for status/resume
+  --allow-late-funding             Resume funding after an expired Acurast start/end window
 ${advanced ? "  --execution-ms <ms>              Override derived Acurast job runtime\n" : ""}
 `);
 }

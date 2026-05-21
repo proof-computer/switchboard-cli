@@ -2,8 +2,9 @@
 import "dotenv/config";
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -11,11 +12,24 @@ import process from "node:process";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
+import { Keyring } from "@polkadot/keyring";
+import { u8aToHex } from "@polkadot/util";
+import { cryptoWaitReady, mnemonicGenerate, mnemonicValidate } from "@polkadot/util-crypto";
+import { ethers } from "ethers";
+
 interface ParsedArgs {
   flags: Map<string, string | boolean>;
 }
 
 type ComposeStyle = "docker-compose-plugin" | "docker-compose-standalone";
+type OperatorAdmissionMode = "local-only" | "pre-admission" | "admitted";
+type OperatorStatusClassification =
+  | "local-only"
+  | "pre-admission"
+  | "admitted"
+  | "report-stale"
+  | "route-state-unhealthy"
+  | "relay-missing";
 
 interface OsRelease {
   id?: string;
@@ -64,10 +78,19 @@ interface OperatorSetupConfig {
   operatorId?: string;
   processorRefs?: string;
   reportSeed?: string;
+  reportSeedGenerated: boolean;
+  reportSigner?: ReportSignerMetadata;
   capabilityReportUrl?: string;
   capabilityReportToken?: string;
   gatewayId: string;
+  payoutAddress?: string;
   network: string;
+  localOnly: boolean;
+  prepareAdmission: boolean;
+  admissionRequestFile?: string;
+  admissionFile?: string;
+  admissionBundle?: OperatorAdmissionBundle;
+  mode: OperatorAdmissionMode;
   dryRun: boolean;
   skipInstall: boolean;
   skipCompose: boolean;
@@ -110,12 +133,78 @@ interface OperatorSetupReport {
     processorRefs?: string;
     capabilityReportUrl?: string;
     gatewayId: string;
+    payoutAddress?: string;
+    reportSigner?: ReportSignerMetadata;
+    admissionMode: OperatorAdmissionMode;
+    admissionFile?: string;
+    admissionRequestFile?: string;
     acurastNetwork: string;
   };
+  admissionRequest?: OperatorAdmissionRequest;
   actions: string[];
   warnings: string[];
   composePullCommand?: string[];
   composeCommand?: string[];
+}
+
+interface ReportSignerMetadata {
+  scheme: "substrate-sr25519";
+  address: string;
+  publicKey: string;
+  ss58Format: number;
+}
+
+interface OperatorAdmissionBundle {
+  operatorId?: string;
+  gatewayId?: string;
+  capabilityReportUrl?: string;
+  capabilityReportToken?: string;
+  routeStateUrl?: string;
+  routeStateToken?: string;
+  payoutAddress?: string;
+  reportSigner?: {
+    scheme?: string;
+    address?: string;
+    signer?: string;
+    publicKey?: string;
+    ss58Format?: number;
+  };
+  acceptedSigner?: {
+    scheme?: string;
+    address?: string;
+    signer?: string;
+    publicKey?: string;
+    ss58Format?: number;
+  };
+}
+
+interface OperatorAdmissionRequest {
+  version: 1;
+  kind: "switchboard.operator.admission.request";
+  createdAt: string;
+  network: string;
+  operatorId?: string;
+  gatewayId: string;
+  managerIds: string[];
+  processorAllowlist: {
+    count: number;
+    sha256?: string;
+  };
+  publicAddress: {
+    value: string;
+    mode: "auto" | "static";
+    port: number;
+  };
+  payoutAddress?: string;
+  reportSigner: ReportSignerMetadata;
+  requestedRelays: {
+    capabilityReportUrl?: string;
+    routeStateUrl?: string;
+  };
+}
+
+interface OperatorSetupRuntime {
+  generateReportSeed?: () => string;
 }
 
 const DEFAULT_ENV_FILE = ".operator-host/operator.env";
@@ -166,23 +255,67 @@ export async function runOperatorStatus(flags: Map<string, string | boolean>): P
   const timeoutMs = numberFlag(flags, "timeout-ms", 5_000);
   const health = await fetchOptionalJson(new URL("/health", gatewayAgentUrl), timeoutMs);
   const localCapability = await fetchOptionalJson(new URL("/reports/gateway-capability", gatewayAgentUrl), timeoutMs);
-  const capabilityUrl = stringFlag(flags, "capability-url") ?? env.get("PROOF_OPERATOR_CAPABILITY_URL") ?? process.env.PROOF_OPERATOR_CAPABILITY_URL;
-  const operatorId = stringFlag(flags, "operator-id") ?? env.get("OPERATOR_ID") ?? process.env.SWITCHBOARD_OPERATOR_ID ?? process.env.PROOF_OPERATOR_ID;
-  const gatewayId = stringFlag(flags, "gateway-id") ?? env.get("GATEWAY_ID") ?? process.env.GATEWAY_ID;
+  const capabilityToken = resolveEnvSecret(flags, "capability-token-env", "PROOF_OPERATOR_CAPABILITY_TOKEN", env);
+  const capabilityUrl =
+    stringFlag(flags, "capability-url") ??
+    process.env.PROOF_OPERATOR_CAPABILITY_URL ??
+    envValue(env, "PROOF_OPERATOR_CAPABILITY_URL");
+  const operatorId =
+    stringFlag(flags, "operator-id") ??
+    process.env.OPERATOR_ID ??
+    process.env.SWITCHBOARD_OPERATOR_ID ??
+    process.env.PROOF_OPERATOR_ID ??
+    envValue(env, "OPERATOR_ID", "SWITCHBOARD_OPERATOR_ID", "PROOF_OPERATOR_ID");
+  const gatewayId = stringFlag(flags, "gateway-id") ?? process.env.GATEWAY_ID ?? envValue(env, "GATEWAY_ID");
   const relayCapability = capabilityUrl && operatorId && gatewayId
-    ? await fetchOptionalJson(new URL(`/v1/operator-capabilities?operatorId=${encodeURIComponent(operatorId)}&gatewayId=${encodeURIComponent(gatewayId)}&limit=1`, capabilityUrl), timeoutMs)
+    ? await fetchRelayCapabilityState({
+        capabilityReportUrl: capabilityUrl,
+        capabilityReportToken: capabilityToken,
+        operatorId,
+        gatewayId
+      }, timeoutMs)
     : undefined;
+  const classification = classifyOperatorStatus({
+    env,
+    docker,
+    health: health.value,
+    healthOk: health.ok,
+    localCapability: localCapability.value,
+    localCapabilityOk: localCapability.ok,
+    relayCapability: relayCapability?.value,
+    relayCapabilityOk: relayCapability?.ok,
+    operatorId,
+    gatewayId,
+    now: new Date()
+  });
 
   const output = {
-    ok: Boolean(docker.docker.ok && docker.compose.ok && health.ok),
+    ok: Boolean(docker.docker.ok && docker.compose.ok && docker.daemon.ok && health.ok && operatorStatusHealthy(classification.state)),
+    state: classification.state,
+    findings: classification.findings,
     projectDir,
     composeFiles,
     envFile,
-    docker,
+    docker: {
+      ...docker,
+      currentUser: currentUsername(),
+      userCanAccessDaemon: docker.daemon.ok,
+      daemonError: docker.daemon.ok ? undefined : docker.daemon.reason
+    },
     compose: {
       ok: composePs ? composePs.exitCode === 0 : false,
       stdout: composePs?.stdout.trim(),
       stderr: composePs?.stderr.trim()
+    },
+    config: {
+      operatorId,
+      gatewayId,
+      admissionMode: envValue(env, "SWITCHBOARD_OPERATOR_MODE"),
+      capabilityUrl,
+      routeStateUrl: envValue(env, "GATEWAY_ROUTE_STATE_URL"),
+      reportSeedConfigured: Boolean(envValue(env, "OPERATOR_REPORT_SEED")),
+      routeStateTokenConfigured: Boolean(envValue(env, "GATEWAY_ROUTE_STATE_TOKEN")),
+      capabilityTokenConfigured: Boolean(envValue(env, "PROOF_OPERATOR_CAPABILITY_TOKEN"))
     },
     gatewayAgent: {
       url: gatewayAgentUrl,
@@ -201,7 +334,7 @@ export async function runOperatorStatus(flags: Map<string, string | boolean>): P
     }
   };
 
-  writeOutput(flags, output, () => printOperatorStatus(output));
+  writeOutput(flags, redactSensitive(output), () => printOperatorStatus(output));
 }
 
 export async function runOperatorUpgrade(flags: Map<string, string | boolean>, rl?: readline.Interface): Promise<void> {
@@ -252,17 +385,25 @@ export async function runOperatorUpgrade(flags: Map<string, string | boolean>, r
 
 export async function setupOperator(
   flags: Map<string, string | boolean>,
-  rl?: readline.Interface
+  rl?: readline.Interface,
+  runtime: OperatorSetupRuntime = {}
 ): Promise<OperatorSetupReport> {
   const prompt = createPromptIo(flags, rl);
   const checkedAt = new Date();
   const projectDir = path.resolve(stringFlag(flags, "project-dir") ?? process.cwd());
   const composeFile = path.resolve(projectDir, stringFlag(flags, "compose-file") ?? DEFAULT_COMPOSE_FILE);
   const envFile = path.resolve(projectDir, stringFlag(flags, "env-file") ?? DEFAULT_ENV_FILE);
+  const existingEnv = await readEnvFileMap(envFile);
   const dryRun = boolFlag(flags, "dry-run");
   const skipInstall = boolFlag(flags, "skip-install");
-  const skipCompose = boolFlag(flags, "skip-compose");
+  const localOnly = boolFlag(flags, "local-only");
+  const prepareAdmission = boolFlag(flags, "prepare-admission");
+  const skipComposeFlag = boolFlag(flags, "skip-compose");
   const assumeYes = boolFlag(flags, "yes") || process.env.SWITCHBOARD_ASSUME_YES === "true";
+  const admissionFile = stringFlag(flags, "admission-file")
+    ? path.resolve(projectDir, stringFlag(flags, "admission-file")!)
+    : undefined;
+  const admissionBundle = admissionFile ? await readOperatorAdmissionBundle(admissionFile) : undefined;
   const localBuild = boolFlag(flags, "local-build");
   const imageRegistry = normalizeImageRegistry(
     stringFlag(flags, "image-registry") ??
@@ -278,35 +419,70 @@ export async function setupOperator(
   const publicPort = numberFlag(flags, "public-port", numberEnv("PUBLIC_HTTPS_PORT", 443));
   const gatewayAgentBindAddress =
     stringFlag(flags, "gateway-agent-bind-address") ??
-    process.env.GATEWAY_AGENT_BIND_ADDR;
+    process.env.GATEWAY_AGENT_BIND_ADDR ??
+    envValue(existingEnv, "GATEWAY_AGENT_BIND_ADDR");
   const osRelease = process.platform === "linux" ? await readOsRelease() : undefined;
   const supportedInstall = supportsAptDockerInstall(process.platform, osRelease);
   const warnings: string[] = [];
   const actions: string[] = [];
   const dockerBefore = await checkDocker();
-  const wanIp = await resolvePublicAddress(flags, prompt, warnings);
-  const publicAddressMode = resolvePublicAddressMode(flags, wanIp.source);
-  const manager = await resolveManagerInputs(flags, prompt, warnings);
-  const operatorId = resolveOperatorId(flags);
-  const processorRefs = resolveProcessorRefs(flags);
-  const reportSeed = resolveEnvSecret(flags, "operator-report-seed-env", "OPERATOR_REPORT_SEED");
-  const capabilityReportToken = resolveEnvSecret(flags, "capability-token-env", "PROOF_OPERATOR_CAPABILITY_TOKEN");
-  const routeStateToken = process.env.GATEWAY_ROUTE_STATE_TOKEN || capabilityReportToken;
-  const routeIntentToken = resolveEnvSecret(flags, "route-intent-token-env", "GATEWAY_AGENT_ROUTE_INTENT_TOKEN");
+  const wanIp = await resolvePublicAddress(flags, prompt, warnings, existingEnv);
+  const publicAddressMode = resolvePublicAddressMode(flags, wanIp.source, existingEnv);
+  const manager = await resolveManagerInputs(flags, prompt, warnings, existingEnv);
+  const operatorId = resolveOperatorId(flags, existingEnv, admissionBundle);
+  const processorRefs = await resolveProcessorRefs(flags, existingEnv, projectDir);
+  const reportSeedResolution = await resolveReportSeed({
+    flags,
+    existingEnv,
+    prompt,
+    runtime,
+    assumeYes
+  });
+  const reportSeed = reportSeedResolution.seed;
+  const reportSigner = reportSeed ? await tryDeriveReportSigner(reportSeed, warnings) : undefined;
+  const capabilityReportToken = resolveEnvSecret(
+    flags,
+    "capability-token-env",
+    "PROOF_OPERATOR_CAPABILITY_TOKEN",
+    existingEnv,
+    admissionBundle?.capabilityReportToken
+  );
+  const routeStateToken =
+    resolveEnvSecret(
+      flags,
+      "route-state-token-env",
+      "GATEWAY_ROUTE_STATE_TOKEN",
+      existingEnv,
+      admissionBundle?.routeStateToken
+    ) || capabilityReportToken;
+  const routeIntentToken = resolveEnvSecret(flags, "route-intent-token-env", "GATEWAY_AGENT_ROUTE_INTENT_TOKEN", existingEnv);
   const gatewayId = sanitizeGatewayId(
     stringFlag(flags, "gateway-id") ??
       process.env.GATEWAY_ID ??
+      envValue(existingEnv, "GATEWAY_ID") ??
+      admissionBundle?.gatewayId ??
       `${os.hostname() || "operator"}-gateway`
   );
   const routeStateUrl =
     stringFlag(flags, "route-state-url") ??
     process.env.GATEWAY_ROUTE_STATE_URL ??
+    envValue(existingEnv, "GATEWAY_ROUTE_STATE_URL") ??
+    admissionBundle?.routeStateUrl ??
     (operatorId ? defaultRouteStateUrl(operatorId, gatewayId) : undefined);
-  const network = stringFlag(flags, "network") ?? process.env.ACURAST_NETWORK ?? "mainnet";
+  const network = stringFlag(flags, "network") ?? process.env.ACURAST_NETWORK ?? envValue(existingEnv, "ACURAST_NETWORK") ?? "mainnet";
   const capabilityReportUrl =
     stringFlag(flags, "capability-url") ??
     process.env.PROOF_OPERATOR_CAPABILITY_URL ??
+    envValue(existingEnv, "PROOF_OPERATOR_CAPABILITY_URL") ??
+    admissionBundle?.capabilityReportUrl ??
     (reportSeed && network === "mainnet" ? DEFAULT_MAINNET_CAPABILITY_REPORT_URL : undefined);
+  const payoutAddress = resolvePayoutAddress(flags, existingEnv, admissionBundle);
+  if (admissionBundle) {
+    validateAdmissionBundleSigner(admissionBundle, reportSigner);
+  }
+  const admissionRequestFile = prepareAdmission
+    ? path.resolve(projectDir, stringFlag(flags, "admission-request-file") ?? "operator-admission-request.json")
+    : undefined;
 
   let composeFileReady = await fileExists(composeFile);
   if (!composeFileReady && !localBuild) {
@@ -343,15 +519,46 @@ export async function setupOperator(
     operatorId,
     processorRefs,
     reportSeed,
+    reportSeedGenerated: reportSeedResolution.generated,
+    reportSigner,
     capabilityReportUrl,
     capabilityReportToken,
     gatewayId,
+    payoutAddress,
     network,
+    localOnly,
+    prepareAdmission,
+    admissionRequestFile,
+    admissionFile,
+    admissionBundle,
+    mode: localOnly ? "local-only" : prepareAdmission ? "pre-admission" : "admitted",
     dryRun,
     skipInstall,
-    skipCompose,
+    skipCompose: skipComposeFlag,
     assumeYes
   };
+
+  const relayAdmissionIssues = relayAdmissionConfigIssues(config);
+  if (relayAdmissionIssues.length > 0) {
+    const message = relayAdmissionConfigMessage(relayAdmissionIssues);
+    if (!localOnly && !prepareAdmission) {
+      throw new Error(message);
+    }
+    warnings.push(`${message} Continuing because ${localOnly ? "--local-only" : "--prepare-admission"} was set.`);
+  }
+
+  if (prepareAdmission && !reportSigner) {
+    throw new Error(
+      "Preparing admission requires a valid sr25519 report seed. Pass --generate-report-seed, set OPERATOR_REPORT_SEED, or pass --operator-report-seed-env <env>."
+    );
+  }
+  if (reportSeed && !reportSigner && !localOnly) {
+    throw new Error(
+      "OPERATOR_REPORT_SEED must be a valid sr25519 mnemonic or derivation URI for admitted/pre-admission setup. Regenerate one with --generate-report-seed."
+    );
+  }
+
+  await confirmSharedManagerProcessorScope(config, prompt, warnings);
 
   let docker = dockerBefore;
   if ((!docker.docker.ok || !docker.compose.ok) && !skipInstall) {
@@ -376,6 +583,16 @@ export async function setupOperator(
     actions.push(`wrote operator env file ${envFile}`);
   }
 
+  const admissionRequest = prepareAdmission ? buildAdmissionRequest(config, checkedAt) : undefined;
+  if (admissionRequest && admissionRequestFile) {
+    if (dryRun) {
+      actions.push(`would write redacted admission request ${admissionRequestFile}`);
+    } else {
+      await writeJsonFile(admissionRequestFile, admissionRequest, 0o644);
+      actions.push(`wrote redacted admission request ${admissionRequestFile}`);
+    }
+  }
+
   const composePullCommand = composePullServicesCommand({
     envFile,
     composeFile,
@@ -389,6 +606,7 @@ export async function setupOperator(
     build: localBuild
   });
   let launchedCompose = false;
+  const skipCompose = skipComposeFlag || (prepareAdmission && relayAdmissionIssues.length > 0);
   if (skipCompose) {
     actions.push("skipped docker compose up");
   } else if (!composeFileReady) {
@@ -414,6 +632,7 @@ export async function setupOperator(
 
   if (launchedCompose) {
     await checkCapabilityRegistration(config, actions, warnings);
+    await verifyLocalGatewayAfterLaunch(config, actions);
   } else if (config.capabilityReportUrl && config.reportSeed && !dryRun) {
     warnings.push("Skipped relay capability registration check because compose was not launched; run `switchboard operator discover` after gateway-agent starts.");
   } else if (config.operatorId && !config.reportSeed) {
@@ -462,8 +681,14 @@ export async function setupOperator(
       processorRefs,
       capabilityReportUrl,
       gatewayId,
+      payoutAddress,
+      reportSigner,
+      admissionMode: config.mode,
+      admissionFile,
+      admissionRequestFile,
       acurastNetwork: network
     },
+    admissionRequest,
     actions,
     warnings,
     composePullCommand: localBuild ? undefined : composePullCommand,
@@ -486,9 +711,16 @@ Options:
   --operator-id <0xbytes32>        Optional Hub operator ID for hub-watcher filtering/reporting
   --processor <ref[,ref...]>       Site-specific Acurast processor include list for OPERATOR_PROCESSORS
   --processors <ref[,ref...]>      Alias for --processor
+  --processor-file <path>          Read processor include list from JSON, CSV, or newline text
+  --payout-address <0xaddress>     Operator payout recipient to advertise in capability reports
   --operator-report-seed-env <env> Env var containing the gateway capability report seed
+  --generate-report-seed           Generate and store a new local sr25519 BIP-39 report seed
   --capability-url <url>           Gateway capability report POST URL
   --capability-token-env <env>     Env var containing the optional capability report bearer token
+  --route-state-token-env <env>    Env var containing the route-state bearer token; defaults to capability token
+  --prepare-admission              Write a redacted operator-admission-request.json and skip live launch until admitted
+  --admission-request-file <path>  Admission request output path, default operator-admission-request.json
+  --admission-file <path>          PROOF-issued admission bundle with relay URLs/tokens and accepted signer
   --public-address <ip-or-host>    Gateway WAN/public address; default fetched with ${WAN_IP_COMMAND.join(" ")}
   --public-address-mode <mode>     auto or static; auto is used when setup auto-detects the WAN IP
   --public-port <port>             Public HTTPS port, default PUBLIC_HTTPS_PORT or 443
@@ -506,6 +738,7 @@ Options:
   --skip-install                   Do not install Docker/Compose if missing
   --skip-compose                   Write config but do not launch compose
   --local-build                    Build local repo images instead of pulling prebuilt images
+  --local-only                     Allow setup without relay admission/reporting material
   --no-build                       Deprecated; default setup already uses prebuilt images
   --dry-run                        Print checks and planned actions without changing the host
   --yes                            Accept install/launch prompts
@@ -516,7 +749,8 @@ Upgrade-only:
 
 Examples:
   switchboard operator setup
-  switchboard operator setup --manager-address 5... --manager-id <manager-id> --yes`);
+  switchboard operator setup --manager-address 5... --manager-id <manager-id> --generate-report-seed --prepare-admission
+  switchboard operator setup --admission-file operator-admission.json --yes`);
 }
 
 export function parseOsRelease(input: string): OsRelease {
@@ -681,27 +915,175 @@ async function readEnvFileMap(envFile: string): Promise<Map<string, string>> {
   return values;
 }
 
-async function fetchOptionalJson(url: URL, timeoutMs: number): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+async function fetchOptionalJson(
+  url: URL,
+  timeoutMs: number,
+  init: RequestInit = {}
+): Promise<{ ok: boolean; value?: unknown; error?: string; status?: number }> {
   try {
-    const response = await fetchWithTimeout(url, { method: "GET" }, timeoutMs);
+    const response = await fetchWithTimeout(url, { method: "GET", ...init }, timeoutMs);
     const text = await response.text();
     if (!response.ok) {
-      return { ok: false, error: `${response.status} ${text}` };
+      return { ok: false, status: response.status, error: `${response.status} ${text}` };
     }
-    return { ok: true, value: text ? JSON.parse(text) : undefined };
+    return { ok: true, status: response.status, value: text ? JSON.parse(text) : undefined };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
+async function readOperatorAdmissionBundle(file: string): Promise<OperatorAdmissionBundle> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(file, "utf8"));
+  } catch (error) {
+    throw new Error(`Could not read --admission-file ${file}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return parseOperatorAdmissionBundle(parsed);
+}
+
+export function parseOperatorAdmissionBundle(input: unknown): OperatorAdmissionBundle {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("Admission file must be a JSON object.");
+  }
+  const record = input as Record<string, unknown>;
+  const capability = record.capability && typeof record.capability === "object" && !Array.isArray(record.capability)
+    ? record.capability as Record<string, unknown>
+    : {};
+  const routeState = record.routeState && typeof record.routeState === "object" && !Array.isArray(record.routeState)
+    ? record.routeState as Record<string, unknown>
+    : {};
+  const reportSigner = signerMetadataFromUnknown(record.reportSigner);
+  const acceptedSigner = signerMetadataFromUnknown(record.acceptedSigner ?? record.signer);
+  const bundle: OperatorAdmissionBundle = {
+    operatorId: stringField(record, "operatorId"),
+    gatewayId: stringField(record, "gatewayId"),
+    capabilityReportUrl:
+      stringField(record, "capabilityReportUrl") ??
+      stringField(record, "capabilityUrl") ??
+      stringField(capability, "url"),
+    capabilityReportToken:
+      stringField(record, "capabilityReportToken") ??
+      stringField(record, "capabilityToken") ??
+      stringField(capability, "token") ??
+      stringField(capability, "bearerToken"),
+    routeStateUrl: stringField(record, "routeStateUrl") ?? stringField(routeState, "url"),
+    routeStateToken:
+      stringField(record, "routeStateToken") ??
+      stringField(routeState, "token") ??
+      stringField(routeState, "bearerToken"),
+    payoutAddress: stringField(record, "payoutAddress"),
+    reportSigner,
+    acceptedSigner
+  };
+  const missing: string[] = [];
+  if (!bundle.operatorId) missing.push("operatorId");
+  if (!bundle.gatewayId) missing.push("gatewayId");
+  if (!bundle.capabilityReportUrl) missing.push("capability.url");
+  if (!bundle.capabilityReportToken) missing.push("capability.token");
+  if (!bundle.routeStateUrl) missing.push("routeState.url");
+  if (!bundle.routeStateToken) missing.push("routeState.token");
+  if (!signerMetadataUsable(bundle.acceptedSigner ?? bundle.reportSigner)) missing.push("acceptedSigner");
+  if (missing.length > 0) {
+    throw new Error(`Admission file is missing required field(s): ${missing.join(", ")}`);
+  }
+  validateUrl(bundle.capabilityReportUrl, "capability.url");
+  validateUrl(bundle.routeStateUrl, "routeState.url");
+  if (bundle.operatorId && !/^0x[0-9a-fA-F]{64}$/.test(bundle.operatorId)) {
+    throw new Error("Admission file operatorId must be a 0x-prefixed bytes32 value.");
+  }
+  return bundle;
+}
+
+function signerMetadataUsable(input: OperatorAdmissionBundle["reportSigner"]): boolean {
+  return Boolean(input && (input.address || input.signer) && input.publicKey);
+}
+
+function signerMetadataFromUnknown(input: unknown): OperatorAdmissionBundle["reportSigner"] {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return undefined;
+  }
+  const record = input as Record<string, unknown>;
+  return {
+    scheme: stringField(record, "scheme"),
+    address: stringField(record, "address"),
+    signer: stringField(record, "signer"),
+    publicKey: stringField(record, "publicKey"),
+    ss58Format: typeof record.ss58Format === "number" ? record.ss58Format : undefined
+  };
+}
+
+function validateAdmissionBundleSigner(bundle: OperatorAdmissionBundle, derived: ReportSignerMetadata | undefined): void {
+  const accepted = bundle.acceptedSigner ?? bundle.reportSigner;
+  if (!accepted || !derived) {
+    return;
+  }
+  const acceptedAddress = accepted.address ?? accepted.signer;
+  if (acceptedAddress && acceptedAddress !== derived.address) {
+    throw new Error(`Admission file accepted signer ${acceptedAddress} does not match local report signer ${derived.address}.`);
+  }
+  if (accepted.publicKey && accepted.publicKey.toLowerCase() !== derived.publicKey.toLowerCase()) {
+    throw new Error("Admission file accepted signer public key does not match the local report seed.");
+  }
+}
+
+function validateUrl(value: string | undefined, label: string): void {
+  if (!value) {
+    return;
+  }
+  try {
+    new URL(value);
+  } catch {
+    throw new Error(`Admission file ${label} must be a valid URL.`);
+  }
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function stringRecordField(record: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function envValue(env: Map<string, string>, ...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = env.get(name);
+    if (value && value.length > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function firstCsv(value: string | undefined): string | undefined {
+  const first = value?.split(",")[0]?.trim();
+  return first && first.length > 0 ? first : undefined;
+}
+
 async function resolvePublicAddress(
   flags: Map<string, string | boolean>,
   prompt: PromptIo,
-  warnings: string[]
+  warnings: string[],
+  existingEnv: Map<string, string>
 ): Promise<{ value: string; source: string }> {
-  const explicit = stringFlag(flags, "public-address") ?? process.env.OPERATOR_PUBLIC_ADDRESSES?.split(",")[0]?.trim();
-  if (explicit) {
-    return { value: explicit, source: "flag-or-env" };
+  const flagValue = stringFlag(flags, "public-address");
+  if (flagValue) {
+    return { value: flagValue, source: "flag" };
+  }
+  const envPublicAddress = firstCsv(process.env.OPERATOR_PUBLIC_ADDRESSES ?? process.env.GATEWAY_PUBLIC_ADDRESSES);
+  if (envPublicAddress) {
+    return { value: envPublicAddress, source: "env" };
+  }
+  const filePublicAddress = firstCsv(envValue(existingEnv, "OPERATOR_PUBLIC_ADDRESSES", "GATEWAY_PUBLIC_ADDRESSES"));
+  if (filePublicAddress) {
+    return { value: filePublicAddress, source: "env-file" };
   }
 
   try {
@@ -720,9 +1102,10 @@ async function resolvePublicAddress(
 
 function resolvePublicAddressMode(
   flags: Map<string, string | boolean>,
-  publicAddressSource: string
+  publicAddressSource: string,
+  existingEnv: Map<string, string>
 ): "auto" | "static" {
-  const mode = stringFlag(flags, "public-address-mode") ?? process.env.OPERATOR_PUBLIC_ADDRESS_MODE;
+  const mode = stringFlag(flags, "public-address-mode") ?? process.env.OPERATOR_PUBLIC_ADDRESS_MODE ?? envValue(existingEnv, "OPERATOR_PUBLIC_ADDRESS_MODE");
   if (mode === "auto" || mode === "static") {
     return mode;
   }
@@ -735,20 +1118,23 @@ function resolvePublicAddressMode(
 async function resolveManagerInputs(
   flags: Map<string, string | boolean>,
   prompt: PromptIo,
-  warnings: string[]
+  warnings: string[],
+  existingEnv: Map<string, string>
 ): Promise<{ managerAddress?: string; managerIds?: string }> {
   let managerAddress =
     stringFlag(flags, "manager-address") ??
     stringFlag(flags, "management-address") ??
     process.env.OPERATOR_MANAGER_ADDRESS ??
     process.env.ACURAST_MANAGER_ADDRESS ??
-    process.env.ACURAST_MANAGEMENT_ADDRESS;
+    process.env.ACURAST_MANAGEMENT_ADDRESS ??
+    envValue(existingEnv, "OPERATOR_MANAGER_ADDRESS", "ACURAST_MANAGER_ADDRESS", "ACURAST_MANAGEMENT_ADDRESS");
   let managerIds =
     stringFlag(flags, "manager-id") ??
     stringFlag(flags, "management-id") ??
     process.env.OPERATOR_MANAGER_IDS ??
     process.env.OPERATOR_MANAGER_ID ??
-    process.env.ACURAST_MANAGER_ID;
+    process.env.ACURAST_MANAGER_ID ??
+    envValue(existingEnv, "OPERATOR_MANAGER_IDS", "OPERATOR_MANAGER_ID", "ACURAST_MANAGER_ID");
 
   if (!managerAddress && !managerIds) {
     const value = await promptRequired(prompt, "Acurast manager address or numeric manager ID");
@@ -796,6 +1182,8 @@ function operatorEnvUpdates(config: OperatorSetupConfig): Record<string, string 
     OPERATOR_ID: config.operatorId,
     OPERATOR_PROCESSORS: config.processorRefs,
     OPERATOR_REPORT_SEED: config.reportSeed,
+    OPERATOR_REPORT_SS58_FORMAT: config.reportSigner ? String(config.reportSigner.ss58Format) : undefined,
+    OPERATOR_PAYOUT_ADDRESS: config.payoutAddress,
     PROOF_OPERATOR_CAPABILITY_URL: config.capabilityReportUrl,
     PROOF_OPERATOR_CAPABILITY_TOKEN: config.capabilityReportToken,
     GATEWAY_AGENT_BIND_ADDR: config.gatewayAgentBindAddress,
@@ -812,6 +1200,7 @@ function operatorEnvUpdates(config: OperatorSetupConfig): Record<string, string 
     OPERATOR_PROCESSOR_MAX_AGE_SECONDS: process.env.OPERATOR_PROCESSOR_MAX_AGE_SECONDS ?? "1800",
     OPERATOR_PROCESSOR_DISCOVERY_CHECK_AVAILABILITY: "true",
     OPERATOR_DISCOVERY_STATE_FILE: DEFAULT_DISCOVERY_STATE_FILE,
+    SWITCHBOARD_OPERATOR_MODE: config.mode,
     ACURAST_NETWORK: config.network,
     ACURAST_RPC: process.env.ACURAST_RPC ?? (mainnet ? DEFAULT_MAINNET_ACURAST_RPC : undefined),
     HUB_CHAIN_PROFILE: mainnet ? "polkadot-hub" : (process.env.HUB_CHAIN_PROFILE ?? process.env.SWITCHBOARD_TARGET),
@@ -879,6 +1268,71 @@ export function migrateLegacyTlsTestUpstreamImage(value: string): string | undef
   return match ? `${DEFAULT_OPERATOR_IMAGE_REGISTRY}/tls-test-upstream:${match[1]}` : undefined;
 }
 
+async function verifyLocalGatewayAfterLaunch(config: OperatorSetupConfig, actions: string[]): Promise<void> {
+  if (config.mode !== "admitted") {
+    return;
+  }
+  const gatewayAgentUrl = process.env.GATEWAY_AGENT_URL ?? `http://127.0.0.1:${process.env.GATEWAY_AGENT_PORT ?? "18080"}`;
+  const health = await fetchJsonWithRetry(new URL("/health", gatewayAgentUrl), 10_000);
+  const localCapability = await fetchJsonWithRetry(new URL("/reports/gateway-capability", gatewayAgentUrl), 10_000);
+  const issues = localGatewayVerificationIssues(config, health, localCapability);
+  if (issues.length > 0) {
+    throw new Error(
+      [
+        "Operator stack launched but local gateway verification failed.",
+        `Issues: ${issues.join("; ")}.`,
+        `Next: run \`switchboard operator status --project-dir ${config.projectDir}\` and inspect gateway-agent logs.`
+      ].join(" ")
+    );
+  }
+  actions.push("verified local gateway health, route-state, signer, public address, and processor scope");
+}
+
+function localGatewayVerificationIssues(config: OperatorSetupConfig, health: unknown, localCapability: unknown): string[] {
+  const issues: string[] = [];
+  const healthRecord = asRecord(health);
+  if (healthRecord?.reportSigningEnabled !== true) {
+    issues.push("gateway-agent health does not report signing enabled");
+  }
+  const routeState = asRecord(healthRecord?.routeState);
+  if (config.routeStateUrl && routeState?.enabled !== true) {
+    issues.push("route-state polling is not enabled");
+  }
+  if (config.routeStateUrl && routeState?.healthy !== true) {
+    issues.push("route-state polling is not healthy");
+  }
+
+  const signed = asRecord(localCapability);
+  const report = asRecord(signed?.report);
+  const operator = asRecord(report?.operator);
+  const gateway = asRecord(report?.gateway);
+  if (config.operatorId && stringRecordField(operator, "operatorId")?.toLowerCase() !== config.operatorId.toLowerCase()) {
+    issues.push("local capability report operatorId does not match env");
+  }
+  if (stringRecordField(operator, "gatewayId") !== config.gatewayId) {
+    issues.push("local capability report gatewayId does not match env");
+  }
+  const signature = asRecord(signed?.signature);
+  if (config.reportSigner && stringRecordField(signature, "signer") !== config.reportSigner.address) {
+    issues.push("local capability report signer does not match local report seed");
+  }
+  const publicAddresses = Array.isArray(gateway?.publicAddresses) ? gateway.publicAddresses.map(String) : [];
+  if (config.publicAddress && !publicAddresses.includes(config.publicAddress)) {
+    issues.push("local capability report public address does not match env");
+  }
+  const includeCount = splitCsv(config.processorRefs).length;
+  if (includeCount > 0) {
+    const healthProcessorDiscovery = asRecord(healthRecord?.processorDiscovery);
+    const includeProcessors = Array.isArray(healthProcessorDiscovery?.includeProcessors)
+      ? healthProcessorDiscovery.includeProcessors
+      : [];
+    if (includeProcessors.length !== includeCount) {
+      issues.push(`gateway-agent processor include count ${includeProcessors.length} does not match env count ${includeCount}`);
+    }
+  }
+  return issues;
+}
+
 async function checkCapabilityRegistration(
   config: OperatorSetupConfig,
   actions: string[],
@@ -907,20 +1361,179 @@ async function checkCapabilityRegistration(
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...(config.capabilityReportToken ? { authorization: `Bearer ${config.capabilityReportToken}` } : {})
+        ...authorizationHeaders(config.capabilityReportToken)
       },
       body: JSON.stringify(signedReport)
     }, 10_000);
     const body = await response.text();
     const warning = capabilityRegistrationWarning(response.status, body);
     if (warning) {
+      if (config.mode === "admitted") {
+        throw new Error(`${warning} Next: run \`switchboard operator status --project-dir ${config.projectDir}\`.`);
+      }
       warnings.push(warning);
       return;
     }
     actions.push(response.status === 409 ? "relay already had this gateway capability report" : "verified relay accepted gateway capability report");
   } catch (error) {
-    warnings.push(`Could not verify relay capability registration: ${error instanceof Error ? error.message : String(error)}`);
+    const message = `Could not verify relay capability registration: ${error instanceof Error ? error.message : String(error)}`;
+    if (config.mode === "admitted") {
+      throw new Error(`${message}. Next: run \`switchboard operator status --project-dir ${config.projectDir}\` for the doctor output.`);
+    }
+    warnings.push(message);
+    return;
   }
+
+  if (config.mode !== "admitted") {
+    return;
+  }
+  const relayState = await fetchRelayCapabilityState(config, 10_000, { activeOnly: true });
+  if (!relayState.ok || !relayCapabilityIncludesGateway(relayState.value, config.operatorId, config.gatewayId)) {
+    throw new Error(
+      `Relay accepted the capability submission but did not return this operatorId + gatewayId in capability state. Next: run \`switchboard operator status --project-dir ${config.projectDir}\`.`
+    );
+  }
+}
+
+async function fetchRelayCapabilityState(
+  config: { capabilityReportUrl?: string; capabilityReportToken?: string; operatorId?: string; gatewayId?: string },
+  timeoutMs: number,
+  options: { activeOnly?: boolean } = {}
+): Promise<{ ok: boolean; value?: unknown; error?: string; status?: number }> {
+  if (!config.capabilityReportUrl || !config.operatorId || !config.gatewayId) {
+    return { ok: false, error: "capability URL, operatorId, and gatewayId are required" };
+  }
+  const url = new URL(config.capabilityReportUrl);
+  url.searchParams.set("operatorId", config.operatorId);
+  url.searchParams.set("gatewayId", config.gatewayId);
+  url.searchParams.set("limit", "1");
+  if (options.activeOnly) {
+    url.searchParams.set("activeOnly", "true");
+  }
+  return fetchOptionalJson(url, timeoutMs, {
+    headers: authorizationHeaders(config.capabilityReportToken)
+  });
+}
+
+function relayCapabilityIncludesGateway(value: unknown, operatorId: string | undefined, gatewayId: string | undefined): boolean {
+  if (!operatorId || !gatewayId) {
+    return false;
+  }
+  const record = asRecord(value);
+  const latest = Array.isArray(record?.latest) ? record.latest : [];
+  const reports = Array.isArray(record?.reports) ? record.reports : [];
+  return [...latest, ...reports].some((item) => {
+    const itemRecord = asRecord(item);
+    const report = asRecord(itemRecord?.report);
+    const operator = asRecord(report?.operator);
+    return stringRecordField(operator, "operatorId")?.toLowerCase() === operatorId.toLowerCase() &&
+      stringRecordField(operator, "gatewayId") === gatewayId;
+  });
+}
+
+function authorizationHeaders(token: string | undefined): Record<string, string> {
+  return token ? { authorization: `Bearer ${token}` } : {};
+}
+
+export function relayAdmissionConfigIssues(config: {
+  network: string;
+  operatorId?: string;
+  gatewayId?: string;
+  reportSeed?: string;
+  capabilityReportUrl?: string;
+  capabilityReportToken?: string;
+  routeStateUrl?: string;
+  routeStateToken?: string;
+}): string[] {
+  if (config.network !== "mainnet") {
+    return [];
+  }
+  const missing: string[] = [];
+  if (!config.operatorId) {
+    missing.push("--operator-id or SWITCHBOARD_OPERATOR_ID/PROOF_OPERATOR_ID");
+  }
+  if (!config.gatewayId) {
+    missing.push("--gateway-id or GATEWAY_ID");
+  }
+  if (!config.reportSeed) {
+    missing.push("--operator-report-seed-env or OPERATOR_REPORT_SEED");
+  }
+  if (!config.capabilityReportUrl) {
+    missing.push("--capability-url or PROOF_OPERATOR_CAPABILITY_URL");
+  }
+  if (!config.capabilityReportToken) {
+    missing.push("--capability-token-env or PROOF_OPERATOR_CAPABILITY_TOKEN");
+  }
+  if (!config.routeStateUrl) {
+    missing.push("--route-state-url or GATEWAY_ROUTE_STATE_URL");
+  }
+  if (!config.routeStateToken) {
+    missing.push("--route-state-token-env, GATEWAY_ROUTE_STATE_TOKEN, or a capability token");
+  }
+  return missing;
+}
+
+export function relayAdmissionConfigMessage(missing: string[]): string {
+  return [
+    "Mainnet operator setup is missing relay admission/reporting configuration.",
+    "A gateway launched without this material can be locally healthy but absent from relay capacity.",
+    `Missing: ${missing.join("; ")}.`,
+    "Pass the missing values, use --prepare-admission to create an admission request, or use --local-only for lab installs."
+  ].join(" ");
+}
+
+async function confirmSharedManagerProcessorScope(
+  config: OperatorSetupConfig,
+  prompt: PromptIo,
+  warnings: string[]
+): Promise<void> {
+  const managerIds = splitCsv(config.managerIds);
+  const sharedManagerIds = managerIds.filter((id) => id === "9470");
+  if (config.localOnly || config.processorRefs || sharedManagerIds.length === 0) {
+    return;
+  }
+  const message =
+    `Manager ID ${sharedManagerIds.join(",")} is shared; without --processor/--processor-file this gateway can advertise the whole manager fleet.`;
+  warnings.push(`${message} Pass an explicit processor allowlist before third-party or multi-site admission.`);
+  if (await confirm(prompt, config.assumeYes, "Continue without an explicit processor allowlist?")) {
+    return;
+  }
+  throw new Error(`${message} Refusing setup. Pass --processor-file <path>, --processor <refs>, or --local-only.`);
+}
+
+function buildAdmissionRequest(config: OperatorSetupConfig, createdAt: Date): OperatorAdmissionRequest {
+  if (!config.reportSigner) {
+    throw new Error("Cannot build admission request without a derived report signer.");
+  }
+  const processors = splitCsv(config.processorRefs);
+  return {
+    version: 1,
+    kind: "switchboard.operator.admission.request",
+    createdAt: createdAt.toISOString(),
+    network: config.network,
+    operatorId: config.operatorId,
+    gatewayId: config.gatewayId,
+    managerIds: splitCsv(config.managerIds),
+    processorAllowlist: {
+      count: processors.length,
+      sha256: processors.length > 0 ? sha256Hex(processors.join("\n")) : undefined
+    },
+    publicAddress: {
+      value: config.publicAddress,
+      mode: config.publicAddressMode,
+      port: config.publicPort
+    },
+    payoutAddress: config.payoutAddress,
+    reportSigner: config.reportSigner,
+    requestedRelays: {
+      capabilityReportUrl: config.capabilityReportUrl,
+      routeStateUrl: config.routeStateUrl
+    }
+  };
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 export function capabilityRegistrationWarning(status: number, body: string): string | undefined {
@@ -969,7 +1582,13 @@ async function writeOperatorEnvFile(envFile: string, updates: Record<string, str
   const existing = await readEnvFileOrTemplate(envFile, projectDir);
   const next = mergeOperatorEnv(existing, updates);
   await mkdir(path.dirname(envFile), { recursive: true });
-  await writeFile(envFile, next, "utf8");
+  await writeFile(envFile, next, { encoding: "utf8", mode: 0o600 });
+  await chmod(envFile, 0o600);
+}
+
+async function writeJsonFile(file: string, value: unknown, mode: number): Promise<void> {
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode });
 }
 
 async function seedPackagedOperatorAssets(
@@ -1375,11 +1994,16 @@ function isManagerIdList(value: string): boolean {
   return value.split(",").every((item) => /^[0-9]+$/.test(item.trim()) && item.trim().length > 0);
 }
 
-function resolveProcessorRefs(flags: Map<string, string | boolean>): string | undefined {
-  const value =
-    stringFlag(flags, "processor") ??
-    stringFlag(flags, "processors") ??
-    process.env.OPERATOR_PROCESSORS;
+async function resolveProcessorRefs(
+  flags: Map<string, string | boolean>,
+  existingEnv: Map<string, string>,
+  projectDir: string
+): Promise<string | undefined> {
+  const inlineValue = stringFlag(flags, "processor") ?? stringFlag(flags, "processors");
+  const fileValue = stringFlag(flags, "processor-file")
+    ? await readProcessorFile(path.resolve(projectDir, stringFlag(flags, "processor-file")!))
+    : undefined;
+  const value = inlineValue ?? fileValue ?? process.env.OPERATOR_PROCESSORS ?? envValue(existingEnv, "OPERATOR_PROCESSORS");
   if (!value) {
     return undefined;
   }
@@ -1390,11 +2014,49 @@ function resolveProcessorRefs(flags: Map<string, string | boolean>): string | un
   return refs.join(",");
 }
 
-function resolveOperatorId(flags: Map<string, string | boolean>): string | undefined {
+async function readProcessorFile(file: string): Promise<string> {
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch (error) {
+    throw new Error(`Could not read --processor-file ${file}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => String(item)).join(",");
+    }
+    if (parsed && typeof parsed === "object") {
+      const record = parsed as Record<string, unknown>;
+      for (const key of ["processors", "includeProcessors", "operatorProcessors"]) {
+        const value = record[key];
+        if (Array.isArray(value)) {
+          return value.map((item) => String(item)).join(",");
+        }
+      }
+    }
+  } catch {
+    // Fall through to text parsing.
+  }
+  return trimmed.split(/[\s,]+/).filter(Boolean).join(",");
+}
+
+function resolveOperatorId(
+  flags: Map<string, string | boolean>,
+  existingEnv: Map<string, string>,
+  admissionBundle: OperatorAdmissionBundle | undefined
+): string | undefined {
   const value =
     stringFlag(flags, "operator-id") ??
+    process.env.OPERATOR_ID ??
     process.env.SWITCHBOARD_OPERATOR_ID ??
-    process.env.PROOF_OPERATOR_ID;
+    process.env.PROOF_OPERATOR_ID ??
+    envValue(existingEnv, "OPERATOR_ID", "SWITCHBOARD_OPERATOR_ID", "PROOF_OPERATOR_ID") ??
+    admissionBundle?.operatorId;
   if (!value) {
     return undefined;
   }
@@ -1408,7 +2070,13 @@ function resolveOperatorId(flags: Map<string, string | boolean>): string | undef
   return normalized;
 }
 
-function resolveEnvSecret(flags: Map<string, string | boolean>, flagName: string, directEnvName: string): string | undefined {
+function resolveEnvSecret(
+  flags: Map<string, string | boolean>,
+  flagName: string,
+  directEnvName: string,
+  existingEnv: Map<string, string>,
+  fallback?: string
+): string | undefined {
   const envName = stringFlag(flags, flagName);
   if (envName) {
     const value = process.env[envName];
@@ -1417,13 +2085,86 @@ function resolveEnvSecret(flags: Map<string, string | boolean>, flagName: string
     }
     return value;
   }
-  const value = process.env[directEnvName];
+  const value = process.env[directEnvName] ?? envValue(existingEnv, directEnvName) ?? fallback;
   return value && value.length > 0 ? value : undefined;
+}
+
+async function resolveReportSeed(input: {
+  flags: Map<string, string | boolean>;
+  existingEnv: Map<string, string>;
+  prompt: PromptIo;
+  runtime: OperatorSetupRuntime;
+  assumeYes: boolean;
+}): Promise<{ seed?: string; generated: boolean }> {
+  const existing = resolveEnvSecret(input.flags, "operator-report-seed-env", "OPERATOR_REPORT_SEED", input.existingEnv);
+  if (existing) {
+    return { seed: existing, generated: false };
+  }
+  if (boolFlag(input.flags, "generate-report-seed")) {
+    return { seed: generateReportSeed(input.runtime), generated: true };
+  }
+  if (await confirm(input.prompt, false, "No OPERATOR_REPORT_SEED was found. Generate a new local sr25519 report seed?")) {
+    return { seed: generateReportSeed(input.runtime), generated: true };
+  }
+  return { generated: false };
+}
+
+function generateReportSeed(runtime: OperatorSetupRuntime): string {
+  const seed = runtime.generateReportSeed ? runtime.generateReportSeed() : mnemonicGenerate(12);
+  if (!mnemonicValidate(seed)) {
+    throw new Error("Generated report seed is not a valid BIP-39 mnemonic.");
+  }
+  return seed;
+}
+
+async function tryDeriveReportSigner(seed: string, warnings: string[]): Promise<ReportSignerMetadata | undefined> {
+  try {
+    return await deriveReportSigner(seed);
+  } catch (error) {
+    warnings.push(`Could not derive sr25519 report signer from OPERATOR_REPORT_SEED: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
+export async function deriveReportSigner(seed: string, ss58Format = 42): Promise<ReportSignerMetadata> {
+  await cryptoWaitReady();
+  const keyring = new Keyring({ type: "sr25519", ss58Format });
+  const pair = keyring.addFromUri(seed);
+  return {
+    scheme: "substrate-sr25519",
+    address: pair.address,
+    publicKey: u8aToHex(pair.publicKey),
+    ss58Format
+  };
+}
+
+function resolvePayoutAddress(
+  flags: Map<string, string | boolean>,
+  existingEnv: Map<string, string>,
+  admissionBundle: OperatorAdmissionBundle | undefined
+): string | undefined {
+  const value =
+    stringFlag(flags, "payout-address") ??
+    process.env.OPERATOR_PAYOUT_ADDRESS ??
+    envValue(existingEnv, "OPERATOR_PAYOUT_ADDRESS") ??
+    admissionBundle?.payoutAddress;
+  if (!value) {
+    return undefined;
+  }
+  try {
+    return ethers.getAddress(value);
+  } catch {
+    throw new Error("--payout-address must be a valid 0x-prefixed EVM address");
+  }
 }
 
 function sanitizeGatewayId(value: string): string {
   const sanitized = value.replace(/[^A-Za-z0-9_.:-]+/g, "-").replace(/^-+|-+$/g, "");
   return sanitized.length > 0 ? sanitized : "operator-gateway";
+}
+
+function splitCsv(value: string | undefined): string[] {
+  return (value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
 }
 
 function defaultRouteStateUrl(operatorId: string, gatewayId: string): string {
@@ -1516,20 +2257,161 @@ function writeOutput(flags: Map<string, string | boolean>, value: unknown, print
   printHuman();
 }
 
+export function classifyOperatorStatus(input: {
+  env: Map<string, string>;
+  docker: DockerState;
+  health: unknown;
+  healthOk: boolean;
+  localCapability: unknown;
+  localCapabilityOk: boolean;
+  relayCapability?: unknown;
+  relayCapabilityOk?: boolean;
+  operatorId?: string;
+  gatewayId?: string;
+  now: Date;
+}): { state: OperatorStatusClassification; findings: string[] } {
+  const findings: string[] = [];
+  if (!input.docker.docker.ok) findings.push("docker CLI is not available");
+  if (!input.docker.compose.ok) findings.push("Docker Compose is not available");
+  if (input.docker.docker.ok && !input.docker.daemon.ok) findings.push("current user cannot access the Docker daemon");
+
+  const configuredMode = envValue(input.env, "SWITCHBOARD_OPERATOR_MODE");
+  const admissionIssues = relayAdmissionConfigIssues({
+    network: envValue(input.env, "ACURAST_NETWORK") ?? "mainnet",
+    operatorId: input.operatorId,
+    gatewayId: input.gatewayId,
+    reportSeed: envValue(input.env, "OPERATOR_REPORT_SEED"),
+    capabilityReportUrl: envValue(input.env, "PROOF_OPERATOR_CAPABILITY_URL"),
+    capabilityReportToken: envValue(input.env, "PROOF_OPERATOR_CAPABILITY_TOKEN"),
+    routeStateUrl: envValue(input.env, "GATEWAY_ROUTE_STATE_URL"),
+    routeStateToken: envValue(input.env, "GATEWAY_ROUTE_STATE_TOKEN") ?? envValue(input.env, "PROOF_OPERATOR_CAPABILITY_TOKEN")
+  });
+  if (configuredMode === "local-only") {
+    return { state: "local-only", findings };
+  }
+  if (configuredMode === "pre-admission" || admissionIssues.length > 0) {
+    findings.push(...admissionIssues.map((item) => `missing ${item}`));
+    return { state: admissionIssues.length > 0 ? "pre-admission" : "pre-admission", findings };
+  }
+
+  const healthRecord = asRecord(input.health);
+  const routeState = asRecord(healthRecord?.routeState);
+  if (input.healthOk && routeState?.enabled === true && routeState.healthy === false) {
+    findings.push("local gateway route-state polling is unhealthy");
+    return { state: "route-state-unhealthy", findings };
+  }
+  const localReport = asRecord(asRecord(input.localCapability)?.report);
+  const localGateway = asRecord(localReport?.gateway);
+  if (input.localCapabilityOk && localGateway?.routeStateHealthy === false) {
+    findings.push("local capability report marks route-state unhealthy");
+    return { state: "route-state-unhealthy", findings };
+  }
+
+  const latest = latestRelayCapability(input.relayCapability, input.operatorId, input.gatewayId);
+  if (!input.relayCapabilityOk || !latest) {
+    findings.push("relay does not currently return this operatorId + gatewayId capability report");
+    return { state: "relay-missing", findings };
+  }
+  const latestReport = asRecord(asRecord(latest)?.report);
+  const expiresAt = stringRecordField(latestReport, "expiresAt");
+  if (expiresAt && Date.parse(expiresAt) <= input.now.getTime()) {
+    findings.push(`relay capability report expired at ${expiresAt}`);
+    return { state: "report-stale", findings };
+  }
+  const latestGateway = asRecord(latestReport?.gateway);
+  if (latestGateway?.routeStateHealthy === false) {
+    findings.push("relay latest capability report marks route-state unhealthy");
+    return { state: "route-state-unhealthy", findings };
+  }
+  return { state: "admitted", findings };
+}
+
+function operatorStatusHealthy(state: OperatorStatusClassification): boolean {
+  return state === "local-only" || state === "pre-admission" || state === "admitted";
+}
+
+function currentUsername(): string | undefined {
+  try {
+    return os.userInfo().username;
+  } catch {
+    return undefined;
+  }
+}
+
+function latestRelayCapability(value: unknown, operatorId: string | undefined, gatewayId: string | undefined): unknown {
+  const record = asRecord(value);
+  const candidates = [
+    ...(Array.isArray(record?.latest) ? record.latest : []),
+    ...(Array.isArray(record?.reports) ? [...record.reports].reverse() : [])
+  ];
+  if (!operatorId || !gatewayId) {
+    return candidates[0];
+  }
+  return candidates.find((item) => {
+    const report = asRecord(asRecord(item)?.report);
+    const operator = asRecord(report?.operator);
+    return stringRecordField(operator, "operatorId")?.toLowerCase() === operatorId.toLowerCase() &&
+      stringRecordField(operator, "gatewayId") === gatewayId;
+  });
+}
+
+function redactSensitive(value: unknown, key = ""): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (sensitiveKey(key)) {
+    return typeof value === "boolean" ? value : "[redacted]";
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitive(item));
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([entryKey, entryValue]) => [entryKey, redactSensitive(entryValue, entryKey)])
+    );
+  }
+  return value;
+}
+
+function sensitiveKey(key: string): boolean {
+  return /token|seed|secret|private.?key|password|authorization|bearer/i.test(key);
+}
+
 function printOperatorStatus(report: {
   ok: boolean;
+  state: OperatorStatusClassification;
+  findings: string[];
   projectDir: string;
   composeFiles: string[];
   envFile: string;
-  docker: DockerState;
+  docker: DockerState & { currentUser?: string; userCanAccessDaemon?: boolean; daemonError?: string };
   compose: { ok: boolean; stdout?: string; stderr?: string };
+  config: {
+    operatorId?: string;
+    gatewayId?: string;
+    admissionMode?: string;
+    capabilityUrl?: string;
+    routeStateUrl?: string;
+    reportSeedConfigured: boolean;
+    routeStateTokenConfigured: boolean;
+    capabilityTokenConfigured: boolean;
+  };
   gatewayAgent: { url: string; ok: boolean; health?: unknown; error?: string };
   capability: { localOk: boolean; local?: unknown; localError?: string; relayUrl?: string; relayOk?: boolean; relay?: unknown; relayError?: string };
 }): void {
-  console.log(`Operator status: ${report.ok ? "ok" : "needs attention"}`);
+  console.log(`Operator status: ${report.state}${report.ok ? "" : " (needs attention)"}`);
   console.log(`Docker: ${report.docker.docker.ok ? "ok" : "missing"}; Compose: ${report.docker.compose.ok ? "ok" : "missing"}`);
+  if (report.docker.docker.ok) {
+    console.log(`Docker daemon access: ${report.docker.userCanAccessDaemon ? "ok" : `blocked for ${report.docker.currentUser ?? "current user"}`}`);
+    if (report.docker.daemonError) {
+      console.log(`Docker daemon error: ${report.docker.daemonError}`);
+    }
+  }
   console.log(`Env file: ${report.envFile}`);
   console.log(`Compose files: ${report.composeFiles.join(", ")}`);
+  console.log(`Operator ID: ${report.config.operatorId ?? "not configured"}`);
+  console.log(`Gateway ID: ${report.config.gatewayId ?? "not configured"}`);
+  console.log(`Admission mode: ${report.config.admissionMode ?? "inferred"}`);
   console.log(`Compose: ${report.compose.ok ? "ok" : "not ready"}`);
   if (report.compose.stdout) {
     console.log(report.compose.stdout);
@@ -1552,6 +2434,17 @@ function printOperatorStatus(report: {
     }
   } else {
     console.log("Relay capability lookup: skipped (PROOF_OPERATOR_CAPABILITY_URL is not configured)");
+  }
+  if (report.findings.length > 0) {
+    console.log("");
+    console.log("Findings:");
+    for (const finding of report.findings) {
+      console.log(`- ${finding}`);
+    }
+  }
+  if (!report.ok) {
+    console.log("");
+    console.log(`Next: switchboard operator status --project-dir ${report.projectDir} --json`);
   }
 }
 
@@ -1578,12 +2471,23 @@ function printOperatorSetupReport(report: OperatorSetupReport): void {
   if (report.config.processorRefs) {
     console.log(`Processors: ${report.config.processorRefs.split(",").length} explicit include(s)`);
   }
+  if (report.config.payoutAddress) {
+    console.log(`Payout address: ${report.config.payoutAddress}`);
+  }
+  if (report.config.reportSigner) {
+    console.log(`Report signer: ${report.config.reportSigner.address}`);
+    console.log(`Report signer public key: ${report.config.reportSigner.publicKey}`);
+  }
+  console.log(`Admission mode: ${report.config.admissionMode}`);
+  if (report.config.admissionRequestFile) {
+    console.log(`Admission request: ${report.config.admissionRequestFile}`);
+  }
   console.log(`Env file: ${report.config.envFile}`);
   console.log(`Compose file: ${report.config.composeFile}`);
   console.log(
     report.config.localBuild
       ? "Images: local build"
-      : `Images: ${report.config.imageRegistry}/operator:${report.config.imageTag}`
+      : `Images: ${report.config.imageRegistry}/gateway:${report.config.imageTag}`
   );
   if (report.actions.length > 0) {
     console.log("");

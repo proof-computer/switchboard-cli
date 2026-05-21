@@ -1,21 +1,26 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import {
   capabilityRegistrationWarning,
+  classifyOperatorStatus,
   composePullServicesCommand,
   composeUpCommand,
+  deriveReportSigner,
   mergeOperatorEnv,
   migrateLegacyGatewayImage,
   migrateLegacyTlsTestUpstreamImage,
   parseOsRelease,
+  parseOperatorAdmissionBundle,
   planOperatorImageMigration,
   setupOperator,
   shouldPrompt
 } from "../scripts/operator/setup.js";
+
+const TEST_REPORT_MNEMONIC = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
 
 describe("operator setup helpers", () => {
   it("--yes disables readline prompts so sudo can own the terminal", () => {
@@ -155,6 +160,7 @@ describe("operator setup helpers", () => {
         ["manager-id", "1"],
         ["skip-install", true],
         ["skip-compose", true],
+        ["local-only", true],
         ["dry-run", true],
         ["yes", true]
       ])
@@ -181,6 +187,7 @@ describe("operator setup helpers", () => {
         ["manager-id", "9470"],
         ["skip-install", true],
         ["skip-compose", true],
+        ["local-only", true],
         ["yes", true]
       ])
     );
@@ -264,6 +271,7 @@ describe("operator setup helpers", () => {
         ["processor", "5First, 5Second"],
         ["skip-install", true],
         ["skip-compose", true],
+        ["local-only", true],
         ["dry-run", true],
         ["yes", true]
       ])
@@ -283,6 +291,7 @@ describe("operator setup helpers", () => {
         ["operator-id", operatorId],
         ["skip-install", true],
         ["skip-compose", true],
+        ["local-only", true],
         ["yes", true]
       ])
     );
@@ -296,7 +305,7 @@ describe("operator setup helpers", () => {
     const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-capability-"));
     const previousSeed = process.env.JEN_OPERATOR_REPORT_SEED;
     const previousToken = process.env.JEN_OPERATOR_CAPABILITY_TOKEN;
-    process.env.JEN_OPERATOR_REPORT_SEED = "test report seed";
+    process.env.JEN_OPERATOR_REPORT_SEED = TEST_REPORT_MNEMONIC;
     process.env.JEN_OPERATOR_CAPABILITY_TOKEN = "test-token";
     try {
       const report = await setupOperator(
@@ -304,6 +313,8 @@ describe("operator setup helpers", () => {
           ["project-dir", projectDir],
           ["public-address", "127.0.0.1"],
           ["manager-id", "9470"],
+          ["operator-id", "0x5c58c1d827db4fc0df06f17cc1e469b96dd86e17e3c2f19d8a7efec218028763"],
+          ["gateway-id", "switchboard-az-test"],
           ["operator-report-seed-env", "JEN_OPERATOR_REPORT_SEED"],
           ["capability-url", "https://control.switchboard.proof.computer/v1/operator-capabilities"],
           ["capability-token-env", "JEN_OPERATOR_CAPABILITY_TOKEN"],
@@ -315,9 +326,10 @@ describe("operator setup helpers", () => {
 
       assert.equal(report.config.capabilityReportUrl, "https://control.switchboard.proof.computer/v1/operator-capabilities");
       const env = await readFile(path.join(projectDir, ".operator-host", "operator.env"), "utf8");
-      assert.match(env, /^OPERATOR_REPORT_SEED=test report seed$/m);
+      assert.match(env, new RegExp(`^OPERATOR_REPORT_SEED=${TEST_REPORT_MNEMONIC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
       assert.match(env, /^PROOF_OPERATOR_CAPABILITY_URL=https:\/\/control\.switchboard\.proof\.computer\/v1\/operator-capabilities$/m);
       assert.match(env, /^PROOF_OPERATOR_CAPABILITY_TOKEN=test-token$/m);
+      assert.match(env, /^GATEWAY_ROUTE_STATE_TOKEN=test-token$/m);
     } finally {
       if (previousSeed === undefined) {
         delete process.env.JEN_OPERATOR_REPORT_SEED;
@@ -334,7 +346,9 @@ describe("operator setup helpers", () => {
 
   it("records route-state polling configuration during setup", async () => {
     const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-route-api-"));
+    const previousSeed = process.env.OPERATOR_REPORT_SEED;
     const previousToken = process.env.PROOF_OPERATOR_CAPABILITY_TOKEN;
+    process.env.OPERATOR_REPORT_SEED = TEST_REPORT_MNEMONIC;
     process.env.PROOF_OPERATOR_CAPABILITY_TOKEN = "capability-token";
     try {
       const report = await setupOperator(
@@ -356,6 +370,7 @@ describe("operator setup helpers", () => {
       assert.equal(report.network.routeStateUrl, expectedRouteStateUrl);
       const env = await readFile(path.join(projectDir, ".operator-host", "operator.env"), "utf8");
       assert.match(env, /^GATEWAY_AGENT_BIND_ADDR=127\.0\.0\.1$/m);
+      assert.match(env, /^PROOF_OPERATOR_CAPABILITY_URL=https:\/\/control\.switchboard\.proof\.computer\/v1\/operator-capabilities$/m);
       assert.match(env, new RegExp(`^GATEWAY_ROUTE_STATE_URL=${expectedRouteStateUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
       assert.match(env, /^GATEWAY_ROUTE_STATE_TOKEN=capability-token$/m);
       assert.match(env, /^ROUTE_INTENT_OUTPUT_URL=http:\/\/gateway-agent:18080\/internal\/route-intents$/m);
@@ -363,12 +378,275 @@ describe("operator setup helpers", () => {
       assert.doesNotMatch(env, /^GATEWAY_AGENT_ROUTE_INTENT_AUTH_MODE=/m);
       assert.doesNotMatch(env, /^GATEWAY_AGENT_ROUTE_INTENT_ALLOWED_SIGNERS=/m);
     } finally {
+      if (previousSeed === undefined) {
+        delete process.env.OPERATOR_REPORT_SEED;
+      } else {
+        process.env.OPERATOR_REPORT_SEED = previousSeed;
+      }
       if (previousToken === undefined) {
         delete process.env.PROOF_OPERATOR_CAPABILITY_TOKEN;
       } else {
         process.env.PROOF_OPERATOR_CAPABILITY_TOKEN = previousToken;
       }
     }
+  });
+
+  it("fails mainnet setup without relay admission material unless local-only", async () => {
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-admission-"));
+    await assert.rejects(
+      setupOperator(
+        new Map<string, string | boolean>([
+          ["project-dir", projectDir],
+          ["public-address", "127.0.0.1"],
+          ["manager-id", "9470"],
+          ["skip-install", true],
+          ["skip-compose", true],
+          ["dry-run", true],
+          ["yes", true]
+        ])
+      ),
+      /Mainnet operator setup is missing relay admission\/reporting configuration/
+    );
+  });
+
+  it("records a distinct route-state token when one is supplied", async () => {
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-route-token-"));
+    const previousSeed = process.env.ROUTE_TOKEN_OPERATOR_REPORT_SEED;
+    const previousCapabilityToken = process.env.ROUTE_TOKEN_CAPABILITY_TOKEN;
+    const previousRouteToken = process.env.ROUTE_TOKEN_ROUTE_STATE_TOKEN;
+    process.env.ROUTE_TOKEN_OPERATOR_REPORT_SEED = TEST_REPORT_MNEMONIC;
+    process.env.ROUTE_TOKEN_CAPABILITY_TOKEN = "capability-token";
+    process.env.ROUTE_TOKEN_ROUTE_STATE_TOKEN = "route-state-token";
+    try {
+      await setupOperator(
+        new Map<string, string | boolean>([
+          ["project-dir", projectDir],
+          ["public-address", "127.0.0.1"],
+          ["manager-id", "9470"],
+          ["operator-id", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+          ["gateway-id", "switchboard-az-token-test"],
+          ["operator-report-seed-env", "ROUTE_TOKEN_OPERATOR_REPORT_SEED"],
+          ["capability-token-env", "ROUTE_TOKEN_CAPABILITY_TOKEN"],
+          ["route-state-token-env", "ROUTE_TOKEN_ROUTE_STATE_TOKEN"],
+          ["skip-install", true],
+          ["skip-compose", true],
+          ["yes", true]
+        ])
+      );
+
+      const env = await readFile(path.join(projectDir, ".operator-host", "operator.env"), "utf8");
+      assert.match(env, /^PROOF_OPERATOR_CAPABILITY_TOKEN=capability-token$/m);
+      assert.match(env, /^GATEWAY_ROUTE_STATE_TOKEN=route-state-token$/m);
+    } finally {
+      if (previousSeed === undefined) {
+        delete process.env.ROUTE_TOKEN_OPERATOR_REPORT_SEED;
+      } else {
+        process.env.ROUTE_TOKEN_OPERATOR_REPORT_SEED = previousSeed;
+      }
+      if (previousCapabilityToken === undefined) {
+        delete process.env.ROUTE_TOKEN_CAPABILITY_TOKEN;
+      } else {
+        process.env.ROUTE_TOKEN_CAPABILITY_TOKEN = previousCapabilityToken;
+      }
+      if (previousRouteToken === undefined) {
+        delete process.env.ROUTE_TOKEN_ROUTE_STATE_TOKEN;
+      } else {
+        process.env.ROUTE_TOKEN_ROUTE_STATE_TOKEN = previousRouteToken;
+      }
+    }
+  });
+
+  it("generates a report seed for prepare-admission without exposing it in reports", async () => {
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-generated-seed-"));
+    const report = await setupOperator(
+      new Map<string, string | boolean>([
+        ["project-dir", projectDir],
+        ["public-address", "198.51.100.25"],
+        ["manager-id", "9470"],
+        ["gateway-id", "switchboard-az-generated"],
+        ["processor", "5First,5Second"],
+        ["payout-address", "0x000000000000000000000000000000000000dEaD"],
+        ["generate-report-seed", true],
+        ["prepare-admission", true],
+        ["skip-install", true],
+        ["yes", true]
+      ]),
+      undefined,
+      { generateReportSeed: () => TEST_REPORT_MNEMONIC }
+    );
+
+    const envFile = path.join(projectDir, ".operator-host", "operator.env");
+    const env = await readFile(envFile, "utf8");
+    assert.match(env, new RegExp(`^OPERATOR_REPORT_SEED=${TEST_REPORT_MNEMONIC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
+    assert.match(env, /^SWITCHBOARD_OPERATOR_MODE=pre-admission$/m);
+    assert.match(env, /^OPERATOR_PAYOUT_ADDRESS=0x000000000000000000000000000000000000dEaD$/m);
+    assert.equal((await stat(envFile)).mode & 0o777, 0o600);
+    assert.ok(report.config.reportSigner?.address);
+    assert.ok(report.config.reportSigner?.publicKey.startsWith("0x"));
+    assert.equal(JSON.stringify(report).includes(TEST_REPORT_MNEMONIC), false);
+
+    const admissionRequestFile = path.join(projectDir, "operator-admission-request.json");
+    const admissionRequest = JSON.parse(await readFile(admissionRequestFile, "utf8")) as {
+      processorAllowlist: { count: number; sha256: string };
+      reportSigner: { address: string; publicKey: string };
+    };
+    assert.equal(admissionRequest.processorAllowlist.count, 2);
+    assert.match(admissionRequest.processorAllowlist.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(admissionRequest.reportSigner.address, report.config.reportSigner?.address);
+    assert.equal(admissionRequest.reportSigner.publicKey, report.config.reportSigner?.publicKey);
+    assert.equal(JSON.stringify(admissionRequest).includes(TEST_REPORT_MNEMONIC), false);
+  });
+
+  it("requires an explicit seed source for non-interactive prepare-admission", async () => {
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-missing-seed-"));
+    await assert.rejects(
+      setupOperator(
+        new Map<string, string | boolean>([
+          ["project-dir", projectDir],
+          ["public-address", "127.0.0.1"],
+          ["manager-id", "9470"],
+          ["prepare-admission", true],
+          ["skip-install", true],
+          ["skip-compose", true],
+          ["yes", true]
+        ])
+      ),
+      /Preparing admission requires a valid sr25519 report seed/
+    );
+  });
+
+  it("parses admission bundles and rejects missing relay material", () => {
+    assert.throws(
+      () => parseOperatorAdmissionBundle({ operatorId: "0x" + "11".repeat(32), gatewayId: "gw" }),
+      /Admission file is missing required field\(s\): capability\.url/
+    );
+    const parsed = parseOperatorAdmissionBundle({
+      operatorId: "0x" + "22".repeat(32),
+      gatewayId: "gateway-1",
+      capability: { url: "https://control.example/v1/operator-capabilities", token: "cap-token" },
+      routeState: { url: "https://control.example/v1/operators/op/gateways/gateway-1/route-state", token: "route-token" },
+      acceptedSigner: { address: "5Signer", publicKey: "0x" + "11".repeat(32) }
+    });
+    assert.equal(parsed.capabilityReportToken, "cap-token");
+    assert.equal(parsed.routeStateToken, "route-token");
+  });
+
+  it("applies an admission file and verifies accepted signer metadata", async () => {
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-admission-file-"));
+    const signer = await deriveReportSigner(TEST_REPORT_MNEMONIC);
+    const admissionFile = path.join(projectDir, "operator-admission.json");
+    await writeFile(
+      admissionFile,
+      JSON.stringify({
+        operatorId: "0x" + "33".repeat(32),
+        gatewayId: "gateway-admitted",
+        capability: { url: "https://control.example/v1/operator-capabilities", token: "cap-token" },
+        routeState: { url: "https://control.example/v1/operators/op/gateways/gateway-admitted/route-state", token: "route-token" },
+        acceptedSigner: signer
+      }),
+      "utf8"
+    );
+
+    await setupOperator(
+      new Map<string, string | boolean>([
+        ["project-dir", projectDir],
+        ["public-address", "198.51.100.26"],
+        ["manager-id", "9470"],
+        ["processor", "5First"],
+        ["admission-file", admissionFile],
+        ["generate-report-seed", true],
+        ["skip-install", true],
+        ["skip-compose", true],
+        ["yes", true]
+      ]),
+      undefined,
+      { generateReportSeed: () => TEST_REPORT_MNEMONIC }
+    );
+
+    const env = await readFile(path.join(projectDir, ".operator-host", "operator.env"), "utf8");
+    assert.match(env, /^OPERATOR_ID=0x3333333333333333333333333333333333333333333333333333333333333333$/m);
+    assert.match(env, /^GATEWAY_ID=gateway-admitted$/m);
+    assert.match(env, /^PROOF_OPERATOR_CAPABILITY_TOKEN=cap-token$/m);
+    assert.match(env, /^GATEWAY_ROUTE_STATE_TOKEN=route-token$/m);
+    assert.match(env, /^SWITCHBOARD_OPERATOR_MODE=admitted$/m);
+  });
+
+  it("reads processor allowlists from files", async () => {
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-processor-file-"));
+    const processorFile = path.join(projectDir, "processors.json");
+    await writeFile(processorFile, JSON.stringify(["5First", "5Second"]), "utf8");
+    const report = await setupOperator(
+      new Map<string, string | boolean>([
+        ["project-dir", projectDir],
+        ["public-address", "127.0.0.1"],
+        ["manager-id", "9470"],
+        ["processor-file", processorFile],
+        ["skip-install", true],
+        ["skip-compose", true],
+        ["local-only", true],
+        ["dry-run", true],
+        ["yes", true]
+      ])
+    );
+
+    assert.equal(report.config.processorRefs, "5First,5Second");
+  });
+
+  it("classifies admitted, stale, unhealthy, missing, and Docker-permission status", () => {
+    const env = new Map<string, string>([
+      ["OPERATOR_ID", "0x" + "44".repeat(32)],
+      ["GATEWAY_ID", "gateway-status"],
+      ["OPERATOR_REPORT_SEED", "configured"],
+      ["PROOF_OPERATOR_CAPABILITY_URL", "https://control.example/v1/operator-capabilities"],
+      ["PROOF_OPERATOR_CAPABILITY_TOKEN", "cap-token"],
+      ["GATEWAY_ROUTE_STATE_URL", "https://control.example/route-state"],
+      ["GATEWAY_ROUTE_STATE_TOKEN", "route-token"]
+    ]);
+    const docker = {
+      docker: { ok: true, command: "docker", args: ["--version"] },
+      compose: { ok: true, command: "docker", args: ["compose", "version"] },
+      composeStyle: "docker-compose-plugin" as const,
+      daemon: { ok: true, command: "docker", args: ["info"] }
+    };
+    const latest = (expiresAt: string, routeStateHealthy = true) => ({
+      latest: [
+        {
+          report: {
+            expiresAt,
+            operator: { operatorId: "0x" + "44".repeat(32), gatewayId: "gateway-status" },
+            gateway: { routeStateHealthy }
+          }
+        }
+      ]
+    });
+    const common = {
+      env,
+      docker,
+      health: { routeState: { enabled: true, healthy: true } },
+      healthOk: true,
+      localCapability: { report: { gateway: { routeStateHealthy: true } } },
+      localCapabilityOk: true,
+      operatorId: "0x" + "44".repeat(32),
+      gatewayId: "gateway-status",
+      now: new Date("2026-05-20T12:00:00.000Z")
+    };
+
+    assert.equal(classifyOperatorStatus({ ...common, relayCapabilityOk: true, relayCapability: latest("2026-05-20T12:05:00.000Z") }).state, "admitted");
+    assert.equal(classifyOperatorStatus({ ...common, relayCapabilityOk: true, relayCapability: latest("2026-05-20T11:59:00.000Z") }).state, "report-stale");
+    assert.equal(classifyOperatorStatus({ ...common, relayCapabilityOk: true, relayCapability: latest("2026-05-20T12:05:00.000Z", false) }).state, "route-state-unhealthy");
+    assert.equal(classifyOperatorStatus({ ...common, relayCapabilityOk: true, relayCapability: { latest: [] } }).state, "relay-missing");
+
+    const blocked = classifyOperatorStatus({
+      ...common,
+      docker: {
+        ...docker,
+        daemon: { ok: false, command: "docker", args: ["info"], reason: "permission denied" }
+      },
+      relayCapabilityOk: true,
+      relayCapability: latest("2026-05-20T12:05:00.000Z")
+    });
+    assert.equal(blocked.state, "admitted");
+    assert.ok(blocked.findings.some((finding) => finding.includes("Docker daemon")));
   });
 
   it("warns clearly when relay capability registration is not allowlisted", () => {

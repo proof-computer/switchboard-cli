@@ -1,5 +1,5 @@
 {
-  "name": "switchboard-cli",
+  "name": "@proof-computer/switchboard-cli",
   "version": "0.1.21",
   "description": "Switchboard CLI for deploying and operating Acurast ingress workloads.",
   "private": false,
@@ -48,6 +48,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/proof-computer/switchboard-cli.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   },
   "engines": {
     "node": ">=22"
