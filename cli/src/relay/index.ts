@@ -675,7 +675,8 @@ function printDeployDryRun(
     announce(`  PROOF_VALIDATION_READ_TOKEN <- ${spec.secrets.validationReadTokenEnv} ${envPresence(spec.secrets.validationReadTokenEnv)}`);
   }
   if (spec.secrets.controlPlaneTokenEnv) {
-    announce(`  PROOF_CONTROL_PLANE_TOKEN  <- ${spec.secrets.controlPlaneTokenEnv} ${envPresence(spec.secrets.controlPlaneTokenEnv)}`);
+    const shipped = spec.relay.enableControlPlane ? "" : " (not shipped; relay.enableControlPlane=false)";
+    announce(`  PROOF_CONTROL_PLANE_TOKEN  <- ${spec.secrets.controlPlaneTokenEnv} ${envPresence(spec.secrets.controlPlaneTokenEnv)}${shipped}`);
   }
   if (spec.secrets.relayInfraAdmissionTokenEnv) {
     announce(`  SB_RELAY_INFRA_ADMISSION_TOKEN <- ${spec.secrets.relayInfraAdmissionTokenEnv} ${envPresence(spec.secrets.relayInfraAdmissionTokenEnv)}`);

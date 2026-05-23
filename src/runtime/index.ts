@@ -27,6 +27,53 @@ import {
   generateProofLogEncryptionKey,
   type ProofLogEncryptedRecord
 } from "../proof-log-crypto.js";
+import {
+  gatewayUpstreamAdmissionDigest,
+  type GatewayUpstreamAdmissionPayload
+} from "./gateway-upstream-admission.js";
+
+export {
+  GATEWAY_UPSTREAM_ADMISSION_REQUEST_DOMAIN,
+  GATEWAY_UPSTREAM_OBSERVATION_DOMAIN,
+  gatewayUpstreamAdmissionDigest,
+  gatewayUpstreamAdmissionId,
+  gatewayUpstreamObservationDigest,
+  normalizeGatewayUpstreamAdmissionPayload,
+  normalizeGatewayUpstreamObservationPayload,
+  normalizeSecp256k1SignatureForDigest,
+  recoverGatewayUpstreamAdmissionSigner,
+  type GatewayUpstreamAdmissionPayload,
+  type GatewayUpstreamObservationPayload,
+  type SignedGatewayUpstreamObservation
+} from "./gateway-upstream-admission.js";
+
+export interface SwitchboardTransportSecurityOptions {
+  allowInsecureHttp?: boolean;
+}
+
+export function requireSecureSwitchboardUrl(
+  rawUrl: string | URL,
+  label: string,
+  options: SwitchboardTransportSecurityOptions = {}
+): URL {
+  let url: URL;
+  try {
+    url = rawUrl instanceof URL ? new URL(rawUrl.toString()) : new URL(rawUrl);
+  } catch (error) {
+    throw new Error(`${label} must be a valid URL`, { cause: error });
+  }
+
+  if (url.protocol === "https:") {
+    return url;
+  }
+  if (url.protocol === "http:" && options.allowInsecureHttp === true) {
+    return url;
+  }
+  if (url.protocol === "http:") {
+    throw new Error(`${label} must use https://; set allowInsecureHttp only for controlled local tests or labs`);
+  }
+  throw new Error(`${label} must use https://; unsupported URL protocol ${url.protocol}`);
+}
 
 export interface SwitchboardRegistrationConfig {
   relayUrl: string;
@@ -43,6 +90,7 @@ export interface SwitchboardRegistrationConfig {
   jobSigner?: SwitchboardJobSigner;
   jobSignerPrivateKey?: string;
   requestTimeoutMs?: number;
+  allowInsecureHttp?: boolean;
 }
 
 export interface SwitchboardCertificateConfig {
@@ -58,6 +106,7 @@ export interface SwitchboardCertificateConfig {
   jobSigner?: SwitchboardJobSigner;
   jobSignerPrivateKey?: string;
   requestTimeoutMs?: number;
+  allowInsecureHttp?: boolean;
 }
 
 export interface SwitchboardJobSigner {
@@ -71,6 +120,9 @@ export interface SwitchboardJobSigner {
     chainId: string | number | bigint;
     registryAddress: string;
     certificateRequest: CertificateRequestPayload;
+  }): Promise<string>;
+  signGatewayUpstreamAdmission?(input: {
+    request: GatewayUpstreamAdmissionPayload;
   }): Promise<string>;
 }
 
@@ -168,6 +220,7 @@ export interface SwitchboardRemoteLoggerConfig {
   timeoutMs?: number;
   baseRecord?: () => Record<string, unknown>;
   onError?: (error: unknown, event: string) => void;
+  allowInsecureHttp?: boolean;
 }
 
 export interface SwitchboardLogSinkEvent {
@@ -224,6 +277,9 @@ export function privateKeyJobSigner(privateKey: string): SwitchboardJobSigner {
     },
     async signCertificateRequest(input) {
       return signCertificateRequest(wallet, input.chainId, input.registryAddress, input.certificateRequest);
+    },
+    async signGatewayUpstreamAdmission(input) {
+      return wallet.signingKey.sign(gatewayUpstreamAdmissionDigest(input.request)).serialized;
     }
   };
 }
@@ -260,6 +316,10 @@ export function acurastJobSigner(std: AcurastRuntimeStd = requiredAcurastStd()):
     async signCertificateRequest(input) {
       const digest = certificateRequestDigest(input.chainId, input.registryAddress, input.certificateRequest);
       return signAcurastSecp256k1Digest(sign, digest, await getAddress(), std);
+    },
+    async signGatewayUpstreamAdmission(input) {
+      const digest = gatewayUpstreamAdmissionDigest(input.request);
+      return signAcurastSecp256k1Digest(sign, digest, await getAddress(), std);
     }
   };
 }
@@ -290,10 +350,11 @@ export async function buildIngressRegistrationRequest(
 export async function registerIngressWithRelay(
   config: SwitchboardRegistrationConfig
 ): Promise<SwitchboardRegistrationResult> {
+  const relayUrl = requireSecureSwitchboardUrl(config.relayUrl, "Switchboard relay URL", config);
   const request = await buildIngressRegistrationRequest(config);
   const abortController = new AbortController();
   const timeout = setTimeout(() => abortController.abort(), config.requestTimeoutMs ?? 10_000);
-  const response = await fetch(new URL("/v1/ingress-registrations", config.relayUrl), {
+  const response = await fetch(new URL("/v1/ingress-registrations", relayUrl), {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -361,10 +422,11 @@ export async function requestCertificateWithRelay(
   config: SwitchboardCertificateConfig,
   fetchImpl: typeof fetch = fetch
 ): Promise<SwitchboardCertificateResult> {
+  const relayUrl = requireSecureSwitchboardUrl(config.relayUrl, "Switchboard relay URL", config);
   const request = await buildIngressCertificateRequest(config);
   const abortController = new AbortController();
   const timeout = setTimeout(() => abortController.abort(), config.requestTimeoutMs ?? 120_000);
-  const response = await fetchImpl(new URL("/v1/certificates", config.relayUrl), {
+  const response = await fetchImpl(new URL("/v1/certificates", relayUrl), {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -461,7 +523,8 @@ export function createEncryptedSwitchboardLogger(
         details
       };
       const encrypted = encryptProofLogRecord(config.encryptionKey!, record);
-      const response = await fetch(config.logUrl!, {
+      const logUrl = requireSecureSwitchboardUrl(config.logUrl!, "Switchboard log URL", config);
+      const response = await fetch(logUrl, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -486,11 +549,13 @@ export async function readEncryptedSwitchboardLogs(input: {
   readToken?: string;
   encryptionKey: string;
   timeoutMs?: number;
+  allowInsecureHttp?: boolean;
 }): Promise<Array<SwitchboardLogRecord & { sequence: number; receivedAt: string }>> {
+  const readUrl = requireSecureSwitchboardUrl(input.readUrl, "Switchboard log read URL", input);
   const abortController = new AbortController();
   const timeout = setTimeout(() => abortController.abort(), input.timeoutMs ?? 10_000);
   try {
-    const response = await fetch(input.readUrl, {
+    const response = await fetch(readUrl, {
       headers: {
         accept: "application/json",
         ...(input.readToken ? { authorization: `Bearer ${input.readToken}` } : {})

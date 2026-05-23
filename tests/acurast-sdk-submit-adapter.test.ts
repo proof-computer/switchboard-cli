@@ -9,6 +9,7 @@ import {
   acurastSdkIpfsUploadConfig,
   buildAcurastSdkEnvVars,
   buildAcurastSdkProjectConfig,
+  deploymentIntentGatewayUpstreamPort,
   type AcurastSdkSubmitActionPayload
 } from "../cli/src/acurast-submit-adapter.js";
 
@@ -109,6 +110,30 @@ describe("Acurast SDK submit adapter builders", () => {
     const byKey = new Map(envVars.map((item) => [item.key, item.value]));
 
     assert.equal(byKey.get("SSH_AUTH_KEYS"), "ssh-ed25519 AAAATEST user@example");
+  });
+
+  it("uses gateway upstream port precedence for deployment-intent updates", () => {
+    const envVars = buildAcurastSdkEnvVars({
+      PORT: "3000",
+      GATEWAY_UPSTREAM_PORT: "9443",
+      SWITCHBOARD_UPSTREAM_PORT: "3443"
+    }, actionPayload);
+    const switchboardConfig = JSON.parse(envVars.find((item) => item.key === "SWITCHBOARD_CONFIG")!.value);
+    assert.equal(switchboardConfig.GATEWAY_UPSTREAM_PORT, "9443");
+    assert.equal(switchboardConfig.SWITCHBOARD_UPSTREAM_PORT, "3443");
+    assert.equal(deploymentIntentGatewayUpstreamPort({
+      GATEWAY_UPSTREAM_PORT: "9443",
+      SWITCHBOARD_UPSTREAM_PORT: "3443",
+      PORT: "3000"
+    }), 9443);
+    assert.equal(deploymentIntentGatewayUpstreamPort({
+      SWITCHBOARD_UPSTREAM_PORT: "3443",
+      PORT: "3000"
+    }), 3443);
+    assert.equal(deploymentIntentGatewayUpstreamPort({
+      PORT: "3000"
+    }), 3000);
+    assert.equal(deploymentIntentGatewayUpstreamPort({}), 3000);
   });
 
   it("rejects missing explicit included env without falling back to CLI harness inputs", () => {

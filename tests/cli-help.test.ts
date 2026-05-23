@@ -24,6 +24,8 @@ describe("switchboard help", () => {
     assert.match(help, /operator setup/);
     assert.match(help, /operator discover/);
     assert.match(help, /launch-demo/);
+    assert.match(help, /deploy doctor/);
+    assert.match(help, /Deploy doctor:/);
     assert.match(help, /Launch demo:/);
     assert.match(help, /switchboard launch-demo --yes-spend/);
     assert.match(help, /--max-cost-per-execution <n>\s+Default 40000000000/);

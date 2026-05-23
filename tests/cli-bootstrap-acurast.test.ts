@@ -38,6 +38,7 @@ const bootstrapSpec = {
     controlPlaneTokenEnv: "PROOF_CONTROL_PLANE_TOKEN"
   },
   relay: {
+    authorityProfile: "bootstrap-control-plane",
     enableValidationReports: true,
     enableControlPlane: true,
     enablePeerBackfill: false,

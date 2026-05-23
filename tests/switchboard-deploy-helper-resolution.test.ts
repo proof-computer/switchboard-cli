@@ -110,6 +110,19 @@ describe("switchboard deploy helper script resolution", () => {
       assert.equal("preferredDomain" in single, false);
       assert.equal("allocation" in single, false);
       assert.equal(single.gatewayId, "gateway-a");
+      assert.equal(mod.deploymentIntentGatewayUpstreamPort({
+        GATEWAY_UPSTREAM_PORT: "9443",
+        SWITCHBOARD_UPSTREAM_PORT: "3443",
+        PORT: "3000"
+      }), 9443);
+      assert.equal(mod.deploymentIntentGatewayUpstreamPort({
+        SWITCHBOARD_UPSTREAM_PORT: "3443",
+        PORT: "3000"
+      }), 3443);
+      assert.equal(mod.deploymentIntentGatewayUpstreamPort({
+        PORT: "3000"
+      }), 3000);
+      assert.equal(mod.deploymentIntentGatewayUpstreamPort({}), 3000);
 
       const group = mod.buildDeploymentIntentGroupCreateBody({
         ...config,
@@ -336,6 +349,7 @@ async function importDeployRunnerWithWorkDir(workDir: string): Promise<{
     input: { jobId: string; processorId: string }
   ) => Record<string, unknown>;
   buildDeploymentIntentGroupCreateBody: (config: Record<string, unknown>) => Record<string, unknown>;
+  deploymentIntentGatewayUpstreamPort: (config: Record<string, string | undefined>) => number;
   deploymentIntentHostnamesFromRecords: (
     funding: Record<string, unknown> | undefined,
     status?: Record<string, unknown>

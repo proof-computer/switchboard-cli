@@ -17,6 +17,7 @@ import {
   writeOutput,
   type AssetDisplay,
   type CliNetworkConfig,
+  type CliRuntime,
   type SwitchboardContext
 } from "../index.js";
 
@@ -41,7 +42,8 @@ interface BalanceLine {
 
 export async function contextAddCommand(
   flags: Map<string, string | boolean>,
-  positionals: string[]
+  positionals: string[],
+  runtime?: Pick<CliRuntime, "contextStorePath">
 ): Promise<void> {
   if (boolFlag(flags, "json")) {
     throw new Error("`context add` is interactive. Use `context set` for scripted updates.");
@@ -51,7 +53,8 @@ export async function contextAddCommand(
   }
 
   const explicitName = positionals[2] ?? stringFlag(flags, "context");
-  const store = await readContextStore();
+  const contextStorePath = runtime?.contextStorePath;
+  const store = contextStorePath ? await readContextStore(contextStorePath) : await readContextStore();
 
   p.intro("Switchboard · context add");
 
@@ -233,7 +236,7 @@ export async function contextAddCommand(
   const setCurrent = useAnswer === true;
 
   pruneUndefined(partial);
-  const updatedStore = await readContextStore();
+  const updatedStore = contextStorePath ? await readContextStore(contextStorePath) : await readContextStore();
   if (updatedStore.contexts?.[name]) {
     p.cancel(`Context "${name}" appeared in another process; aborting.`);
     process.exit(1);
@@ -242,7 +245,11 @@ export async function contextAddCommand(
   if (setCurrent || !updatedStore.current) {
     updatedStore.current = name;
   }
-  await writeContextStore(updatedStore);
+  if (contextStorePath) {
+    await writeContextStore(updatedStore, contextStorePath);
+  } else {
+    await writeContextStore(updatedStore);
+  }
   p.log.success(`Saved context "${name}"${updatedStore.current === name ? " (current)" : ""}.`);
 
   const skipBalances = boolFlag(flags, "no-balance-check");

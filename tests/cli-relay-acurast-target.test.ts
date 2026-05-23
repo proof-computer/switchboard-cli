@@ -398,6 +398,63 @@ describe("prepareAcurastDeployContext", () => {
     assert.ok(!JSON.stringify(ctx.buildConfig).includes("ADMISSION_TOKEN_VALUE"));
   });
 
+  it("requires a dedicated proof-infra admission token even when a control-plane token is set", () => {
+    const proofInfraSpec = spec({
+      secrets: {
+        ...((baseSpec as Record<string, unknown>).secrets as Record<string, unknown>),
+        controlPlaneTokenEnv: "PROOF_CONTROL_PLANE_TOKEN",
+        relayInfraAdmissionTokenEnv: "PROOF_RELAY_INFRA_ADMISSION_TOKEN"
+      },
+      relay: {
+        admissionMode: "proof-infra",
+        autoRegister: false,
+        bootstrapRelayUrl: "https://relay-a.switchboard.proof.computer",
+        enablePeerBackfill: false
+      } as Record<string, unknown>,
+      peers: []
+    });
+
+    assert.throws(
+      () =>
+        prepareAcurastDeployContext(proofInfraSpec, {
+          env: {
+            ...baseEnv,
+            PROOF_CONTROL_PLANE_TOKEN: "BROAD_TOKEN_ONLY"
+          }
+        }),
+      /requires spec\.secrets\.relayInfraAdmissionTokenEnv to be set in env/
+    );
+  });
+
+  it("keeps declared control-plane tokens out of proof-infra runtime env when control-plane is disabled", () => {
+    const proofInfraSpec = spec({
+      secrets: {
+        ...((baseSpec as Record<string, unknown>).secrets as Record<string, unknown>),
+        controlPlaneTokenEnv: "PROOF_CONTROL_PLANE_TOKEN",
+        relayInfraAdmissionTokenEnv: "PROOF_RELAY_INFRA_ADMISSION_TOKEN"
+      },
+      relay: {
+        admissionMode: "proof-infra",
+        autoRegister: false,
+        bootstrapRelayUrl: "https://relay-a.switchboard.proof.computer",
+        enablePeerBackfill: false
+      } as Record<string, unknown>,
+      peers: []
+    });
+    const ctx = prepareAcurastDeployContext(proofInfraSpec, {
+      env: {
+        ...baseEnv,
+        PROOF_CONTROL_PLANE_TOKEN: "BROAD_CONTROL_PLANE_TOKEN",
+        PROOF_RELAY_INFRA_ADMISSION_TOKEN: "ADMISSION_TOKEN_VALUE"
+      }
+    });
+
+    assert.equal(ctx.runtimeEnv.SB_RELAY_INFRA_ADMISSION_TOKEN, "ADMISSION_TOKEN_VALUE");
+    assert.equal(ctx.runtimeEnv.PROOF_CONTROL_PLANE_TOKEN, undefined);
+    assert.equal(ctx.includeEnv.includes("SB_RELAY_INFRA_ADMISSION_TOKEN"), true);
+    assert.equal(ctx.includeEnv.includes("PROOF_CONTROL_PLANE_TOKEN"), false);
+  });
+
   it("lets operators override the proof-infra Acurast RPC build config without runtime env slots", () => {
     const proofInfraSpec = spec({
       secrets: {
@@ -558,6 +615,59 @@ describe("runAcurastDeploy", () => {
       const buildConfig = JSON.parse(env.SWITCHBOARD_BUILD_CONFIG!);
       assert.ok(!JSON.stringify(buildConfig).includes("0xRELAYER_PRIVATE_KEY_VALUE"));
       assert.ok(!JSON.stringify(buildConfig).includes("34".repeat(32)));
+    }
+  });
+
+  it("does not submit broad control-plane tokens for proof-infra deploys when control-plane is disabled", async () => {
+    const proofInfraSpec = spec({
+      secrets: {
+        ...((baseSpec as Record<string, unknown>).secrets as Record<string, unknown>),
+        controlPlaneTokenEnv: "PROOF_CONTROL_PLANE_TOKEN",
+        relayInfraAdmissionTokenEnv: "PROOF_RELAY_INFRA_ADMISSION_TOKEN"
+      },
+      relay: {
+        admissionMode: "proof-infra",
+        autoRegister: false,
+        bootstrapRelayUrl: "https://relay-a.switchboard.proof.computer",
+        enablePeerBackfill: false
+      } as Record<string, unknown>,
+      peers: [],
+      acurast: {
+        ...((baseSpec as Record<string, unknown>).acurast as Record<string, unknown>),
+        encryptedCode: false
+      }
+    });
+    const childEnvs: NodeJS.ProcessEnv[] = [];
+    let deployEnv: NodeJS.ProcessEnv | undefined;
+
+    await runAcurastDeploy(proofInfraSpec, {
+      yes: true,
+      sources: {
+        env: {
+          ...baseEnv,
+          PROOF_CONTROL_PLANE_TOKEN: "BROAD_CONTROL_PLANE_TOKEN",
+          PROOF_RELAY_INFRA_ADMISSION_TOKEN: "ADMISSION_TOKEN_VALUE"
+        } as NodeJS.ProcessEnv
+      },
+      io: { log: () => {}, warn: () => {}, error: () => {} },
+      spawnPnpm: async (args, env) => {
+        childEnvs.push(env);
+        if (args[0] === "acurast:deploy-express:direct") {
+          deployEnv = env;
+        }
+        return 0;
+      },
+      spawnNode: async () => 0,
+      skipReadinessPoll: true,
+      skipPeerCheck: true
+    });
+
+    assert.ok(deployEnv);
+    for (const env of childEnvs) {
+      assert.equal(env.PROOF_CONTROL_PLANE_TOKEN, undefined);
+      assert.equal(env.SB_RELAY_INFRA_ADMISSION_TOKEN, "ADMISSION_TOKEN_VALUE");
+      assert.ok(env.ACURAST_INCLUDE_ENV?.includes("SB_RELAY_INFRA_ADMISSION_TOKEN"));
+      assert.equal(env.ACURAST_INCLUDE_ENV?.includes("PROOF_CONTROL_PLANE_TOKEN"), false);
     }
   });
 

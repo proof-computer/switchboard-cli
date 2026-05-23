@@ -26,7 +26,8 @@ export const FORBIDDEN_ACURAST_ENV_NAMES = [
 // Acurast relay deploys.
 export const HIGH_AUTHORITY_ACURAST_ENV_NAMES = [
   "ACME_EAB_HMAC_KEY",
-  "CLOUDFLARE_API_TOKEN"
+  "CLOUDFLARE_API_TOKEN",
+  "PROOF_CONTROL_PLANE_TOKEN"
 ] as const;
 
 const FORBIDDEN_SET = new Set<string>(FORBIDDEN_ACURAST_ENV_NAMES.map((name) => name.toUpperCase()));
@@ -233,10 +234,10 @@ export const relayDeploymentSpecSchema = z
           path: ["relay", "bootstrapRelayUrl"]
         });
       }
-      if (!value.secrets.relayInfraAdmissionTokenEnv && !value.secrets.controlPlaneTokenEnv) {
+      if (!value.secrets.relayInfraAdmissionTokenEnv) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: "secrets.relayInfraAdmissionTokenEnv or secrets.controlPlaneTokenEnv is required when relay.admissionMode=proof-infra",
+          message: "secrets.relayInfraAdmissionTokenEnv is required when relay.admissionMode=proof-infra",
           path: ["secrets", "relayInfraAdmissionTokenEnv"]
         });
       }
@@ -346,7 +347,9 @@ function collectShippedEnvRefs(value: z.output<typeof relayDeploymentSpecSchema>
   const refs: Array<[string, Array<string | number>]> = [];
   refs.push([value.secrets.relayerPrivateKeyEnv, ["secrets", "relayerPrivateKeyEnv"]]);
   if (value.secrets.validationReadTokenEnv) refs.push([value.secrets.validationReadTokenEnv, ["secrets", "validationReadTokenEnv"]]);
-  if (value.secrets.controlPlaneTokenEnv) refs.push([value.secrets.controlPlaneTokenEnv, ["secrets", "controlPlaneTokenEnv"]]);
+  if (value.relay.enableControlPlane && value.secrets.controlPlaneTokenEnv) {
+    refs.push([value.secrets.controlPlaneTokenEnv, ["secrets", "controlPlaneTokenEnv"]]);
+  }
   if (value.secrets.relayInfraAdmissionTokenEnv) refs.push([value.secrets.relayInfraAdmissionTokenEnv, ["secrets", "relayInfraAdmissionTokenEnv"]]);
   if (value.secrets.logCreateTokenEnv) refs.push([value.secrets.logCreateTokenEnv, ["secrets", "logCreateTokenEnv"]]);
   if (value.secrets.logEncryptionKeyEnv) refs.push([value.secrets.logEncryptionKeyEnv, ["secrets", "logEncryptionKeyEnv"]]);

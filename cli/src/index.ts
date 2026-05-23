@@ -3,10 +3,12 @@ import "dotenv/config";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { lookup as dnsLookup } from "node:dns/promises";
 import { realpathSync } from "node:fs";
 import { access, chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { fileURLToPath } from "node:url";
 import { ApiPromise, WsProvider } from "@polkadot/api";
 import { CUSTOM_TYPES, RequiredModules } from "@acurast/sdk/types";
@@ -43,6 +45,7 @@ import {
 import {
   expandedReportProcessors,
   processorRefToId,
+  publicIpv4Address,
   type GatewayCapabilityReport,
   type ProcessorScope
 } from "../../src/operator-capability.js";
@@ -162,6 +165,7 @@ const SSH_TEMPLATE_STUNNEL_CONFIG = "stunnel.conf";
 const SSH_TEMPLATE_GETIFADDRS_OVERRIDE = "getifaddrs_override.c";
 const SSH_TEMPLATE_AUTHORIZED_KEYS = "authorized_keys";
 const SSH_TEMPLATE_AUTHORIZED_KEYS_EXAMPLE = "authorized_keys.example";
+const SSH_TEMPLATE_BRIDGE_DIAGNOSTIC_COMMAND = "switchboard-cargo-bridge-doctor";
 const SSH_AUTH_KEYS_ENV = "SSH_AUTH_KEYS";
 const ACURAST_SCRIPT_RUNTIME = "script";
 const ACURAST_NODE_RUNTIME = "node";
@@ -201,6 +205,7 @@ export type CommandName =
   | "launch-demo"
   | "deploy"
   | "deploy-status"
+  | "deploy-doctor"
   | "deploy-resume"
   | "deployment-status"
   | "hostname-attach"
@@ -462,27 +467,27 @@ export async function runSwitchboardCli(argv: readonly string[] = process.argv.s
   }
 
   if (parsed.command === "context-use") {
-    await contextUseCommand(flags, parsed.positionals);
+    await contextUseCommand(flags, parsed.positionals, runtime);
     return;
   }
 
   if (parsed.command === "context-set") {
-    await contextSetCommand(flags, parsed.positionals);
+    await contextSetCommand(flags, parsed.positionals, runtime);
     return;
   }
 
   if (parsed.command === "context-add") {
-    await contextAddCommand(flags, parsed.positionals);
+    await contextAddCommand(flags, parsed.positionals, runtime);
     return;
   }
 
   if (parsed.command === "context-dns-set") {
-    await contextDnsSetCommand(flags, parsed.positionals);
+    await contextDnsSetCommand(flags, parsed.positionals, runtime);
     return;
   }
 
   if (parsed.command === "context-dns-clear") {
-    await contextDnsClearCommand(flags, parsed.positionals);
+    await contextDnsClearCommand(flags, parsed.positionals, runtime);
     return;
   }
 
@@ -538,6 +543,11 @@ export async function runSwitchboardCli(argv: readonly string[] = process.argv.s
 
   if (parsed.command === "deploy-status") {
     await deployWorkflowStatusCommand(flags, runtime);
+    return;
+  }
+
+  if (parsed.command === "deploy-doctor") {
+    await deployDoctorCommand(flags, runtime);
     return;
   }
 
@@ -1459,7 +1469,40 @@ ensure_python_runtime() {
   fi
   SWITCHBOARD_PYTHON_BIN="$(command -v python3)"
   export SWITCHBOARD_PYTHON_BIN
+  install_bridge_diagnostic_command
   bootstrap_log python_runtime_done
+}
+
+install_bridge_diagnostic_command() {
+  BRIDGE_DIAGNOSTIC_COMMAND_PATH="\${SWITCHBOARD_BRIDGE_DIAGNOSTIC_COMMAND_PATH:-/usr/local/bin/${SSH_TEMPLATE_BRIDGE_DIAGNOSTIC_COMMAND}}"
+  mkdir -p "\$(dirname "\${BRIDGE_DIAGNOSTIC_COMMAND_PATH}")"
+  cat > "\${BRIDGE_DIAGNOSTIC_COMMAND_PATH}" <<'EOF'
+#!/bin/sh
+set -eu
+exec "\${SWITCHBOARD_PYTHON_BIN:-python3}" - <<'PY'
+import json
+import os
+import sys
+
+state_path = os.environ.get("SWITCHBOARD_BRIDGE_DIAGNOSTIC_STATE")
+if not state_path:
+    run_dir = os.environ.get("SWITCHBOARD_RUN_DIR", "/run/switchboard")
+    state_path = os.path.join(run_dir, "bridge-diagnostic.json")
+os.environ["SWITCHBOARD_BRIDGE_DIAGNOSTIC_STATE"] = state_path
+try:
+    with open(state_path, "r", encoding="utf8") as handle:
+        state = json.load(handle)
+except Exception as error:
+    print(f"switchboard cargo bridge diagnostic state unavailable: {error}", file=sys.stderr)
+    raise SystemExit(78)
+helper = state.get("pythonHelper") or os.environ.get("PYTHON_HELPER")
+if not helper:
+    print("switchboard cargo bridge diagnostic state did not include a helper path", file=sys.stderr)
+    raise SystemExit(78)
+os.execv(sys.executable, [sys.executable, helper, "bridge-doctor"])
+PY
+EOF
+  chmod 755 "\${BRIDGE_DIAGNOSTIC_COMMAND_PATH}"
 }
 
 ensure_getifaddrs_override() {
@@ -1501,7 +1544,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-STATE_PATH = Path(os.environ.get("SWITCHBOARD_BOOTSTRAP_STATE", "/run/switchboard/bootstrap-state.json"))
+DEFAULT_RUN_DIR = Path(os.environ.get("SWITCHBOARD_RUN_DIR", "/run/switchboard"))
+STATE_PATH = Path(os.environ.get("SWITCHBOARD_BOOTSTRAP_STATE", str(DEFAULT_RUN_DIR / "bootstrap-state.json")))
+BRIDGE_DIAGNOSTIC_STATE_PATH = Path(os.environ.get("SWITCHBOARD_BRIDGE_DIAGNOSTIC_STATE", str(DEFAULT_RUN_DIR / "bridge-diagnostic.json")))
+BRIDGE_DIAGNOSTIC_CHALLENGE = "0x" + "11" * 32
 TLS_CERT_PATH = Path(os.environ.get("SWITCHBOARD_TLS_CERT", "/run/switchboard/tls.crt"))
 TLS_KEY_PATH = Path(os.environ.get("SWITCHBOARD_TLS_KEY", "/run/switchboard/tls.key"))
 REMOTE_BOOT_EVENTS = {
@@ -1549,16 +1595,98 @@ def strip_0x(value):
     return value[2:] if value.startswith(("0x", "0X")) else value
 
 
+def hex_byte_length(value):
+    text = strip_0x(value)
+    if len(text) % 2 != 0:
+        return None
+    try:
+        bytes.fromhex(text)
+    except ValueError:
+        return None
+    return len(text) // 2
+
+
+def load_bridge_diagnostic_state(required=False):
+    if not BRIDGE_DIAGNOSTIC_STATE_PATH.exists():
+        if required:
+            fail("Cargo bridge diagnostic state is unavailable; wait for bootstrap to start before running the bridge diagnostic helper")
+        return {}
+    try:
+        data = json.loads(BRIDGE_DIAGNOSTIC_STATE_PATH.read_text(encoding="utf8"))
+    except Exception as error:
+        if required:
+            fail(f"Cargo bridge diagnostic state could not be read: {error}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_bridge_diagnostic_state(bridge, config=None, public_key=None, deployment=None, job_signer=None):
+    state = load_bridge_diagnostic_state(required=False)
+    state.update({
+        "version": 1,
+        "socketName": bridge.socket_name,
+        "pythonHelper": str(Path(__file__).resolve()),
+        "signerMode": "cargo-bridge-secp256k1",
+        "publicKey": public_key or state.get("publicKey"),
+        "deployment": deployment or state.get("deployment"),
+        "jobSigner": job_signer or state.get("jobSigner"),
+    })
+    safe_config = config or {}
+    safe_fields = {
+        "SWITCHBOARD_INTENT_ID": "intentId",
+        "SWITCHBOARD_RELAY_URL": "relayUrl",
+        "ENDPOINT_HOSTNAME": "endpointHostname",
+        "SESSION_ID": "sessionId",
+        "JOB_ID": "jobId",
+        "GATEWAY_ID": "gatewayId",
+        "PROCESSOR_ID": "processorId",
+        "OPERATOR_ID": "operatorId",
+    }
+    for source, target in safe_fields.items():
+        value = safe_config.get(source)
+        if value:
+            state[target] = value
+    BRIDGE_DIAGNOSTIC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BRIDGE_DIAGNOSTIC_STATE_PATH.write_text(json.dumps({k: v for k, v in state.items() if v is not None}, sort_keys=True), encoding="utf8")
+    os.chmod(BRIDGE_DIAGNOSTIC_STATE_PATH, 0o600)
+
+
+def public_key_summary(public_key):
+    byte_length = hex_byte_length(public_key)
+    text = strip_0x(public_key)
+    return {
+        "value": public_key,
+        "encoding": "hex",
+        "bytes": byte_length,
+        "compressedSecp256k1": byte_length == 33 and text[:2].lower() in ("02", "03"),
+    }
+
+
+def signature_summary(signature):
+    byte_length = hex_byte_length(signature)
+    return {
+        "encoding": "hex",
+        "bytes": byte_length,
+        "hasRecoveryByte": byte_length == 65,
+    }
+
+
 class Bridge:
-    def __init__(self, socket_name):
+    def __init__(self, socket_name, source="env"):
         if not socket_name:
-            fail("BRIDGE_SOCKET is required for Cargo bridge signing")
+            fail("BRIDGE_SOCKET is required for Cargo bridge signing and no bridge diagnostic state is available")
         self.socket_name = socket_name
+        self.source = source
         self.counter = 0
 
     @classmethod
     def from_env(cls):
-        return cls(os.environ.get("BRIDGE_SOCKET"))
+        socket_name = os.environ.get("BRIDGE_SOCKET")
+        if socket_name:
+            return cls(socket_name, source="env")
+        state = load_bridge_diagnostic_state(required=False)
+        state_socket = state.get("socketName") if isinstance(state, dict) else None
+        return cls(state_socket, source="diagnostic-state")
 
     def call(self, method, params=None):
         self.counter += 1
@@ -1636,6 +1764,26 @@ def required(config, name):
     if not value:
         fail(f"{name} is required")
     return value
+
+
+def require_https_url(url, label):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https" and parsed.netloc:
+        return url
+    if parsed.scheme == "http":
+        fail(f"{label} must use https://; plaintext HTTP relay transport is not allowed in Acurast jobs")
+    if parsed.scheme:
+        fail(f"{label} must use https://; unsupported URL protocol {parsed.scheme}:")
+    fail(f"{label} must be an absolute https URL")
+
+
+def require_gateway_admission_url(url, label):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme in ("https", "http") and parsed.netloc:
+        return url
+    if parsed.scheme:
+        fail(f"{label} must use http:// or https://; unsupported URL protocol {parsed.scheme}:")
+    fail(f"{label} must be an absolute http or https URL")
 
 
 def request_json(method, url, body=None, token=None, timeout=120):
@@ -1800,13 +1948,13 @@ def discover_upstream_ips(config, bridge):
 
 
 def intent_endpoint(config, suffix):
-    relay_url = required(config, "SWITCHBOARD_RELAY_URL").rstrip("/")
+    relay_url = require_https_url(required(config, "SWITCHBOARD_RELAY_URL"), "SWITCHBOARD_RELAY_URL").rstrip("/")
     intent_id = urllib.parse.quote(required(config, "SWITCHBOARD_INTENT_ID"), safe="")
     return f"{relay_url}/v1/deployment-intents/{intent_id}{suffix}"
 
 
 def post_health(config, state, details):
-    relay_url = required(config, "SWITCHBOARD_RELAY_URL").rstrip("/")
+    relay_url = require_https_url(required(config, "SWITCHBOARD_RELAY_URL"), "SWITCHBOARD_RELAY_URL").rstrip("/")
     intent_id = required(config, "SWITCHBOARD_INTENT_ID")
     token = required(config, "SWITCHBOARD_INTENT_TOKEN")
     status, body = request_json(
@@ -1848,7 +1996,7 @@ def claim_intent(config, bridge, public_key, deployment, upstream_ips):
 
 
 def fetch_runtime_config(config):
-    relay_url = required(config, "SWITCHBOARD_RELAY_URL").rstrip("/")
+    relay_url = require_https_url(required(config, "SWITCHBOARD_RELAY_URL"), "SWITCHBOARD_RELAY_URL").rstrip("/")
     intent_id = required(config, "SWITCHBOARD_INTENT_ID")
     token = required(config, "SWITCHBOARD_INTENT_TOKEN")
     timeout = int(config.get("SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", "60000")) / 1000
@@ -1871,11 +2019,16 @@ def apply_runtime_config(config, runtime):
         "operatorId": "OPERATOR_ID",
         "processorId": "PROCESSOR_ID",
         "gatewayId": "GATEWAY_ID",
+        "gatewayUpstreamAdmissionUrl": "GATEWAY_UPSTREAM_ADMISSION_URL",
         "endpointHostname": "ENDPOINT_HOSTNAME",
     }
     for source, target in mapping.items():
         if runtime_config.get(source) is not None:
             config[target] = str(runtime_config[source])
+    if config.get("RELAY_URL"):
+        require_https_url(config["RELAY_URL"], "RELAY_URL")
+    if config.get("GATEWAY_UPSTREAM_ADMISSION_URL"):
+        require_gateway_admission_url(config["GATEWAY_UPSTREAM_ADMISSION_URL"], "GATEWAY_UPSTREAM_ADMISSION_URL")
     config["SWITCHBOARD_CERTIFICATE_MODE"] = str(runtime_config.get("certificateMode") or "job-acme")
     certificate_hostnames = runtime_config.get("certificateHostnames") or [runtime_config.get("endpointHostname")]
     config["SWITCHBOARD_CERTIFICATE_HOSTNAMES"] = ",".join(str(item) for item in certificate_hostnames if item)
@@ -2009,21 +2162,75 @@ def write_tls_certificate(cert):
     log("certificate_written")
 
 
+def gateway_upstream_port(config):
+    return int(config.get("GATEWAY_UPSTREAM_PORT") or config.get("SWITCHBOARD_UPSTREAM_PORT") or os.environ.get("PORT", "3000"))
+
+
+def admit_gateway_upstream(config, bridge):
+    admission_url = config.get("GATEWAY_UPSTREAM_ADMISSION_URL")
+    if not admission_url:
+        return None
+    admission_url = require_gateway_admission_url(admission_url, "GATEWAY_UPSTREAM_ADMISSION_URL")
+    maybe_whitelist_url(bridge, admission_url)
+    token = required(config, "SWITCHBOARD_INTENT_TOKEN")
+    status, challenge = request_json(
+        "POST",
+        intent_endpoint(config, "/runtime-signing/upstream-admission-challenge"),
+        {"upstreamPort": gateway_upstream_port(config)},
+        token=token,
+        timeout=int(config.get("SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", "60000")) / 1000,
+    )
+    if status < 200 or status >= 300:
+        fail(f"gateway upstream admission challenge failed: {status} {challenge}")
+    request = challenge.get("request")
+    digest = challenge.get("digest")
+    if not request or not digest:
+        fail("gateway upstream admission challenge response was missing request or digest")
+    signature = bridge.sign_digest(digest)
+    status, gateway_body = request_json(
+        "POST",
+        admission_url,
+        {"request": request, "signature": signature},
+        timeout=int(config.get("SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", "60000")) / 1000,
+    )
+    if status < 200 or status >= 300:
+        fail(f"gateway upstream admission failed: {status} {gateway_body}")
+    status, relay_body = request_json(
+        "POST",
+        intent_endpoint(config, "/upstream-admissions"),
+        {
+            "request": request,
+            "requestSignature": signature,
+            "observation": gateway_body.get("observation"),
+            "observationSignature": gateway_body.get("observationSignature"),
+        },
+        token=token,
+        timeout=int(config.get("SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", "60000")) / 1000,
+    )
+    if status < 200 or status >= 300:
+        fail(f"relay gateway upstream admission submit failed: {status} {relay_body}")
+    admission = relay_body.get("admission") or {}
+    log("gateway-upstream-admitted", admissionId=admission.get("admissionId"), observedAt=admission.get("observedAt"))
+    return admission
+
+
 def prepare():
     config = load_config()
     log("bridge_connect_start")
     bridge = Bridge.from_env()
     public_key = bridge.public_key()
     deployment = bridge.deployment_id()
+    save_bridge_diagnostic_state(bridge, config=config, public_key=public_key, deployment=deployment)
     log("bridge_connected")
-    maybe_whitelist_url(bridge, required(config, "SWITCHBOARD_RELAY_URL"))
+    maybe_whitelist_url(bridge, require_https_url(required(config, "SWITCHBOARD_RELAY_URL"), "SWITCHBOARD_RELAY_URL"))
     upstream_ips = discover_upstream_ips(config, bridge)
     claim = claim_intent(config, bridge, public_key, deployment, upstream_ips)
     job_signer = claim.get("runtimeSigner")
     log("job-signer-ready", signerMode="cargo-bridge-secp256k1", jobSigner=job_signer)
     post_health(config, "waiting_funding", {"runtimeSigner": job_signer, "upstreamIps": upstream_ips})
     wait_for_runtime_config(config)
-    maybe_whitelist_url(bridge, required(config, "RELAY_URL"))
+    save_bridge_diagnostic_state(bridge, config=config, public_key=public_key, deployment=deployment, job_signer=job_signer)
+    maybe_whitelist_url(bridge, require_https_url(required(config, "RELAY_URL"), "RELAY_URL"))
     register_ingress(config, bridge, job_signer)
     certs = request_certificates(config, bridge, job_signer)
     if certs:
@@ -2034,12 +2241,15 @@ def prepare():
 def ready():
     state = load_state()
     config = state.get("config") or load_config()
+    bridge = Bridge.from_env()
+    admission = admit_gateway_upstream(config, bridge)
     post_health(config, "ready", {
         "sessionId": config.get("SESSION_ID"),
         "endpointHostname": config.get("ENDPOINT_HOSTNAME"),
         "protocol": "https",
         "applicationProtocol": "ssh",
-        "port": int(os.environ.get("PORT", "3000")),
+        "port": gateway_upstream_port(config),
+        "gatewayUpstreamAdmission": admission,
         "certificateHostnames": [item.strip() for item in config.get("SWITCHBOARD_CERTIFICATE_HOSTNAMES", "").split(",") if item.strip()],
     })
     log("health_ready")
@@ -2053,6 +2263,42 @@ def bridge_smoke():
     print(json.dumps({"publicKey": public_key, "signature": signature}, sort_keys=True))
 
 
+def bridge_doctor():
+    state = load_bridge_diagnostic_state(required=False)
+    bridge = Bridge.from_env()
+    public_key = bridge.public_key()
+    signature = bridge.sign_digest(BRIDGE_DIAGNOSTIC_CHALLENGE)
+    if bridge.source == "env":
+        save_bridge_diagnostic_state(bridge, public_key=public_key)
+        state = load_bridge_diagnostic_state(required=False)
+    output = {
+        "ok": True,
+        "action": "bridge-doctor",
+        "signerMode": "cargo-bridge-secp256k1",
+        "bridge": {
+            "available": True,
+            "source": bridge.source,
+        },
+        "publicKey": public_key_summary(public_key),
+        "signature": signature_summary(signature),
+        "challenge": {
+            "kind": "fixed-diagnostic-digest",
+            "digest": BRIDGE_DIAGNOSTIC_CHALLENGE,
+        },
+        "known": {
+            "deployment": state.get("deployment"),
+            "jobSigner": state.get("jobSigner"),
+            "intentId": state.get("intentId"),
+            "endpointHostname": state.get("endpointHostname"),
+            "sessionId": state.get("sessionId"),
+            "gatewayId": state.get("gatewayId"),
+            "processorId": state.get("processorId"),
+            "operatorId": state.get("operatorId"),
+        },
+    }
+    print(json.dumps(output, sort_keys=True))
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "prepare"
     log("python_start", mode=mode)
@@ -2062,6 +2308,8 @@ def main():
         ready()
     elif mode == "bridge-smoke":
         bridge_smoke()
+    elif mode == "bridge-doctor":
+        bridge_doctor()
     else:
         fail(f"unsupported bootstrap mode: {mode}")
 
@@ -2178,7 +2426,7 @@ async function projectShowCommand(flags: Map<string, string | boolean>, runtime:
 }
 
 async function contextListCommand(flags: Map<string, string | boolean>, runtime: CliRuntime) {
-  const store = await readContextStore();
+  const store = await readContextStore(runtime.contextStorePath);
   const names = Object.keys(store.contexts ?? {}).sort();
   const output = {
     ok: true,
@@ -2237,29 +2485,29 @@ async function contextCurrentCommand(flags: Map<string, string | boolean>, runti
   });
 }
 
-async function contextUseCommand(flags: Map<string, string | boolean>, positionals: string[]) {
+async function contextUseCommand(flags: Map<string, string | boolean>, positionals: string[], runtime: CliRuntime) {
   const name = positionals[2] ?? stringFlag(flags, "context");
   if (!name) {
     throw new Error("Missing context name. Use `switchboard context use <name>`.");
   }
-  const store = await readContextStore();
+  const store = await readContextStore(runtime.contextStorePath);
   if (!store.contexts?.[name]) {
     throw new Error(`Unknown context "${name}". Create it with \`switchboard context add ${name}\` or \`switchboard context set ${name} ...\`.`);
   }
   store.current = name;
-  await writeContextStore(store);
-  writeOutput(flags, { ok: true, action: "context-use", current: name, contextStorePath: contextStorePath() }, () => {
+  await writeContextStore(store, runtime.contextStorePath);
+  writeOutput(flags, { ok: true, action: "context-use", current: name, contextStorePath: runtime.contextStorePath }, () => {
     console.log(`Current Switchboard context: ${name}`);
   });
 }
 
-async function contextSetCommand(flags: Map<string, string | boolean>, positionals: string[]) {
+async function contextSetCommand(flags: Map<string, string | boolean>, positionals: string[], runtime: CliRuntime) {
   assertNoRemovedContextSetFlags(flags);
   const name = positionals[2] ?? stringFlag(flags, "context");
   if (!name) {
     throw new Error("Missing context name. Use `switchboard context set <name> ...`.");
   }
-  const store = await readContextStore();
+  const store = await readContextStore(runtime.contextStorePath);
   const existing = stripRemovedContextFields(store.contexts?.[name] ?? {});
   const next: SwitchboardContext = {
     ...existing,
@@ -2296,7 +2544,7 @@ async function contextSetCommand(flags: Map<string, string | boolean>, positiona
   if (boolFlag(flags, "use") || !store.current) {
     store.current = name;
   }
-  await writeContextStore(store);
+  await writeContextStore(store, runtime.contextStorePath);
   writeOutput(flags, { ok: true, action: "context-set", name, current: store.current, context: sanitizeContextForOutput(next) }, () => {
     console.log(`Switchboard context saved: ${name}`);
     if (store.current === name) {
@@ -3965,6 +4213,7 @@ function launchDemoWorkflowInputFromCli(input: {
   return launchDemoWorkflowInput({
     deploymentMode: input.groupDeployEnabled ? "group" : "single",
     relayUrl: input.relayUrl,
+    allowInsecureHttp: boolFlag(input.flags, "allow-local-relay"),
     target: {
       name: target.name,
       chainId: input.manifestConfig.chainId ?? target.expectedChainId?.toString() ?? "",
@@ -4144,6 +4393,7 @@ function deployWorkflowInputFromCli(input: {
   };
   return {
     relayUrl: input.relayUrl,
+    allowInsecureHttp: boolFlag(input.flags, "allow-local-relay"),
     target: {
       name: target.name,
       chainId: input.manifestConfig.chainId ?? target.expectedChainId?.toString() ?? "",
@@ -4178,7 +4428,10 @@ function deployWorkflowAdapters(
   store?: ReturnType<typeof deployWorkflowStore>,
   options: { helperEnv?: Record<string, string | undefined> } = {}
 ): SwitchboardDeployWorkflowAdapters {
-  const controlPlane = new SwitchboardControlPlaneClient({ relayUrl: input.relayUrl });
+  const controlPlane = new SwitchboardControlPlaneClient({
+    relayUrl: input.relayUrl,
+    allowInsecureHttp: input.allowInsecureHttp === true
+  });
   return {
     controlPlane,
     acurast: {
@@ -4460,10 +4713,557 @@ interface DeployWorkflowStatusOutput {
   reportPath?: string;
 }
 
+export interface DeployDoctorAdapters {
+  fetchImpl?: typeof fetch;
+  dnsLookup?: (hostname: string) => Promise<Array<{ address: string; family: number }>>;
+  probeSshOverTls?: (input: DeployDoctorProbeInput) => Promise<DeployDoctorProbeResult>;
+  now?: () => Date;
+}
+
+export interface HostnameStatusReadinessInput {
+  customerHostname: string;
+  sessionId: string;
+  routeIntentUrl?: string;
+  operatorSshHost?: string;
+  timeoutMs: number;
+}
+
+export interface HostnameStatusAdapters {
+  fetchImpl?: typeof fetch;
+  dnsProviderHint?: (customerHostname: string) => Promise<Record<string, any>> | Record<string, any>;
+  readinessChecks?: (input: HostnameStatusReadinessInput) => Promise<Record<string, any>> | Record<string, any>;
+}
+
+export interface DeployDoctorProbeInput {
+  hostname: string;
+  port: number;
+  timeoutMs: number;
+}
+
+export interface DeployDoctorProbeResult {
+  checked: boolean;
+  tls: {
+    ok: boolean;
+    authorized?: boolean;
+    authorizationError?: string;
+    peerCertificate?: Record<string, unknown>;
+    error?: string;
+    code?: string;
+  };
+  ssh: {
+    ok: boolean;
+    banner?: string;
+    error?: string;
+  };
+}
+
+interface DeployDoctorSource {
+  kind: "intent-id" | LoadedDeployWorkflowState["source"]["kind"];
+  source: DeployWorkflowStateSource | { kind: "intent-id" };
+  snapshot?: SwitchboardDeployWorkflowSnapshot;
+  report?: Record<string, any>;
+  loadedSnapshotPath?: string;
+  loadedPrivate?: boolean;
+  tokenHydrated?: boolean;
+  warnings: string[];
+}
+
+interface DeployDoctorHttpResult {
+  checked: boolean;
+  ok: boolean;
+  status?: number;
+  value?: Record<string, unknown>;
+  error?: string;
+  unauthorized?: boolean;
+}
+
+interface DeployDoctorOutput {
+  ok: boolean;
+  action: "deploy-doctor";
+  classification: {
+    status: string;
+    stage: string;
+    summary: string;
+    nextAction: string;
+  };
+  source: Record<string, unknown>;
+  identifiers: Record<string, unknown>;
+  local: Record<string, unknown>;
+  relay: Record<string, unknown>;
+  capability: Record<string, unknown>;
+  routeState: Record<string, unknown>;
+  dns: Record<string, unknown>;
+  publicProbe: DeployDoctorProbeResult | { checked: false; reason: string };
+  bridgeDiagnostic: Record<string, unknown>;
+  commands: Record<string, string>;
+  warnings: string[];
+}
+
 async function deployWorkflowStatusCommand(flags: Map<string, string | boolean>, runtime: CliRuntime): Promise<void> {
   const loaded = await loadDeployWorkflowState(flags, runtime);
   const status = await buildDeployWorkflowStatusOutput(loaded, flags, "deploy-status");
   writeOutput(flags, status, () => printDeployWorkflowStatus(status));
+}
+
+export async function runSwitchboardProjectShow(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "project" ? [...argv] : ["project", "show", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "project-show") {
+    throw new Error(`runSwitchboardProjectShow expected project show args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await projectShowCommand(flags, runtime);
+}
+
+export async function runSwitchboardPreflight(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "preflight" ? [...argv] : ["preflight", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "preflight") {
+    throw new Error(`runSwitchboardPreflight expected preflight args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await preflightCommand(flags, runtime);
+}
+
+export async function runSwitchboardDeploymentStatus(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "status" ? [...argv] : ["status", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "deployment-status") {
+    throw new Error(`runSwitchboardDeploymentStatus expected status args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await deploymentStatusCommand(flags);
+}
+
+export async function runSwitchboardContextList(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "context" && (argv[1] === "list" || argv[1] === "ls")
+    ? [...argv]
+    : ["context", "list", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "context-list") {
+    throw new Error(`runSwitchboardContextList expected context list args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await contextListCommand(flags, runtime);
+}
+
+export async function runSwitchboardContextCurrent(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "context" && argv[1] === "current" ? [...argv] : ["context", "current", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "context-current") {
+    throw new Error(`runSwitchboardContextCurrent expected context current args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await contextCurrentCommand(flags, runtime);
+}
+
+export async function runSwitchboardContextUse(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "context" && argv[1] === "use" ? [...argv] : ["context", "use", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "context-use") {
+    throw new Error(`runSwitchboardContextUse expected context use args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await contextUseCommand(flags, parsed.positionals, runtime);
+}
+
+export async function runSwitchboardContextSet(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "context" && argv[1] === "set" ? [...argv] : ["context", "set", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "context-set") {
+    throw new Error(`runSwitchboardContextSet expected context set args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await contextSetCommand(flags, parsed.positionals, runtime);
+}
+
+export async function runSwitchboardContextAdd(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "context" && argv[1] === "add" ? [...argv] : ["context", "add", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "context-add") {
+    throw new Error(`runSwitchboardContextAdd expected context add args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await contextAddCommand(flags, parsed.positionals, runtime);
+}
+
+export async function runSwitchboardContextDnsSet(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "context" && argv[1] === "dns" && argv[2] === "set"
+    ? [...argv]
+    : ["context", "dns", "set", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "context-dns-set") {
+    throw new Error(`runSwitchboardContextDnsSet expected context dns set args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await contextDnsSetCommand(flags, parsed.positionals, runtime);
+}
+
+export async function runSwitchboardContextDnsClear(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "context" &&
+    argv[1] === "dns" &&
+    (argv[2] === "clear" || argv[2] === "remove" || argv[2] === "rm")
+    ? [...argv]
+    : ["context", "dns", "clear", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "context-dns-clear") {
+    throw new Error(`runSwitchboardContextDnsClear expected context dns clear args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await contextDnsClearCommand(flags, parsed.positionals, runtime);
+}
+
+export async function runSwitchboardClaimable(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "claimable" ? [...argv] : ["claimable", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "claimable") {
+    throw new Error(`runSwitchboardClaimable expected claimable args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await claimCommand(flags, { readOnly: true });
+}
+
+export async function runSwitchboardRefundable(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "refundable" || (argv[0] === "session" && argv[1] === "refundable")
+    ? [...argv]
+    : ["refundable", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "session-refundable") {
+    throw new Error(`runSwitchboardRefundable expected refundable args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await refundCommand(flags, { readOnly: true });
+}
+
+export async function runSwitchboardHostnameStatus(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  adapters: HostnameStatusAdapters = {}
+): Promise<void> {
+  const normalized = argv[0] === "hostname" && argv[1] === "status" ? [...argv] : ["hostname", "status", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "hostname-status") {
+    throw new Error(`runSwitchboardHostnameStatus expected hostname status args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await hostnameStatusCommand(flags, parsed.positionals, adapters);
+}
+
+export async function runSwitchboardDeployStatus(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "deploy" && argv[1] === "status" ? [...argv] : ["deploy", "status", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "deploy-status") {
+    throw new Error(`runSwitchboardDeployStatus expected deploy status args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await deployWorkflowStatusCommand(flags, runtime);
+}
+
+export async function runSwitchboardLaunchDemo(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "launch-demo" ? [...argv] : ["launch-demo", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "launch-demo") {
+    throw new Error(`runSwitchboardLaunchDemo expected launch-demo args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await launchDemoCommand(flags, runtime);
+}
+
+export async function runSwitchboardDeploy(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "deploy" ? [...argv] : ["deploy", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "deploy") {
+    throw new Error(`runSwitchboardDeploy expected deploy args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await deployCommand(flags, runtime);
+}
+
+export async function runSwitchboardDeployResume(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "deploy" && argv[1] === "resume" ? [...argv] : ["deploy", "resume", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "deploy-resume") {
+    throw new Error(`runSwitchboardDeployResume expected deploy resume args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await deployWorkflowResumeCommand(flags, runtime);
+}
+
+async function deployDoctorCommand(
+  flags: Map<string, string | boolean>,
+  runtime: CliRuntime,
+  adapters: DeployDoctorAdapters = {}
+): Promise<void> {
+  const output = await buildSwitchboardDeployDoctorReport(flags, runtime, adapters);
+  writeOutput(flags, output, () => printDeployDoctor(output));
+}
+
+export async function runSwitchboardDeployDoctor(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  adapters: DeployDoctorAdapters = {}
+): Promise<void> {
+  const normalized = argv[0] === "deploy" && argv[1] === "doctor" ? [...argv] : ["deploy", "doctor", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "deploy-doctor") {
+    throw new Error(`runSwitchboardDeployDoctor expected deploy doctor args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await deployDoctorCommand(flags, runtime, adapters);
+}
+
+export async function buildSwitchboardDeployDoctorReport(
+  flags: Map<string, string | boolean>,
+  runtime: CliRuntime,
+  adapters: DeployDoctorAdapters = {}
+): Promise<DeployDoctorOutput> {
+  const now = adapters.now?.() ?? new Date();
+  const source = await loadDeployDoctorSource(flags, runtime);
+  const report = source.report;
+  const snapshot = source.snapshot;
+  const warnings = [...source.warnings];
+  if (source.tokenHydrated) {
+    warnings.push("Hydrated the unredacted deployment intent token from report.json localSecret.");
+  }
+
+  const intentId = deployDoctorIntentId(flags, source);
+  const intentToken = deployDoctorIntentToken(flags, source);
+  const relayUrl = await deployDoctorRelayUrl(flags, runtime, source);
+  const requestTimeoutMs = numberFlag(flags, "request-timeout-ms", "SWITCHBOARD_DEPLOY_DOCTOR_REQUEST_TIMEOUT_MS", 15_000);
+  const observability = intentId && relayUrl && intentToken
+    ? await deployDoctorFetchJson({
+        fetchImpl: adapters.fetchImpl,
+        url: new URL(`/v1/deployment-intents/${encodeURIComponent(intentId)}/observability`, relayUrl),
+        token: intentToken,
+        timeoutMs: requestTimeoutMs
+      })
+    : {
+        checked: false,
+        ok: false,
+        error: !intentId
+          ? "missing intent id"
+          : !relayUrl
+            ? "missing relay URL"
+            : "missing deployment intent token"
+      };
+  if (observability.error && observability.checked) {
+    warnings.push(`Deployment intent observability unavailable: ${observability.error}`);
+  }
+
+  const observabilityValue = recordValue(observability.value);
+  const availability = recordValue(observabilityValue.availability);
+  const gateway = recordValue(observabilityValue.gateway);
+  const observabilityCapability = recordValue(gateway.capability);
+  const observabilityRouteState = recordValue(observabilityValue.routeState);
+  const localRoute = deployDoctorLocalRoute(source);
+  const runtimeSummary = deployDoctorRuntimeSummary(source, observabilityValue);
+  const schedule = snapshot ? deployWorkflowScheduleSummary(snapshot, report) : deployDoctorReportScheduleSummary(report);
+  warnings.push(...deployWorkflowScheduleWarnings(schedule));
+
+  const identifiers = deployDoctorIdentifiers({
+    flags,
+    source,
+    observability: observabilityValue,
+    runtime: runtimeSummary
+  });
+  const bridgeDiagnostic = deployDoctorBridgeDiagnostic(source, identifiers, runtimeSummary);
+  const commands = deployDoctorCommands(identifiers.hostname, booleanRecordField(bridgeDiagnostic, "available"));
+
+  const capability = await deployDoctorCapabilitySummary({
+    flags,
+    relayUrl,
+    identifiers,
+    observabilityCapability,
+    requestTimeoutMs,
+    adapters,
+    now
+  });
+  if (capability.warning) warnings.push(capability.warning);
+
+  const routeState = await deployDoctorRouteStateSummary({
+    flags,
+    relayUrl,
+    identifiers,
+    observabilityRouteState,
+    requestTimeoutMs,
+    adapters
+  });
+  if (routeState.warning) warnings.push(routeState.warning);
+
+  const dns = identifiers.hostname
+    ? await deployDoctorDnsSummary(identifiers.hostname, adapters)
+    : { checked: false, reason: "missing hostname" };
+  if (stringRecordField(dns, "error")) {
+    warnings.push(`DNS lookup failed: ${stringRecordField(dns, "error")}`);
+  }
+
+  const publicProbe = boolFlag(flags, "probe")
+    ? identifiers.hostname
+      ? await (adapters.probeSshOverTls ?? probeSshOverTls)({
+          hostname: identifiers.hostname,
+          port: numberFlag(flags, "tls-port", "SWITCHBOARD_DEPLOY_DOCTOR_TLS_PORT", 443),
+          timeoutMs: numberFlag(flags, "probe-timeout-ms", "SWITCHBOARD_DEPLOY_DOCTOR_PROBE_TIMEOUT_MS", 8_000)
+        })
+      : { checked: false as const, reason: "missing hostname" }
+    : { checked: false as const, reason: "pass --probe to run public TLS/SNI and SSH banner checks" };
+
+  const funding = deployDoctorFundingSummary(source, availability);
+  const route = deployDoctorRouteSummary(localRoute, availability, observabilityRouteState, routeState);
+  const classification = classifyDeployDoctor({
+    phase: snapshot ? normalizedDeployWorkflowPhase(snapshot) : undefined,
+    funding,
+    route,
+    schedule,
+    capability,
+    routeState,
+    runtime: runtimeSummary,
+    publicProbe
+  });
+
+  return {
+    ok: classification.status === "healthy",
+    action: "deploy-doctor",
+    classification,
+    source: jsonSafeOutput({
+      kind: source.kind,
+      reportPath: source.source.kind !== "intent-id" ? source.source.reportPath : undefined,
+      snapshotPath: source.source.kind !== "intent-id" ? source.source.snapshotPath : undefined,
+      loadedSnapshotPath: source.loadedSnapshotPath,
+      loadedPrivate: source.loadedPrivate
+    }),
+    identifiers: jsonSafeOutput({
+      intentId,
+      relayUrl,
+      hostname: identifiers.hostname,
+      operatorId: identifiers.operatorId,
+      gatewayId: identifiers.gatewayId,
+      processorId: identifiers.processorId,
+      processor: identifiers.processor,
+      deploymentId: identifiers.deploymentId,
+      sessionId: identifiers.sessionId
+    }),
+    local: jsonSafeOutput({
+      workflowId: snapshot?.workflowId,
+      phase: snapshot ? normalizedDeployWorkflowPhase(snapshot) : undefined,
+      schedule,
+      funding,
+      route: localRoute,
+      runtime: runtimeSummary
+    }),
+    relay: jsonSafeOutput({
+      observability,
+      availability
+    }),
+    capability: jsonSafeOutput(capability.output),
+    routeState: jsonSafeOutput(routeState.output),
+    dns: jsonSafeOutput(dns),
+    publicProbe: jsonSafeOutput(publicProbe),
+    bridgeDiagnostic: jsonSafeOutput(bridgeDiagnostic),
+    commands,
+    warnings
+  };
 }
 
 async function deployWorkflowResumeCommand(flags: Map<string, string | boolean>, runtime: CliRuntime): Promise<void> {
@@ -4826,7 +5626,10 @@ async function readDeployWorkflowIntentStatus(loaded: LoadedDeployWorkflowState)
   if (!intentId) return undefined;
   const token = deployWorkflowIntentToken(loaded.snapshot);
   if (!token) return undefined;
-  const client = new SwitchboardControlPlaneClient({ relayUrl: loaded.snapshot.input.relayUrl });
+  const client = new SwitchboardControlPlaneClient({
+    relayUrl: loaded.snapshot.input.relayUrl,
+    allowInsecureHttp: loaded.snapshot.input.allowInsecureHttp === true
+  });
   return client.readDeploymentIntent(intentId, { cliToken: token });
 }
 
@@ -4991,6 +5794,763 @@ function printDeployWorkflowStatus(status: DeployWorkflowStatusOutput): void {
   for (const warning of status.warnings) {
     console.log(statusLine("warn", "Warning", warning));
   }
+}
+
+async function loadDeployDoctorSource(flags: Map<string, string | boolean>, runtime: CliRuntime): Promise<DeployDoctorSource> {
+  const intentId = stringFlag(flags, "intent-id");
+  const localSources = ["run-dir", "report", "snapshot"].filter((name) => stringFlag(flags, name));
+  if (intentId && localSources.length > 0) {
+    throw new Error("Use only one of --intent-id, --run-dir, --report, or --snapshot for deploy doctor.");
+  }
+  if (intentId) {
+    return {
+      kind: "intent-id",
+      source: { kind: "intent-id" },
+      warnings: []
+    };
+  }
+  const loaded = await loadDeployWorkflowState(flags, runtime);
+  return {
+    kind: loaded.source.kind,
+    source: loaded.source,
+    snapshot: loaded.snapshot,
+    report: loaded.report,
+    loadedSnapshotPath: loaded.loadedSnapshotPath,
+    loadedPrivate: loaded.loadedPrivate,
+    tokenHydrated: loaded.tokenHydrated,
+    warnings: loaded.warnings
+  };
+}
+
+function deployDoctorIntentId(flags: Map<string, string | boolean>, source: DeployDoctorSource): string | undefined {
+  return (
+    stringFlag(flags, "intent-id") ??
+    (source.snapshot ? deployWorkflowIntentId(source.snapshot) : undefined) ??
+    stringRecordField(source.report?.deploymentIntent, "intentId") ??
+    stringNestedField(source.report?.deploymentIntent, "intent", "intentId")
+  );
+}
+
+function deployDoctorIntentToken(flags: Map<string, string | boolean>, source: DeployDoctorSource): string | undefined {
+  return (
+    stringFlag(flags, "intent-token") ??
+    secretFromEnvFlag(flags, "intent-token-env") ??
+    optionalEnv("SWITCHBOARD_INTENT_TOKEN") ??
+    (source.snapshot ? deployWorkflowIntentToken(source.snapshot) : undefined) ??
+    stringNestedField(source.report?.deploymentIntent, "localSecret", "cliToken") ??
+    stringRecordField(source.report?.deploymentIntent, "cliToken")
+  );
+}
+
+async function deployDoctorRelayUrl(
+  flags: Map<string, string | boolean>,
+  runtime: CliRuntime,
+  source: DeployDoctorSource
+): Promise<string | undefined> {
+  const local =
+    stringFlag(flags, "relay-url") ??
+    source.snapshot?.input.relayUrl ??
+    stringRecordField(source.report?.relay, "url") ??
+    stringRecordField(source.report?.deploymentIntent, "relayUrl") ??
+    stringNestedField(source.report?.deploymentIntent, "env", "SWITCHBOARD_RELAY_URL") ??
+    optionalEnv("RELAY_URL") ??
+    optionalEnv("PROOF_CONTROL_PLANE_URL");
+  if (local) {
+    return normalizeCliBaseUrl(local);
+  }
+  if (stringFlag(flags, "intent-id")) {
+    const manifestConfig = await resolveCliNetworkConfig(flags);
+    return manifestConfig.relayUrl ? normalizeCliBaseUrl(manifestConfig.relayUrl) : undefined;
+  }
+  void runtime;
+  return undefined;
+}
+
+async function deployDoctorFetchJson(input: {
+  fetchImpl?: typeof fetch;
+  url: URL;
+  token?: string;
+  timeoutMs: number;
+}): Promise<DeployDoctorHttpResult> {
+  try {
+    const response = await (input.fetchImpl ?? fetch)(input.url, {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        ...(input.token ? { authorization: `Bearer ${input.token}` } : {})
+      },
+      signal: AbortSignal.timeout(input.timeoutMs)
+    });
+    const body = await response.text();
+    const parsed = body ? parseJsonObject(body) : {};
+    if (!response.ok || parsed?.ok === false) {
+      return {
+        checked: true,
+        ok: false,
+        status: response.status,
+        value: parsed,
+        unauthorized: response.status === 401 || response.status === 403,
+        error: `${response.status} ${body.slice(0, 500)}`
+      };
+    }
+    return {
+      checked: true,
+      ok: true,
+      status: response.status,
+      value: parsed
+    };
+  } catch (error) {
+    return {
+      checked: true,
+      ok: false,
+      error: safeErrorMessage(error)
+    };
+  }
+}
+
+function deployDoctorLocalRoute(source: DeployDoctorSource): Record<string, unknown> {
+  const snapshot = source.snapshot;
+  const report = source.report;
+  return firstNonEmptyRecord([
+    recordValue(recordValue(snapshot?.data.routeStatus).route),
+    recordValue(recordValue(recordValue(snapshot?.data.routeStatus).intent).route),
+    recordValue(snapshot?.data.route),
+    recordValue(report?.route),
+    recordValue(report?.routeActivation),
+    recordValue(recordValue(report?.deploymentIntent).route),
+    recordValue(recordValue(recordValue(report?.deploymentIntent).intent).route)
+  ]);
+}
+
+function deployDoctorRuntimeSummary(
+  source: DeployDoctorSource,
+  observability: Record<string, unknown>
+): Record<string, unknown> {
+  const runtime = firstNonEmptyRecord([
+    recordValue(source.snapshot?.data.runtime),
+    recordValue(source.report?.runtime),
+    recordValue(recordValue(observability.availability).health)
+  ]);
+  const upstreams = uniqueStrings([
+    ...stringArrayRecordField(runtime, "upstreamIps"),
+    ...stringArrayRecordField(runtime, "upstreamHosts"),
+    ...stringArrayRecordField(recordValue(source.report?.operator), "upstreamIps"),
+    hostFromHostPort(stringRecordField(source.report?.operator, "upstream"))
+  ].filter((item): item is string => Boolean(item)));
+  return {
+    ...runtime,
+    upstreamIps: upstreams.length > 0 ? upstreams : undefined,
+    upstreamClassifications: upstreams.map((upstream) => ({
+      upstream,
+      classification: classifyUpstreamAddress(upstream)
+    }))
+  };
+}
+
+function deployDoctorIdentifiers(input: {
+  flags: Map<string, string | boolean>;
+  source: DeployDoctorSource;
+  observability: Record<string, unknown>;
+  runtime: Record<string, unknown>;
+}): {
+  hostname?: string;
+  operatorId?: string;
+  gatewayId?: string;
+  processorId?: string;
+  processor?: string;
+  deploymentId?: string;
+  sessionId?: string;
+} {
+  const report = input.source.report;
+  const snapshot = input.source.snapshot;
+  const reportHostnames = deploymentReportHostnames(report);
+  const gateway = recordValue(input.observability.gateway);
+  const availability = recordValue(input.observability.availability);
+  const routeState = recordValue(input.observability.routeState);
+  const dnsCanonical = recordValue(recordValue(input.observability.dns).canonical);
+  const localRoute = deployDoctorLocalRoute(input.source);
+  const capacity = recordValue(snapshot?.data.capacity);
+  const deployment = recordValue(snapshot?.data.deployment);
+  const reportSession = recordValue(report?.session);
+  const funding = recordValue(availability.funding);
+
+  return {
+    hostname: normalizeHostnameForCli(
+      stringFlag(input.flags, "hostname") ??
+      reportHostnames.public ??
+      stringRecordField(reportSession, "hostname") ??
+      stringRecordField(availability, "endpointHostname") ??
+      stringRecordField(routeState, "hostname") ??
+      stringRecordField(dnsCanonical, "hostname") ??
+      stringRecordField(localRoute, "hostname")
+    ),
+    operatorId:
+      stringFlag(input.flags, "operator-id") ??
+      stringRecordField(capacity, "operatorId") ??
+      stringRecordField(reportSession, "operatorId") ??
+      stringRecordField(gateway, "operatorId") ??
+      stringRecordField(recordValue(localRoute.source), "operatorId"),
+    gatewayId:
+      stringFlag(input.flags, "gateway-id") ??
+      stringRecordField(capacity, "gatewayId") ??
+      stringRecordField(reportSession, "gatewayId") ??
+      stringRecordField(gateway, "gatewayId") ??
+      stringRecordField(routeState, "gatewayId") ??
+      stringRecordField(recordValue(localRoute.sink), "gatewayId") ??
+      stringRecordField(recordValue(localRoute.source), "gatewayId"),
+    processorId:
+      stringFlag(input.flags, "processor-id") ??
+      stringRecordField(capacity, "processorId") ??
+      stringRecordField(reportSession, "processorId") ??
+      stringRecordField(gateway, "processorId"),
+    processor:
+      stringFlag(input.flags, "processor") ??
+      stringRecordField(capacity, "processor") ??
+      stringRecordField(reportSession, "processor"),
+    deploymentId:
+      stringFlag(input.flags, "deployment-id") ??
+      stringRecordField(deployment, "deploymentId") ??
+      stringRecordField(report?.deployment, "deploymentId"),
+    sessionId:
+      stringFlag(input.flags, "session-id") ??
+      stringRecordField(reportSession, "sessionId") ??
+      stringRecordField(availability, "sessionId") ??
+      stringRecordField(funding, "sessionId")
+  };
+}
+
+async function deployDoctorCapabilitySummary(input: {
+  flags: Map<string, string | boolean>;
+  relayUrl?: string;
+  identifiers: { operatorId?: string; gatewayId?: string };
+  observabilityCapability: Record<string, unknown>;
+  requestTimeoutMs: number;
+  adapters: DeployDoctorAdapters;
+  now: Date;
+}): Promise<{ output: Record<string, unknown>; warning?: string }> {
+  const latestFromObservability = recordValue(input.observabilityCapability.latestReport);
+  let latestReport = Object.keys(latestFromObservability).length > 0 ? latestFromObservability : undefined;
+  let warning: string | undefined;
+  const operatorId = input.identifiers.operatorId;
+  const gatewayId = input.identifiers.gatewayId;
+  const capabilityUrl = input.relayUrl && (operatorId || gatewayId)
+    ? new URL("/v1/operator-capabilities", input.relayUrl)
+    : undefined;
+  if (capabilityUrl) {
+    if (operatorId) capabilityUrl.searchParams.set("operatorId", operatorId);
+    if (gatewayId) capabilityUrl.searchParams.set("gatewayId", gatewayId);
+    capabilityUrl.searchParams.set("activeOnly", "true");
+    capabilityUrl.searchParams.set("limit", "5");
+  }
+  const readToken =
+    secretFromEnvFlag(input.flags, "capability-read-token-env") ??
+    optionalEnv("PROOF_OPERATOR_CAPABILITY_READ_TOKEN") ??
+    optionalEnv("SWITCHBOARD_OPERATOR_CAPABILITY_READ_TOKEN");
+  const capabilityRead = capabilityUrl
+    ? await deployDoctorFetchJson({
+        fetchImpl: input.adapters.fetchImpl,
+        url: capabilityUrl,
+        token: readToken,
+        timeoutMs: input.requestTimeoutMs
+      })
+    : { checked: false, ok: false, error: "missing relay/operator/gateway" };
+
+  const latestReadReports = arrayRecordField(capabilityRead.value, "latest");
+  if (!latestReport && latestReadReports[0]) {
+    latestReport = deployDoctorCapabilityReportSummary(latestReadReports[0]);
+  }
+  const reportExpiresAt = stringRecordField(latestReport, "expiresAt");
+  const stale = reportExpiresAt ? Date.parse(reportExpiresAt) <= input.now.getTime() : undefined;
+  if (capabilityRead.unauthorized) {
+    warning = "Operator capability read was unauthorized; check the capability read token or relay admission.";
+  } else if (stale === true) {
+    warning = `Latest operator capability report expired at ${reportExpiresAt}.`;
+  } else if (input.observabilityCapability.available === false) {
+    warning = `No fresh matching operator capability report: ${stringRecordField(input.observabilityCapability, "reason") ?? "unknown"}.`;
+  }
+
+  return {
+    warning,
+    output: {
+      available: input.observabilityCapability.available,
+      reason: stringRecordField(input.observabilityCapability, "reason"),
+      operatorId,
+      gatewayId,
+      latestReport,
+      stale,
+      routeStateAvailable: input.observabilityCapability.routeStateAvailable,
+      routeState: input.observabilityCapability.routeState,
+      capacity: {
+        activeRouteCount: input.observabilityCapability.activeRouteCount,
+        routeCapacity: input.observabilityCapability.routeCapacity,
+        reportedProcessorCount: input.observabilityCapability.reportedProcessorCount
+      },
+      read: capabilityRead
+    }
+  };
+}
+
+function deployDoctorCapabilityReportSummary(report: Record<string, unknown>): Record<string, unknown> {
+  const body = recordValue(report.report);
+  return {
+    reportId: stringRecordField(body, "reportId") ?? stringRecordField(report, "reportId"),
+    reportedAt: stringRecordField(body, "reportedAt") ?? stringRecordField(report, "reportedAt"),
+    receivedAt: stringRecordField(report, "receivedAt"),
+    expiresAt: stringRecordField(body, "expiresAt") ?? stringRecordField(report, "expiresAt"),
+    signer: stringRecordField(report, "signer"),
+    operatorId: stringNestedField(body, "operator", "operatorId"),
+    gatewayId: stringNestedField(body, "operator", "gatewayId")
+  };
+}
+
+async function deployDoctorRouteStateSummary(input: {
+  flags: Map<string, string | boolean>;
+  relayUrl?: string;
+  identifiers: { operatorId?: string; gatewayId?: string; hostname?: string };
+  observabilityRouteState: Record<string, unknown>;
+  requestTimeoutMs: number;
+  adapters: DeployDoctorAdapters;
+}): Promise<{ output: Record<string, unknown>; warning?: string }> {
+  const token =
+    secretFromEnvFlag(input.flags, "route-state-token-env") ??
+    optionalEnv("GATEWAY_ROUTE_STATE_TOKEN") ??
+    optionalEnv("PROOF_GATEWAY_ROUTE_STATE_TOKEN");
+  const operatorId = input.identifiers.operatorId;
+  const gatewayId = input.identifiers.gatewayId;
+  const routeStateUrl = input.relayUrl && operatorId && gatewayId
+    ? new URL(`/v1/operators/${encodeURIComponent(operatorId)}/gateways/${encodeURIComponent(gatewayId)}/route-state`, input.relayUrl)
+    : undefined;
+  const read = routeStateUrl && token
+    ? await deployDoctorFetchJson({
+        fetchImpl: input.adapters.fetchImpl,
+        url: routeStateUrl,
+        token,
+        timeoutMs: input.requestTimeoutMs
+      })
+    : { checked: false, ok: false, error: routeStateUrl ? "missing route-state token" : "missing relay/operator/gateway" };
+  const routes = arrayRecordField(read.value, "routes");
+  const activeRoutes = arrayRecordField(read.value, "activeRoutes");
+  const hostname = input.identifiers.hostname?.toLowerCase();
+  const routeMatchesHostname = Boolean(hostname && [...routes, ...activeRoutes].some((route) => routeHostnames(route).includes(hostname)));
+  const active = activeRoutes.length > 0 && (!hostname || routeMatchesHostname);
+  let warning: string | undefined;
+  if (read.unauthorized) {
+    warning = "Gateway route-state read was unauthorized; check the route-state token.";
+  }
+  return {
+    warning,
+    output: {
+      desired: input.observabilityRouteState.desired,
+      reason: stringRecordField(input.observabilityRouteState, "reason"),
+      runtimeHttpsReady: input.observabilityRouteState.runtimeHttpsReady,
+      operatorId,
+      gatewayId,
+      active,
+      routeMatchesHostname,
+      read
+    }
+  };
+}
+
+async function deployDoctorDnsSummary(hostname: string, adapters: DeployDoctorAdapters): Promise<Record<string, unknown>> {
+  try {
+    const lookup = adapters.dnsLookup ?? ((value: string) => dnsLookup(value, { all: true }));
+    const addresses = await lookup(hostname);
+    return {
+      checked: true,
+      ok: addresses.length > 0,
+      hostname,
+      addresses
+    };
+  } catch (error) {
+    return {
+      checked: true,
+      ok: false,
+      hostname,
+      error: safeErrorMessage(error)
+    };
+  }
+}
+
+function deployDoctorFundingSummary(source: DeployDoctorSource, availability: Record<string, unknown>): Record<string, unknown> {
+  const relayFunding = recordValue(availability.funding);
+  const snapshot = source.snapshot;
+  const localFunding = firstNonEmptyRecord([
+    recordValue(snapshot?.data.fundingStatus),
+    recordValue(snapshot?.data.funding),
+    recordValue(source.report?.funding)
+  ]);
+  const quote = firstNonEmptyRecord([
+    recordValue(snapshot?.data.quote),
+    recordValue(source.report?.quote)
+  ]);
+  const status = stringRecordField(relayFunding, "status") ?? stringRecordField(localFunding, "status");
+  return {
+    status: status ?? (Object.keys(quote).length > 0 ? "quote_ready" : undefined),
+    funded: status === "funded" || Boolean(stringRecordField(localFunding, "txHash")),
+    quoteReady: Object.keys(quote).length > 0,
+    sessionId: stringRecordField(relayFunding, "sessionId") ?? stringRecordField(localFunding, "sessionId") ?? stringNestedField(quote, "quote", "sessionId"),
+    relay: relayFunding,
+    local: localFunding,
+    quote
+  };
+}
+
+function deployDoctorRouteSummary(
+  localRoute: Record<string, unknown>,
+  availability: Record<string, unknown>,
+  observabilityRouteState: Record<string, unknown>,
+  routeState: { output: Record<string, unknown> }
+): Record<string, unknown> {
+  const availabilityRoute = recordValue(availability.route);
+  const localStatus = stringRecordField(localRoute, "status");
+  const relayStatus = stringRecordField(availabilityRoute, "status");
+  const active =
+    localStatus === "active" ||
+    relayStatus === "active" ||
+    booleanRecordField(routeState.output, "active");
+  return {
+    active,
+    status: relayStatus ?? localStatus,
+    desired: observabilityRouteState.desired,
+    desiredReason: stringRecordField(observabilityRouteState, "reason"),
+    local: localRoute,
+    relay: availabilityRoute
+  };
+}
+
+function deployDoctorReportScheduleSummary(report: Record<string, any> | undefined): Record<string, unknown> | undefined {
+  const schedule = deploymentSchedule(report);
+  if (!schedule) return undefined;
+  const startMs =
+    normalizeScheduleTimestampMs(schedule.startTime) ??
+    (unixSecondsField(schedule, "startUnixSeconds") !== undefined ? unixSecondsField(schedule, "startUnixSeconds")! * 1000 : undefined);
+  const endMs =
+    normalizeScheduleTimestampMs(schedule.endTime) ??
+    (unixSecondsField(schedule, "endUnixSeconds") !== undefined ? unixSecondsField(schedule, "endUnixSeconds")! * 1000 : undefined);
+  const maxStartDelayMs = normalizeDurationMs(schedule.maxStartDelay);
+  const latestStartMs = startMs !== undefined && maxStartDelayMs !== undefined ? startMs + maxStartDelayMs : undefined;
+  return {
+    ...schedule,
+    startIso: stringRecordField(schedule, "startIso") ?? (startMs ? new Date(startMs).toISOString() : undefined),
+    endIso: stringRecordField(schedule, "endIso") ?? (endMs ? new Date(endMs).toISOString() : undefined),
+    latestStartIso: latestStartMs ? new Date(latestStartMs).toISOString() : undefined,
+    startWindowExpired: latestStartMs !== undefined ? Date.now() > latestStartMs : undefined,
+    endExpired: endMs !== undefined ? Date.now() > endMs : undefined
+  };
+}
+
+function deployDoctorBridgeDiagnostic(
+  source: DeployDoctorSource,
+  identifiers: {
+    hostname?: string;
+    deploymentId?: string;
+    sessionId?: string;
+    gatewayId?: string;
+    processorId?: string;
+    operatorId?: string;
+  },
+  runtime: Record<string, unknown>
+): Record<string, unknown> {
+  const report = source.report;
+  const snapshotRuntime = recordValue(source.snapshot?.input.runtime);
+  const reportRuntime = recordValue(report?.runtime);
+  const reportDeployment = recordValue(report?.deployment);
+  const applicationProtocol =
+    stringRecordField(runtime, "applicationProtocol") ??
+    stringRecordField(reportRuntime, "applicationProtocol") ??
+    stringRecordField(reportDeployment, "applicationProtocol");
+  const signerMode =
+    stringRecordField(runtime, "signerMode") ??
+    stringRecordField(reportRuntime, "signerMode") ??
+    stringRecordField(reportDeployment, "signerMode");
+  const runtimeKind =
+    stringRecordField(snapshotRuntime, "kind") ??
+    stringRecordField(reportRuntime, "kind") ??
+    stringRecordField(reportDeployment, "runtime");
+  const available =
+    applicationProtocol === "ssh" ||
+    signerMode === "cargo-bridge-secp256k1" ||
+    runtimeKind === "script" ||
+    Boolean(stringRecordField(snapshotRuntime, "authorizedKeys"));
+  return {
+    available,
+    command: available ? SSH_TEMPLATE_BRIDGE_DIAGNOSTIC_COMMAND : undefined,
+    signerMode: available ? "cargo-bridge-secp256k1" : signerMode,
+    applicationProtocol,
+    runtimeKind,
+    known: {
+      runtimeSigner: stringRecordField(runtime, "runtimeSigner") ?? stringRecordField(reportRuntime, "runtimeSigner"),
+      deploymentId: identifiers.deploymentId,
+      sessionId: identifiers.sessionId,
+      gatewayId: identifiers.gatewayId,
+      processorId: identifiers.processorId,
+      operatorId: identifiers.operatorId,
+      hostname: identifiers.hostname
+    }
+  };
+}
+
+function deployDoctorCommands(hostname: string | undefined, includeBridgeDiagnostic = false): Record<string, string> {
+  const commands: Record<string, string> = includeBridgeDiagnostic
+    ? { bridgeDoctor: SSH_TEMPLATE_BRIDGE_DIAGNOSTIC_COMMAND }
+    : {};
+  if (!hostname) return commands;
+  return {
+    ...commands,
+    openssl: `openssl s_client -connect ${hostname}:443 -servername ${hostname} -quiet`,
+    ssh: `ssh -o "ProxyCommand=openssl s_client -quiet -connect %h:443 -servername %h" root@${hostname}`,
+    ...(includeBridgeDiagnostic
+      ? { sshBridgeDoctor: `ssh -o "ProxyCommand=openssl s_client -quiet -connect %h:443 -servername %h" root@${hostname} ${SSH_TEMPLATE_BRIDGE_DIAGNOSTIC_COMMAND}` }
+      : {})
+  };
+}
+
+function classifyDeployDoctor(input: {
+  phase?: string;
+  funding: Record<string, unknown>;
+  route: Record<string, unknown>;
+  schedule?: Record<string, unknown>;
+  capability: { output: Record<string, unknown> };
+  routeState: { output: Record<string, unknown> };
+  runtime: Record<string, unknown>;
+  publicProbe: DeployDoctorProbeResult | { checked: false; reason: string };
+}): DeployDoctorOutput["classification"] {
+  const lateFunding = lateFundingWarningFromSummary(input.schedule);
+  const funded = booleanRecordField(input.funding, "funded");
+  const runtimeUpstreams = arrayRecordField(input.runtime, "upstreamClassifications");
+  const publicUpstream = runtimeUpstreams.find((item) => stringRecordField(item, "classification") === "public-egress");
+  if (lateFunding && !funded) {
+    return {
+      status: "late_funding_window",
+      stage: "funding",
+      summary: lateFunding,
+      nextAction: "Do not fund this run unless you intentionally accept expired Acurast evidence."
+    };
+  }
+  if (recordValue(input.capability.output.read).unauthorized === true) {
+    return {
+      status: "capability_token_unauthorized",
+      stage: "operator capability",
+      summary: "The relay rejected the operator capability read token.",
+      nextAction: "Check the capability read token/admission before spending against this gateway."
+    };
+  }
+  if (input.capability.output.stale === true || input.capability.output.available === false) {
+    return {
+      status: "stale_or_missing_capability",
+      stage: "operator capability",
+      summary: stringRecordField(input.capability.output, "reason") ?? "No fresh authorized capability report matched this deployment.",
+      nextAction: "Repair gateway-agent capability reporting before spending or resuming the deploy."
+    };
+  }
+  if (publicUpstream) {
+    return {
+      status: "upstream_public_egress",
+      stage: "runtime upstream",
+      summary: `Runtime upstream ${stringRecordField(publicUpstream, "upstream")} looks like public egress, not a gateway-reachable LAN address.`,
+      nextAction: "Redeploy or repair runtime upstream discovery so route-state targets the processor-local listener."
+    };
+  }
+  if (!funded && (input.phase === "quote ready" || input.phase === "funding needed" || input.funding.status === "quote_ready")) {
+    return {
+      status: "funding_required",
+      stage: "funding",
+      summary: "The runtime has a quote but the Hub session is not funded.",
+      nextAction: "Run deploy resume only if the schedule window is still valid."
+    };
+  }
+  if (!funded && !input.phase?.includes("runtime claimed")) {
+    return {
+      status: "runtime_not_claimed",
+      stage: "runtime claim",
+      summary: "The deployment has not reached a funded runtime/route diagnostic point yet.",
+      nextAction: "Wait for the Acurast job to claim the intent, or inspect the Acurast deployment logs."
+    };
+  }
+  if (funded && input.route.active !== true) {
+    return {
+      status: "route_missing",
+      stage: "route-state",
+      summary: stringRecordField(input.route, "desiredReason") ?? "The funded deployment does not have an active gateway route.",
+      nextAction: "Check runtime HTTPS readiness, route-state polling, and gateway capability freshness."
+    };
+  }
+  if (input.publicProbe.checked && input.publicProbe.tls.ok === false) {
+    const error = input.publicProbe.tls.error ?? "TLS/SNI probe failed";
+    return {
+      status: /reset|ECONNRESET/i.test(error) ? "tls_route_reset" : "tls_probe_failed",
+      stage: "public TLS/SNI",
+      summary: error,
+      nextAction: "Check gateway route-state target and whether stunnel is listening on the advertised upstream."
+    };
+  }
+  if (input.publicProbe.checked && input.publicProbe.tls.ok && input.publicProbe.ssh.ok === false) {
+    return {
+      status: "ssh_banner_missing",
+      stage: "SSH banner",
+      summary: input.publicProbe.ssh.error ?? "TLS connected but no SSH banner was observed.",
+      nextAction: "Check Dropbear startup and stunnel forwarding inside the Cargo runtime."
+    };
+  }
+  if (input.route.active === true && (!input.publicProbe.checked || input.publicProbe.ssh.ok === true)) {
+    return {
+      status: "healthy",
+      stage: input.publicProbe.checked ? "SSH banner" : "route-state",
+      summary: input.publicProbe.checked ? "Route is active and the SSH banner probe succeeded." : "Route is active. Pass --probe to verify TLS/SNI and SSH banner reachability.",
+      nextAction: "No action required."
+    };
+  }
+  return {
+    status: "needs_attention",
+    stage: input.phase ?? "deployment",
+    summary: "Deploy doctor could not classify the deployment as healthy.",
+    nextAction: "Inspect the readbacks above and rerun with --probe when the public hostname is expected to be reachable."
+  };
+}
+
+function printDeployDoctor(output: DeployDoctorOutput): void {
+  console.log(sectionTitle("Deploy doctor"));
+  printOutputRows([
+    { label: "Status", value: output.ok ? "healthy" : "needs attention" },
+    { label: "Stage", value: output.classification.stage },
+    { label: "Summary", value: output.classification.summary },
+    { label: "Next", value: output.classification.nextAction },
+    { label: "Intent", value: stringRecordField(output.identifiers, "intentId") },
+    { label: "Hostname", value: stringRecordField(output.identifiers, "hostname") },
+    { label: "Gateway", value: stringRecordField(output.identifiers, "gatewayId") },
+    { label: "Processor", value: compactId(stringRecordField(output.identifiers, "processor") ?? stringRecordField(output.identifiers, "processorId")) }
+  ]);
+  if (booleanRecordField(output.bridgeDiagnostic, "available")) {
+    const known = recordValue(output.bridgeDiagnostic.known);
+    console.log("");
+    console.log(sectionTitle("Bridge diagnostic"));
+    printOutputRows([
+      { label: "Command", value: stringRecordField(output.bridgeDiagnostic, "command") },
+      { label: "Signer mode", value: stringRecordField(output.bridgeDiagnostic, "signerMode") },
+      { label: "Runtime signer", value: compactId(stringRecordField(known, "runtimeSigner")) }
+    ]);
+  }
+  if (Object.keys(output.commands).length > 0) {
+    console.log("");
+    console.log(sectionTitle("Probe commands"));
+    for (const [name, command] of Object.entries(output.commands)) {
+      console.log(`${name}: ${command}`);
+    }
+  }
+  for (const warning of output.warnings) {
+    console.log(statusLine("warn", "Warning", warning));
+  }
+}
+
+async function probeSshOverTls(input: DeployDoctorProbeInput): Promise<DeployDoctorProbeResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let secure = false;
+    let socket: TLSSocket | undefined;
+    const finish = (result: DeployDoctorProbeResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket?.destroy();
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      finish({
+        checked: true,
+        tls: secure ? { ok: true } : { ok: false, error: `TLS probe timed out after ${input.timeoutMs}ms` },
+        ssh: { ok: false, error: `SSH banner timed out after ${input.timeoutMs}ms` }
+      });
+    }, input.timeoutMs);
+
+    socket = tlsConnect({
+      host: input.hostname,
+      port: input.port,
+      servername: input.hostname,
+      rejectUnauthorized: false
+    });
+    socket.setEncoding("utf8");
+    socket.once("secureConnect", () => {
+      secure = true;
+      const certificate = socket?.getPeerCertificate();
+      const tls = {
+        ok: true,
+        authorized: socket?.authorized,
+        authorizationError: typeof socket?.authorizationError === "string" ? socket.authorizationError : undefined,
+        peerCertificate: certificate && Object.keys(certificate).length > 0
+          ? {
+              subject: certificate.subject,
+              issuer: certificate.issuer,
+              validFrom: certificate.valid_from,
+              validTo: certificate.valid_to,
+              subjectaltname: certificate.subjectaltname
+            }
+          : undefined
+      };
+      socket?.once("data", (chunk: string | Buffer) => {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+        const first = firstLine(text);
+        finish({
+          checked: true,
+          tls,
+          ssh: first.startsWith("SSH-")
+            ? { ok: true, banner: first }
+            : { ok: false, banner: first, error: "first bytes were not an SSH banner" }
+        });
+      });
+      socket?.once("end", () => {
+        finish({
+          checked: true,
+          tls,
+          ssh: { ok: false, error: "TLS stream ended before an SSH banner arrived" }
+        });
+      });
+    });
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      finish({
+        checked: true,
+        tls: secure ? { ok: true } : { ok: false, error: error.message, code: error.code },
+        ssh: { ok: false, error: error.message }
+      });
+    });
+  });
+}
+
+function firstNonEmptyRecord(records: Record<string, unknown>[]): Record<string, unknown> {
+  return records.find((record) => Object.keys(record).length > 0) ?? {};
+}
+
+function arrayRecordField(record: unknown, name: string): Array<Record<string, unknown>> {
+  const value = record && typeof record === "object" && !Array.isArray(record)
+    ? (record as Record<string, unknown>)[name]
+    : undefined;
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+    : [];
+}
+
+function hostFromHostPort(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (trimmed.startsWith("[") && trimmed.includes("]")) {
+    return trimmed.slice(1, trimmed.indexOf("]"));
+  }
+  return trimmed.split(":")[0];
+}
+
+function classifyUpstreamAddress(value: string): string {
+  if (publicIpv4Address(value)) return "public-egress";
+  if (privateIpv4Address(value)) return "private-lan";
+  if (/^127\.|^0\.|^169\.254\./.test(value)) return "local-or-link";
+  if (/^[0-9.]+$/.test(value)) return "reserved-or-non-public";
+  return "hostname";
+}
+
+function privateIpv4Address(value: string): boolean {
+  const parts = value.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part))) return false;
+  const [a, b] = parts;
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
 function requireDeployWorkflowAcurastAction(snapshot: SwitchboardDeployWorkflowSnapshot): WorkflowRequiredAction {
@@ -6318,7 +7878,11 @@ async function hostnameRemoveCommand(flags: Map<string, string | boolean>, posit
   }
 }
 
-async function hostnameStatusCommand(flags: Map<string, string | boolean>, positionals: string[]) {
+async function hostnameStatusCommand(
+  flags: Map<string, string | boolean>,
+  positionals: string[],
+  adapters: HostnameStatusAdapters = {}
+) {
   const reportPath = deploymentReportPath(flags);
   const report = reportPath ? (JSON.parse(await readFile(reportPath, "utf8")) as Record<string, any>) : undefined;
   const manifestConfig = await resolveCliNetworkConfig(flags);
@@ -6350,14 +7914,23 @@ async function hostnameStatusCommand(flags: Map<string, string | boolean>, posit
   }
   const endpointId = normalizeEndpointIdForCli(stringFlag(flags, "endpoint-id") ?? endpointHostname ?? "");
   const waitSeconds = numberFlag(flags, "wait-seconds", "PROOF_CUSTOMER_HOSTNAME_WAIT_SECONDS", boolFlag(flags, "wait") ? 300 : 0);
-  const dnsProviderHint = lookupDnsProviderHintForCli(customerHostname);
+  const dnsProviderHint = adapters.dnsProviderHint
+    ? Promise.resolve(adapters.dnsProviderHint(customerHostname))
+    : lookupDnsProviderHintForCli(customerHostname);
   const output =
     waitSeconds > 0
-      ? await waitForCustomerHostname(relayUrl, endpointId, customerHostname, waitSeconds, numberFlag(flags, "poll-seconds", "PROOF_CUSTOMER_HOSTNAME_POLL_SECONDS", 10))
-      : await getCustomerHostnameStatus(relayUrl, endpointId, customerHostname);
+      ? await waitForCustomerHostname(
+          relayUrl,
+          endpointId,
+          customerHostname,
+          waitSeconds,
+          numberFlag(flags, "poll-seconds", "PROOF_CUSTOMER_HOSTNAME_POLL_SECONDS", 10),
+          adapters.fetchImpl
+        )
+      : await getCustomerHostnameStatus(relayUrl, endpointId, customerHostname, adapters.fetchImpl);
   const readiness =
     output.status === "dns_validated" && !boolFlag(flags, "skip-readiness-checks")
-      ? await customerHostnameReadinessChecks({
+      ? await (adapters.readinessChecks ?? customerHostnameReadinessChecks)({
           customerHostname,
           sessionId: String(output.sessionId ?? ""),
           routeIntentUrl,
@@ -7819,13 +9392,14 @@ async function lookupDnsProviderHintForCli(customerHostname: string, timeoutMs =
 async function getCustomerHostnameStatus(
   relayUrl: string,
   endpointId: string,
-  customerHostname: string
+  customerHostname: string,
+  fetchImpl: typeof fetch = fetch
 ): Promise<Record<string, any>> {
   const url = new URL(
     `/v1/endpoints/${encodeURIComponent(endpointId)}/customer-hostnames/${encodeURIComponent(customerHostname)}`,
     relayUrl
   );
-  const response = await fetch(url);
+  const response = await fetchImpl(url);
   const body = await response.text();
   if (!response.ok) {
     throw new Error(`${response.status} ${body}`);
@@ -7838,27 +9412,22 @@ async function waitForCustomerHostname(
   endpointId: string,
   customerHostname: string,
   waitSeconds: number,
-  pollSeconds: number
+  pollSeconds: number,
+  fetchImpl: typeof fetch = fetch
 ): Promise<Record<string, any>> {
   const deadline = Date.now() + waitSeconds * 1000;
   let latest: Record<string, any> | undefined;
   while (Date.now() <= deadline) {
-    latest = await getCustomerHostnameStatus(relayUrl, endpointId, customerHostname);
+    latest = await getCustomerHostnameStatus(relayUrl, endpointId, customerHostname, fetchImpl);
     if (latest.status === "dns_validated") {
       return latest;
     }
     await new Promise((resolve) => setTimeout(resolve, Math.max(1, pollSeconds) * 1000));
   }
-  return latest ?? (await getCustomerHostnameStatus(relayUrl, endpointId, customerHostname));
+  return latest ?? (await getCustomerHostnameStatus(relayUrl, endpointId, customerHostname, fetchImpl));
 }
 
-async function customerHostnameReadinessChecks(input: {
-  customerHostname: string;
-  sessionId: string;
-  routeIntentUrl?: string;
-  operatorSshHost?: string;
-  timeoutMs: number;
-}): Promise<Record<string, any>> {
+async function customerHostnameReadinessChecks(input: HostnameStatusReadinessInput): Promise<Record<string, any>> {
   const [route, https] = await Promise.all([
     input.routeIntentUrl
       ? customerHostnameRouteReadiness(input.routeIntentUrl, input.operatorSshHost, input.sessionId, input.customerHostname)
@@ -9203,8 +10772,7 @@ export function contextStorePath(): string {
   return switchboardContextStorePath();
 }
 
-export async function readContextStore(): Promise<SwitchboardContextStore> {
-  const filePath = contextStorePath();
+export async function readContextStore(filePath: string = contextStorePath()): Promise<SwitchboardContextStore> {
   if (await fileExists(filePath)) {
     const parsed = await readJsonFile<SwitchboardContextStore>(filePath);
     return {
@@ -9215,8 +10783,8 @@ export async function readContextStore(): Promise<SwitchboardContextStore> {
   return { contexts: {} };
 }
 
-export async function writeContextStore(store: SwitchboardContextStore): Promise<void> {
-  await writeJsonFile(contextStorePath(), {
+export async function writeContextStore(store: SwitchboardContextStore, filePath: string = contextStorePath()): Promise<void> {
+  await writeJsonFile(filePath, {
     current: store.current,
     contexts: store.contexts ?? {}
   });
@@ -9544,6 +11112,9 @@ function normalizeCommand(positionals: string[]): CommandName {
   }
   if (positionals.length === 2 && positionals[0] === "deploy" && positionals[1] === "status") {
     return "deploy-status";
+  }
+  if (positionals.length === 2 && positionals[0] === "deploy" && positionals[1] === "doctor") {
+    return "deploy-doctor";
   }
   if (positionals.length === 2 && positionals[0] === "deploy" && positionals[1] === "resume") {
     return "deploy-resume";
@@ -9897,6 +11468,8 @@ Public beta deployer commands:
           Deploy a project workload from switchboard.json or --entrypoint.
   deploy status
           Read local deploy workflow/report state and print the next recovery action.
+  deploy doctor
+          Diagnose local workflow, relay, route-state, DNS/TLS, and SSH banner state.
   deploy resume
           Resume a single-replica deploy workflow from local private state.
   status
@@ -9987,6 +11560,14 @@ Project config:
   latest report pointers, and local caches are stored in .switchboard/.
   The SSH template generates an inspectable Script/Cargo project whose
   bootstrap uses the Cargo bridge signer for registration and job-ACME.
+
+Deploy doctor:
+  switchboard deploy doctor --run-dir .switchboard/runs/<id>
+  switchboard deploy doctor --intent-id di_... --relay-url https://control.switchboard.proof.computer --intent-token-env SWITCHBOARD_INTENT_TOKEN
+  switchboard deploy doctor --report report.json --probe
+  deploy doctor is read-only. --probe performs only public TLS/SNI and SSH
+  banner checks. It never spends, deploys, mutates DNS/routes, or records
+  settlement.
 
 Contexts:
   switchboard context add mainnet

@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
+import { runSwitchboardDeployResume, runSwitchboardDeployStatus } from "../cli/src/index.js";
 import { signNetworkManifest, type NetworkManifest } from "../src/network-manifest.js";
 
 const cliRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -145,6 +146,72 @@ describe("switchboard deploy resume/status", () => {
         assert.equal(output.action, "deploy-status");
         assert.equal(output.phase, "runtime claimed");
       } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("exports a shared deploy status runner for native plugin reuse", async () => {
+    await withControlPlane(async ({ baseUrl, requests }) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-deploy-status-runner-"));
+      const originalLog = console.log;
+      const lines: string[] = [];
+      console.log = (line?: unknown) => {
+        lines.push(String(line ?? ""));
+      };
+      try {
+        const runDir = path.join(cwd, "run");
+        await mkdir(runDir, { recursive: true });
+        await writePrivateSnapshot(runDir, deploySnapshot({ baseUrl, step: "runtime_claimed" }));
+
+        await runSwitchboardDeployStatus(["--json", "--run-dir", runDir], {
+          projectRoot: cwd,
+          contextStorePath: path.join(cwd, ".switchboard-home", "contexts.json")
+        });
+
+        assert.equal(requests.createIntent.length, 0);
+        assert.equal(requests.deploymentUpdate.length, 0);
+        assert.equal(requests.fundingRefresh.length, 0);
+        assert.equal(requests.routeRefresh.length, 0);
+        assert.equal(requests.intentRead.length, 1);
+        const output = JSON.parse(lines.join("\n"));
+        assert.equal(output.action, "deploy-status");
+        assert.equal(output.phase, "runtime claimed");
+      } finally {
+        console.log = originalLog;
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("exports a shared deploy resume runner for native plugin reuse", async () => {
+    await withControlPlane(async ({ baseUrl, requests }) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-deploy-resume-runner-"));
+      const originalLog = console.log;
+      const lines: string[] = [];
+      console.log = (line?: unknown) => {
+        lines.push(String(line ?? ""));
+      };
+      try {
+        const runDir = path.join(cwd, "run");
+        await mkdir(runDir, { recursive: true });
+        await writePrivateSnapshot(runDir, deploySnapshot({ baseUrl, step: "complete" }));
+
+        await runSwitchboardDeployResume(["--yes", "--json", "--run-dir", runDir], {
+          projectRoot: cwd,
+          contextStorePath: path.join(cwd, ".switchboard-home", "contexts.json")
+        });
+
+        assert.equal(requests.createIntent.length, 0);
+        assert.equal(requests.deploymentUpdate.length, 0);
+        assert.equal(requests.fundingRefresh.length, 0);
+        assert.equal(requests.routeRefresh.length, 0);
+        assert.equal(requests.intentRead.length, 1);
+        const output = JSON.parse(lines.join("\n"));
+        assert.equal(output.action, "deploy-resume");
+        assert.equal(output.phase, "complete");
+      } finally {
+        console.log = originalLog;
         await rm(cwd, { recursive: true, force: true });
       }
     });
@@ -347,6 +414,7 @@ function deploySnapshot(input: { baseUrl: string; step: string; schedule?: Recor
     step: input.step,
     input: {
       relayUrl: input.baseUrl,
+      allowInsecureHttp: true,
       jobId: hex32("33"),
       target: {
         name: "polkadot-hub",

@@ -162,6 +162,59 @@ describe("relay deployment spec", () => {
     assert.ok(bootstrap.acurast?.includeEnv.includes("CLOUDFLARE_API_TOKEN"));
   });
 
+  it("keeps PROOF_CONTROL_PLANE_TOKEN out of durable Acurast relay payloads", () => {
+    const declaredButNotEnabled = parseRelayDeploymentSpec({
+      ...validAcurastSpec,
+      secrets: {
+        ...validAcurastSpec.secrets,
+        controlPlaneTokenEnv: "PROOF_CONTROL_PLANE_TOKEN"
+      }
+    });
+    assert.equal(declaredButNotEnabled.secrets.controlPlaneTokenEnv, "PROOF_CONTROL_PLANE_TOKEN");
+    assert.equal(declaredButNotEnabled.relay.enableControlPlane, false);
+
+    const controlEnabled = safeParseRelayDeploymentSpec({
+      ...validAcurastSpec,
+      secrets: {
+        ...validAcurastSpec.secrets,
+        controlPlaneTokenEnv: "PROOF_CONTROL_PLANE_TOKEN"
+      },
+      relay: {
+        enableControlPlane: true
+      }
+    });
+    assert.equal(controlEnabled.ok, false);
+    if (!controlEnabled.ok) {
+      assert.ok(controlEnabled.error.errors.some((issue) => issue.message.includes("bootstrap env")));
+    }
+
+    const included = safeParseRelayDeploymentSpec({
+      ...validAcurastSpec,
+      acurast: {
+        ...validAcurastSpec.acurast,
+        includeEnv: [...validAcurastSpec.acurast.includeEnv, "PROOF_CONTROL_PLANE_TOKEN"]
+      }
+    });
+    assert.equal(included.ok, false);
+    if (!included.ok) {
+      assert.ok(included.error.errors.some((issue) => issue.message.includes("bootstrap env")));
+    }
+
+    const bootstrap = parseRelayDeploymentSpec({
+      ...validAcurastSpec,
+      secrets: {
+        ...validAcurastSpec.secrets,
+        controlPlaneTokenEnv: "PROOF_CONTROL_PLANE_TOKEN"
+      },
+      relay: {
+        authorityProfile: "bootstrap-control-plane",
+        enableControlPlane: true
+      }
+    });
+    assert.equal(bootstrap.relay.authorityProfile, "bootstrap-control-plane");
+    assert.equal(bootstrap.relay.enableControlPlane, true);
+  });
+
   it("rejects unknown top-level fields (strict)", () => {
     const result = safeParseRelayDeploymentSpec({
       ...validAcurastSpec,
@@ -268,6 +321,25 @@ describe("relay deployment spec", () => {
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.ok(result.error.errors.some((issue) => issue.message.includes("autoRegister")));
+    }
+  });
+
+  it("rejects proof-infra admission when relayInfraAdmissionTokenEnv is not declared", () => {
+    const result = safeParseRelayDeploymentSpec({
+      ...validAcurastSpec,
+      secrets: {
+        ...validAcurastSpec.secrets,
+        controlPlaneTokenEnv: "PROOF_CONTROL_PLANE_TOKEN"
+      },
+      relay: {
+        admissionMode: "proof-infra",
+        autoRegister: false,
+        bootstrapRelayUrl: "https://relay-a.switchboard.proof.computer"
+      }
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.ok(result.error.errors.some((issue) => issue.message.includes("relayInfraAdmissionTokenEnv is required")));
     }
   });
 

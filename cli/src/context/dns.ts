@@ -6,6 +6,7 @@ import {
   stringFlag,
   writeContextStore,
   writeOutput,
+  type CliRuntime,
   type SwitchboardContext
 } from "../index.js";
 
@@ -13,7 +14,8 @@ const SUPPORTED_PROVIDERS = new Set(["cloudflare"]);
 
 export async function contextDnsSetCommand(
   flags: Map<string, string | boolean>,
-  positionals: string[]
+  positionals: string[],
+  runtime?: Pick<CliRuntime, "contextStorePath">
 ): Promise<void> {
   const provider = positionals[3];
   if (!provider) {
@@ -31,7 +33,8 @@ export async function contextDnsSetCommand(
   }
 
   const explicitContext = stringFlag(flags, "context");
-  const store = await readContextStore();
+  const contextStorePath = runtime?.contextStorePath;
+  const store = contextStorePath ? await readContextStore(contextStorePath) : await readContextStore();
   const targetName = explicitContext ?? store.current;
   if (!targetName) {
     throw new Error("No context selected. Pass --context <name> or run `switchboard context use <name>` first.");
@@ -45,7 +48,11 @@ export async function contextDnsSetCommand(
   pruneUndefined(next);
 
   store.contexts = { ...(store.contexts ?? {}), [targetName]: next };
-  await writeContextStore(store);
+  if (contextStorePath) {
+    await writeContextStore(store, contextStorePath);
+  } else {
+    await writeContextStore(store);
+  }
 
   writeOutput(
     flags,
@@ -68,14 +75,16 @@ export async function contextDnsSetCommand(
 
 export async function contextDnsClearCommand(
   flags: Map<string, string | boolean>,
-  positionals: string[]
+  positionals: string[],
+  runtime?: Pick<CliRuntime, "contextStorePath">
 ): Promise<void> {
   const provider = positionals[3] ?? "cloudflare";
   if (!SUPPORTED_PROVIDERS.has(provider)) {
     throw new Error(`Unsupported DNS provider "${provider}".`);
   }
   const explicitContext = stringFlag(flags, "context");
-  const store = await readContextStore();
+  const contextStorePath = runtime?.contextStorePath;
+  const store = contextStorePath ? await readContextStore(contextStorePath) : await readContextStore();
   const targetName = explicitContext ?? store.current;
   if (!targetName || !store.contexts?.[targetName]) {
     throw new Error("No matching context.");
@@ -85,7 +94,11 @@ export async function contextDnsClearCommand(
     delete next.cloudflareApiTokenEnv;
   }
   store.contexts[targetName] = next;
-  await writeContextStore(store);
+  if (contextStorePath) {
+    await writeContextStore(store, contextStorePath);
+  } else {
+    await writeContextStore(store);
+  }
 
   writeOutput(
     flags,

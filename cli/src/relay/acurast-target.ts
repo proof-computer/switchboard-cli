@@ -211,9 +211,9 @@ export function prepareAcurastDeployContext(
     if (!spec.relay.bootstrapRelayUrl) {
       throw new Error("relay.admissionMode=proof-infra requires relay.bootstrapRelayUrl in the spec");
     }
-    if (!relayInfraAdmissionToken && !controlPlaneToken) {
+    if (!relayInfraAdmissionToken) {
       throw new Error(
-        "relay.admissionMode=proof-infra requires spec.secrets.relayInfraAdmissionTokenEnv or spec.secrets.controlPlaneTokenEnv to be set in env"
+        "relay.admissionMode=proof-infra requires spec.secrets.relayInfraAdmissionTokenEnv to be set in env"
       );
     }
   }
@@ -369,9 +369,9 @@ export function prepareAcurastDeployContext(
     RELAYER_PRIVATE_KEY: relayerPrivateKey
   };
   if (validationReadToken) runtimeEnv.PROOF_VALIDATION_READ_TOKEN = validationReadToken;
-  if (controlPlaneToken) runtimeEnv.PROOF_CONTROL_PLANE_TOKEN = controlPlaneToken;
+  if (spec.relay.enableControlPlane && controlPlaneToken) runtimeEnv.PROOF_CONTROL_PLANE_TOKEN = controlPlaneToken;
   if (proofInfraAdmission) {
-    runtimeEnv.SB_RELAY_INFRA_ADMISSION_TOKEN = relayInfraAdmissionToken ?? controlPlaneToken!;
+    runtimeEnv.SB_RELAY_INFRA_ADMISSION_TOKEN = relayInfraAdmissionToken!;
   }
   if (logCreateToken && env.PROOF_LOGS_ENABLED === "true") runtimeEnv.PROOF_LOG_CREATE_TOKEN = logCreateToken;
   if (logEncryptionKey) runtimeEnv.SWITCHBOARD_LOG_ENCRYPTION_KEY = logEncryptionKey;
@@ -518,6 +518,9 @@ export async function runAcurastDeploy(
     if (!explicitRuntimeEnv.has(key)) {
       delete childEnv[key];
     }
+  }
+  if (!explicitRuntimeEnv.has("PROOF_CONTROL_PLANE_TOKEN")) {
+    delete childEnv.PROOF_CONTROL_PLANE_TOKEN;
   }
   auditSubmittedRuntimeEnv(context, childEnv, spec.relayId);
 

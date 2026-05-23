@@ -46,7 +46,20 @@ export function buildSpecSecretIntentPlan(
 
   addRuntimeEnvRef(items, "RELAYER_PRIVATE_KEY", spec.secrets.relayerPrivateKeyEnv, env, "secrets.relayerPrivateKeyEnv");
   addOptionalRuntimeEnvRef(items, "PROOF_VALIDATION_READ_TOKEN", spec.secrets.validationReadTokenEnv, env, "secrets.validationReadTokenEnv");
-  addOptionalRuntimeEnvRef(items, "PROOF_CONTROL_PLANE_TOKEN", spec.secrets.controlPlaneTokenEnv, env, "secrets.controlPlaneTokenEnv");
+  if (spec.secrets.controlPlaneTokenEnv) {
+    if (spec.relay.enableControlPlane) {
+      addOptionalRuntimeEnvRef(items, "PROOF_CONTROL_PLANE_TOKEN", spec.secrets.controlPlaneTokenEnv, env, "secrets.controlPlaneTokenEnv");
+    } else {
+      items.push(classifiedItem(
+        "PROOF_CONTROL_PLANE_TOKEN",
+        "localOnly",
+        "secrets.controlPlaneTokenEnv",
+        false,
+        envPresent(env, spec.secrets.controlPlaneTokenEnv),
+        `<- ${spec.secrets.controlPlaneTokenEnv}; relay.enableControlPlane=false`
+      ));
+    }
+  }
   addOptionalRuntimeEnvRef(items, "PROOF_LOG_CREATE_TOKEN", spec.secrets.logCreateTokenEnv, env, "secrets.logCreateTokenEnv");
   addOptionalRuntimeEnvRef(
     items,

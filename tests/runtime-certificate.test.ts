@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  createEncryptedSwitchboardLogger,
+  generateProofLogEncryptionKey,
   requestCertificateWithRelay,
   SwitchboardCertificateError,
   type SwitchboardJobSigner
@@ -40,6 +42,66 @@ describe("Switchboard runtime certificate requests", () => {
         });
         return true;
       }
+    );
+  });
+
+  it("rejects plaintext relay and log transports before fetch", async () => {
+    let certificateFetches = 0;
+    await assert.rejects(
+      () => requestCertificateWithRelay(
+        { ...exampleCertificateConfig(), relayUrl: "http://relay.example.test" },
+        async () => {
+          certificateFetches += 1;
+          return new Response("{}", { status: 200 });
+        }
+      ),
+      /Switchboard relay URL must use https:\/\//
+    );
+    assert.equal(certificateFetches, 0);
+
+    const originalFetch = globalThis.fetch;
+    const logErrors: unknown[] = [];
+    let logFetches = 0;
+    globalThis.fetch = (async () => {
+      logFetches += 1;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const logger = createEncryptedSwitchboardLogger({
+        logUrl: "http://logs.example.test/ingest",
+        writeToken: "log-secret",
+        encryptionKey: generateProofLogEncryptionKey(),
+        onError: (error) => logErrors.push(error)
+      });
+      await logger("transport-test");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(logFetches, 0);
+    assert.match(String((logErrors[0] as Error | undefined)?.message ?? ""), /Switchboard log URL must use https:\/\//);
+  });
+
+  it("allows explicit local HTTP but rejects other URL schemes", async () => {
+    const urls: string[] = [];
+    await requestCertificateWithRelay(
+      { ...exampleCertificateConfig(), relayUrl: "http://127.0.0.1:3000", allowInsecureHttp: true },
+      async (url) => {
+        urls.push(url.toString());
+        return new Response(JSON.stringify({ certificatePem: "cert", issuer: "test" }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+    );
+    assert.deepEqual(urls, ["http://127.0.0.1:3000/v1/certificates"]);
+
+    await assert.rejects(
+      () => requestCertificateWithRelay(
+        { ...exampleCertificateConfig(), relayUrl: "file:///tmp/relay.json", allowInsecureHttp: true },
+        async () => new Response("{}", { status: 200 })
+      ),
+      /unsupported URL protocol file:/
     );
   });
 });

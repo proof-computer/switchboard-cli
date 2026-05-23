@@ -92,9 +92,14 @@ describe("switchboard init --template ssh", () => {
       assert.match(shellBootstrap, /bootstrap_log python_runtime_done/);
       assert.match(shellBootstrap, /SWITCHBOARD_PYTHON_BIN/);
       assert.match(shellBootstrap, /command -v python3/);
+      assert.match(shellBootstrap, /switchboard-cargo-bridge-doctor/);
+      assert.match(shellBootstrap, /SWITCHBOARD_BRIDGE_DIAGNOSTIC_COMMAND_PATH/);
       assert.doesNotMatch(shellBootstrap, /openssh-server|python3-pip|python3-venv|pip install|eth-keys|cryptography/);
       const pythonBootstrap = await readFile(path.join(cwd, "switchboard-cargo-bootstrap.py"), "utf8");
       assert.match(pythonBootstrap, /BRIDGE_SOCKET/);
+      assert.match(pythonBootstrap, /BRIDGE_DIAGNOSTIC_STATE_PATH/);
+      assert.match(pythonBootstrap, /bridge_doctor/);
+      assert.match(pythonBootstrap, /signature_summary/);
       assert.match(pythonBootstrap, /signer_publicKey/);
       assert.match(pythonBootstrap, /signer_sign/);
       assert.match(pythonBootstrap, /network_whitelist/);
@@ -111,6 +116,11 @@ describe("switchboard init --template ssh", () => {
       assert.match(pythonBootstrap, /\/runtime-signing\/registration/);
       assert.match(pythonBootstrap, /\/runtime-signing\/certificate-challenge/);
       assert.match(pythonBootstrap, /\/runtime-signing\/certificate/);
+      assert.match(pythonBootstrap, /\/runtime-signing\/upstream-admission-challenge/);
+      assert.match(pythonBootstrap, /\/upstream-admissions/);
+      assert.match(pythonBootstrap, /def admit_gateway_upstream/);
+      assert.match(pythonBootstrap, /def require_https_url/);
+      assert.match(pythonBootstrap, /plaintext HTTP relay transport is not allowed in Acurast jobs/);
       assert.match(pythonBootstrap, /"signerMode": "cargo-bridge-secp256k1"/);
       assert.match(pythonBootstrap, /"upstreamIps": upstream_ips/);
       assert.doesNotMatch(pythonBootstrap, /\/cargo\//);
@@ -217,10 +227,6 @@ exit 99
         await writeExecutable(path.join(binDir, commandName), "#!/bin/sh\nexit 0\n");
       }
       await writeExecutable(path.join(binDir, "python3"), `#!/bin/sh
-if [ "\${1:-}" = "-" ]; then
-  cat >/dev/null
-  exit 0
-fi
 PATH='${(process.env.PATH ?? "").replaceAll("'", "'\\''")}' exec python3 "$@"
 `);
       const overrideSo = path.join(cwd, "prebaked-getifaddrs.so");
@@ -250,7 +256,8 @@ PATH='${(process.env.PATH ?? "").replaceAll("'", "'\\''")}' exec python3 "$@"
             BRIDGE_SOCKET: socketPath,
             GETIFADDRS_OVERRIDE_SO: overrideSo,
             PATH: `${binDir}:${process.env.PATH ?? ""}`,
-            SWITCHBOARD_RUN_DIR: path.join(cwd, "run")
+            SWITCHBOARD_RUN_DIR: path.join(cwd, "run"),
+            SWITCHBOARD_BRIDGE_DIAGNOSTIC_COMMAND_PATH: path.join(binDir, "switchboard-cargo-bridge-doctor")
           }
         });
 
@@ -260,6 +267,110 @@ PATH='${(process.env.PATH ?? "").replaceAll("'", "'\\''")}' exec python3 "$@"
         assert.equal(output.publicKey, `02${"11".repeat(32)}`);
         assert.equal(output.signature, "22".repeat(64));
         assert.deepEqual(calls, ["signer_publicKey", "signer_sign"]);
+      } finally {
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("runs a redacted bridge diagnostic helper from persisted Cargo bridge state", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-ssh-template-bridge-doctor-"));
+    try {
+      const init = await runCli([
+        "init",
+        "--project-dir",
+        cwd,
+        "--template",
+        "ssh",
+        "--distro",
+        "ubuntu",
+        "--json"
+      ]);
+      assert.equal(init.code, 0, init.stderr);
+
+      const binDir = path.join(cwd, "bin");
+      await mkdir(binDir);
+      const aptMarker = path.join(cwd, "apt-called");
+      await writeExecutable(path.join(binDir, "apt-get"), `#!/bin/sh
+printf called > '${aptMarker.replaceAll("'", "'\\''")}'
+exit 99
+`);
+      for (const commandName of ["curl", "openssl", "gcc", "stunnel", "dropbear", "dropbearkey"]) {
+        await writeExecutable(path.join(binDir, commandName), "#!/bin/sh\nexit 0\n");
+      }
+      await writeExecutable(path.join(binDir, "python3"), `#!/bin/sh
+PATH='${(process.env.PATH ?? "").replaceAll("'", "'\\''")}' exec python3 "$@"
+`);
+      const overrideSo = path.join(cwd, "prebaked-getifaddrs.so");
+      await writeFile(overrideSo, "prebaked", "utf8");
+
+      const socketPath = path.join(cwd, "bridge.sock");
+      const runDir = path.join(cwd, "run");
+      const commandPath = path.join(binDir, "switchboard-cargo-bridge-doctor");
+      const calls: string[] = [];
+      const server = createServer((connection) => {
+        let data = "";
+        connection.on("data", (chunk) => {
+          data += chunk.toString("utf8");
+          if (!data.includes("\n")) return;
+          const request = JSON.parse(data.trim());
+          calls.push(request.method);
+          const result =
+            request.method === "signer_publicKey"
+              ? { publicKey: `02${"11".repeat(32)}` }
+              : { bytes: "22".repeat(64) };
+          connection.end(`${JSON.stringify({ jsonrpc: "2.0", result, id: request.id })}\n`);
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      try {
+        const first = await runShell(["switchboard-cargo-bootstrap.sh", "bridge-doctor"], {
+          cwd,
+          env: {
+            BRIDGE_SOCKET: socketPath,
+            GETIFADDRS_OVERRIDE_SO: overrideSo,
+            PATH: `${binDir}:${process.env.PATH ?? ""}`,
+            SWITCHBOARD_RUN_DIR: runDir,
+            SWITCHBOARD_BRIDGE_DIAGNOSTIC_COMMAND_PATH: commandPath
+          }
+        });
+
+        assert.equal(first.code, 0, first.stderr);
+        assert.equal(await fileExists(aptMarker), false);
+        const firstOutput = JSON.parse(first.stdout);
+        assert.equal(firstOutput.ok, true);
+        assert.equal(firstOutput.action, "bridge-doctor");
+        assert.equal(firstOutput.bridge.source, "env");
+        assert.equal(firstOutput.publicKey.value, `02${"11".repeat(32)}`);
+        assert.equal(firstOutput.publicKey.compressedSecp256k1, true);
+        assert.equal(firstOutput.signature.bytes, 64);
+        assert.equal(firstOutput.signature.hasRecoveryByte, false);
+        assert.doesNotMatch(first.stdout, new RegExp(socketPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "u"));
+        assert.doesNotMatch(first.stdout, new RegExp("22".repeat(64), "u"));
+
+        const statePath = path.join(runDir, "bridge-diagnostic.json");
+        assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+        const state = JSON.parse(await readFile(statePath, "utf8"));
+        assert.equal(state.socketName, socketPath);
+        assert.match(state.pythonHelper, /switchboard-cargo-bootstrap\.py$/u);
+        assert.equal((await stat(commandPath)).mode & 0o111, 0o111);
+
+        const second = await runCommand(commandPath, [], {
+          cwd,
+          env: {
+            PATH: `${binDir}:${process.env.PATH ?? ""}`,
+            SWITCHBOARD_RUN_DIR: runDir
+          }
+        });
+        assert.equal(second.code, 0, second.stderr);
+        const secondOutput = JSON.parse(second.stdout);
+        assert.equal(secondOutput.bridge.source, "diagnostic-state");
+        assert.equal(secondOutput.signature.bytes, 64);
+        assert.doesNotMatch(second.stdout, new RegExp(socketPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "u"));
+        assert.doesNotMatch(second.stdout, new RegExp("22".repeat(64), "u"));
+        assert.deepEqual(calls, ["signer_publicKey", "signer_sign", "signer_publicKey", "signer_sign"]);
       } finally {
         await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       }

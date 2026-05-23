@@ -160,6 +160,8 @@ export function buildAcurastSdkEnvVars(
   if (actionPayload) {
     add("SWITCHBOARD_CONFIG", JSON.stringify({
       PORT: env.PORT ?? "3000",
+      GATEWAY_UPSTREAM_PORT: env.GATEWAY_UPSTREAM_PORT,
+      SWITCHBOARD_UPSTREAM_PORT: env.SWITCHBOARD_UPSTREAM_PORT,
       SWITCHBOARD_HOST: env.SWITCHBOARD_HOST ?? "0.0.0.0",
       SWITCHBOARD_AUTO_REGISTER: "true",
       SWITCHBOARD_RELAY_URL: actionPayload.deploymentIntent.env.SWITCHBOARD_RELAY_URL,
@@ -184,6 +186,17 @@ export function buildAcurastSdkEnvVars(
     add(key, value);
   }
   return Array.from(values.entries()).map(([key, value]) => ({ key, value }));
+}
+
+export function deploymentIntentGatewayUpstreamPort(env: Record<string, string | undefined>): number {
+  const candidates: Array<[string, string | undefined]> = [
+    ["GATEWAY_UPSTREAM_PORT", env.GATEWAY_UPSTREAM_PORT],
+    ["SWITCHBOARD_UPSTREAM_PORT", env.SWITCHBOARD_UPSTREAM_PORT],
+    ["PORT", env.PORT],
+    ["PORT", "3000"]
+  ];
+  const [label, value] = candidates.find(([, candidate]) => candidate !== undefined && candidate.length > 0) ?? ["PORT", "3000"];
+  return positiveInteger(value ?? "3000", label);
 }
 
 export async function submitAcurastSingleReplicaWithSdk(input: AcurastSdkSubmitInput): Promise<AcurastSdkSubmitResult> {
@@ -451,7 +464,7 @@ async function updateDeploymentIntentDeployment(
       operatorId: input.actionPayload.capacity.operatorId,
       processorId: deployment.processorId,
       processor: deployment.processor,
-      upstreamPort: Number(input.env.PORT ?? "3000"),
+      upstreamPort: deploymentIntentGatewayUpstreamPort(input.env),
       source: {
         mode: "switchboard-deploy-sdk",
         workflowId: input.actionPayload.workflowId

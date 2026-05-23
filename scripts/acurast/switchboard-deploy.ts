@@ -97,6 +97,8 @@ interface RegistrationObservation {
 
 interface AcurastJobConfigFile {
   PORT: string;
+  GATEWAY_UPSTREAM_PORT?: string;
+  SWITCHBOARD_UPSTREAM_PORT?: string;
   SWITCHBOARD_HOST: string;
   SWITCHBOARD_AUTO_REGISTER: string;
   SWITCHBOARD_RELAY_URL: string;
@@ -392,6 +394,8 @@ async function main(): Promise<void> {
 
   const jobConfig: AcurastJobConfigFile = {
     PORT: String(config.port),
+    GATEWAY_UPSTREAM_PORT: stringEnv("GATEWAY_UPSTREAM_PORT"),
+    SWITCHBOARD_UPSTREAM_PORT: stringEnv("SWITCHBOARD_UPSTREAM_PORT"),
     SWITCHBOARD_HOST: "0.0.0.0",
     SWITCHBOARD_AUTO_REGISTER: "true",
     SWITCHBOARD_RELAY_URL: deploymentIntent.env.SWITCHBOARD_RELAY_URL,
@@ -416,6 +420,7 @@ async function main(): Promise<void> {
     ...jobConfig,
     ...extraBuildConfig
   });
+  const upstreamPort = deploymentIntentGatewayUpstreamPort(jobConfig);
   await writeJson(metadataPath, {
     runId: config.runId,
     runDir: config.runDir,
@@ -501,7 +506,8 @@ async function main(): Promise<void> {
     deploymentId: deployment.deploymentId,
     jobId,
     processor,
-    processorId
+    processorId,
+    upstreamPort
   });
 
   if (deployRunnerMode() === "acurast-submit-only") {
@@ -641,7 +647,7 @@ async function main(): Promise<void> {
         customerHostnames: config.certificateHostnames.filter((hostname) => hostname !== config.hostname),
         hostnameRole: "ha_public",
         upstreamHost: upstreamIp,
-        upstreamPort: config.port,
+        upstreamPort,
         expiresAt: routeExpiresAt,
         source: {
           mode: "switchboard-deploy",
@@ -824,6 +830,8 @@ async function runDeploymentIntentGroup(
   const reportPath = path.join(config.runDir, "report.json");
   const jobConfig: AcurastJobConfigFile = {
     PORT: String(config.port),
+    GATEWAY_UPSTREAM_PORT: stringEnv("GATEWAY_UPSTREAM_PORT"),
+    SWITCHBOARD_UPSTREAM_PORT: stringEnv("SWITCHBOARD_UPSTREAM_PORT"),
     SWITCHBOARD_HOST: "0.0.0.0",
     SWITCHBOARD_AUTO_REGISTER: "true",
     SWITCHBOARD_RELAY_URL: group.env.SWITCHBOARD_RELAY_URL,
@@ -840,6 +848,7 @@ async function runDeploymentIntentGroup(
     ...jobConfig,
     ...extraBuildConfig
   });
+  const upstreamPort = deploymentIntentGatewayUpstreamPort(jobConfig);
   await writeJson(metadataPath, {
     runId: config.runId,
     runDir: config.runDir,
@@ -892,7 +901,8 @@ async function runDeploymentIntentGroup(
   console.log(deployStatus("ok", "Submitted to Acurast", `deployment=${deployment.deploymentId}`));
   const deploymentSchedule = parseDeploymentSchedule(deployment.output);
   await updateDeploymentIntentGroupDeployment(config, group, {
-    deploymentId: deployment.deploymentId
+    deploymentId: deployment.deploymentId,
+    upstreamPort
   });
 
   if (deployRunnerMode() === "acurast-group-submit-only") {
@@ -1957,6 +1967,23 @@ export function buildDeploymentIntentGroupCreateBody(
   };
 }
 
+export function deploymentIntentGatewayUpstreamPort(
+  config: Pick<AcurastJobConfigFile, "PORT" | "GATEWAY_UPSTREAM_PORT" | "SWITCHBOARD_UPSTREAM_PORT">
+): number {
+  const candidates: Array<[string, string | undefined]> = [
+    ["GATEWAY_UPSTREAM_PORT", config.GATEWAY_UPSTREAM_PORT],
+    ["SWITCHBOARD_UPSTREAM_PORT", config.SWITCHBOARD_UPSTREAM_PORT],
+    ["PORT", config.PORT],
+    ["PORT", "3000"]
+  ];
+  const [name, value] = candidates.find(([, candidate]) => candidate !== undefined && candidate.length > 0) ?? ["PORT", "3000"];
+  const port = parseNonNegativeInteger(name, value ?? "3000");
+  if (port < 1 || port > 65535) {
+    throw new Error(`${name} must be a TCP port between 1 and 65535`);
+  }
+  return port;
+}
+
 async function updateDeploymentIntentDeployment(
   config: HarnessConfig,
   deploymentIntent: DeploymentIntentBootstrap,
@@ -1965,6 +1992,7 @@ async function updateDeploymentIntentDeployment(
     jobId: string;
     processor: string;
     processorId: string;
+    upstreamPort: number;
   }
 ): Promise<Record<string, unknown>> {
   const response = await fetch(new URL(`/v1/deployment-intents/${encodeURIComponent(deploymentIntent.intentId)}/deployment`, config.relayUrl), {
@@ -1979,7 +2007,7 @@ async function updateDeploymentIntentDeployment(
       operatorId: config.operatorId,
       processorId: input.processorId,
       processor: input.processor,
-      upstreamPort: config.port,
+      upstreamPort: input.upstreamPort,
       source: {
         mode: "switchboard-deploy",
         runId: config.runId
@@ -2000,6 +2028,7 @@ async function updateDeploymentIntentGroupDeployment(
   group: DeploymentIntentGroupBootstrap,
   input: {
     deploymentId: string;
+    upstreamPort: number;
   }
 ): Promise<Record<string, unknown>> {
   const response = await fetch(new URL(`/v1/deployment-intent-groups/${encodeURIComponent(group.groupId)}/deployment`, config.relayUrl), {
@@ -2010,7 +2039,7 @@ async function updateDeploymentIntentGroupDeployment(
     },
     body: JSON.stringify({
       acurastDeploymentId: input.deploymentId,
-      upstreamPort: config.port,
+      upstreamPort: input.upstreamPort,
       members: group.members.map((member) => ({
         intentId: member.intentId,
         jobId: member.jobId,
@@ -2418,6 +2447,8 @@ function consumerJobRuntimeEnvironment(
   return {
     SWITCHBOARD_CONFIG: JSON.stringify({
       PORT: jobConfig.PORT,
+      GATEWAY_UPSTREAM_PORT: jobConfig.GATEWAY_UPSTREAM_PORT,
+      SWITCHBOARD_UPSTREAM_PORT: jobConfig.SWITCHBOARD_UPSTREAM_PORT,
       SWITCHBOARD_HOST: jobConfig.SWITCHBOARD_HOST,
       SWITCHBOARD_AUTO_REGISTER: jobConfig.SWITCHBOARD_AUTO_REGISTER,
       ...intentEnv,
