@@ -80,6 +80,36 @@ Run the CLI from source:
 pnpm switchboard --help
 ```
 
+The PROOF umbrella CLI plugin calls command-specific shared runners from this
+package when available, falling back to the packaged `switchboard` binary for
+older installs. Relay inventory sync is exposed as
+`runSwitchboardRelaySync(argv)` and preserves the existing local
+`switchboard relay sync` behavior: read signed discovery, write
+`relays/catalog.json`, create missing local stub specs, and preserve existing
+relay spec files without publishing catalogs, deploying jobs, changing DNS,
+submitting transactions, or changing local project/context state. Relay key
+generation is exposed as
+`runSwitchboardRelayKeygen(argv)` and preserves the existing local
+`switchboard relay keygen <relay-id>` behavior, including default private-key
+stderr handling and explicit `--unsafe-stdout`. Local relay spec generation is
+exposed as `runSwitchboardRelayScaffold(argv)` and preserves the existing
+`switchboard relay scaffold <relay-id>` behavior: local `relays/<id>.json`
+writes, optional key generation with stderr secret handling, overwrite
+refusal without `--force`, Acurast/Compose defaults, and no live publish, DNS,
+deploy, chain, relay-state, or context mutation. Relay health transition
+watching is exposed as `runSwitchboardRelayWatch(argv)` and preserves the
+existing read-only `switchboard relay watch [relay-id]` behavior, including
+local relay catalog lookup, endpoint probes, `--interval-ms`, and
+`--max-runs`. Local relay catalog artifact builds are exposed as
+`runSwitchboardRelayCatalogBuild(argv)` and preserve the existing
+`switchboard relay catalog build` behavior: local relay spec discovery,
+local catalog-state overlay, signing-key fallback, and output/stdout handling.
+Local relay catalog state mutation is exposed as
+`runSwitchboardRelayCatalogSetState(argv)` and preserves the existing
+`switchboard relay catalog set-state <relay-id> <state>` behavior: local
+relay catalog file updates, optional rebuild/signing, and no live relay
+publish, DNS, deploy, chain, or context mutation.
+
 Build output is generated into `dist/`, with packaged validator job bundles
 under `assets/jobs/`. These generated files are ignored by Git; local installs,
 `prepare`, and package dry-runs build them from source. Local Acurast staging
@@ -88,8 +118,8 @@ directories such as `dist/acurast/` are ignored and must not be packaged.
 ## Package Shape
 
 The package includes the compiled CLI, internal runner bundles, generated
-validator job bundles, and operator setup assets used by
-`switchboard operator setup`. GitHub Release installs consume the generated
+validator job bundles, and gateway setup assets used by
+`switchboard gateway setup`. GitHub Release installs consume the generated
 package tarball. The package `prepare` script builds and verifies the
 generated artifacts, and
 `npm pack --dry-run --json` is the release-surface check.

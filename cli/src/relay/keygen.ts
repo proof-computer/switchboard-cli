@@ -4,6 +4,7 @@ export interface RunRelayKeygenOptions {
   flags: Map<string, string | boolean>;
   positionals?: string[];
   io?: { log: (line: string) => void; warn: (line: string) => void; error: (line: string) => void };
+  createWallet?: () => RelayKeygenWallet;
 }
 
 export interface RelayKeygenResult {
@@ -12,6 +13,11 @@ export interface RelayKeygenResult {
   privateKey: string;
   envName: string;
   fishLine: string;
+}
+
+export interface RelayKeygenWallet {
+  address: string;
+  privateKey: string;
 }
 
 /**
@@ -31,7 +37,7 @@ export async function runRelayKeygen(options: RunRelayKeygenOptions): Promise<Re
     throw new Error("Usage: switchboard relay keygen <relay-id>  (id must match /^[a-z0-9-]+$/)");
   }
 
-  const wallet = ethers.Wallet.createRandom();
+  const wallet = (options.createWallet ?? (() => ethers.Wallet.createRandom()))();
   const envName = stringFlag(options.flags, "env-name") ?? defaultEnvName(relayId);
   const fishLine = `set -gx ${envName} ${wallet.privateKey}`;
 

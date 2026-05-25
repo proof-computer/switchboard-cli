@@ -2,7 +2,7 @@
 import "dotenv/config";
 
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
@@ -69,10 +69,14 @@ interface OperatorSetupConfig {
   publicAddress: string;
   publicAddressMode: "auto" | "static";
   publicPort: number;
+  gatewayAgentPort: number;
   gatewayAgentBindAddress?: string;
+  gatewayAgentExternallyBound: boolean;
+  upstreamAdmissionUrl?: string;
   routeStateUrl?: string;
   routeStateToken?: string;
   routeIntentToken?: string;
+  routeIntentTokenGenerated: boolean;
   managerAddress?: string;
   managerIds?: string;
   operatorId?: string;
@@ -114,8 +118,11 @@ interface OperatorSetupReport {
     publicAddressMode: "auto" | "static";
     source: string;
     publicPort: number;
+    gatewayAgentPort: number;
     localPortAlreadyOpen: boolean;
     gatewayAgentBindAddress?: string;
+    gatewayAgentExternallyBound: boolean;
+    upstreamAdmissionUrl?: string;
     routeStateUrl?: string;
   };
   config: {
@@ -126,6 +133,10 @@ interface OperatorSetupReport {
     imageTag: string;
     localBuild: boolean;
     gatewayAgentBindAddress?: string;
+    gatewayAgentExternallyBound: boolean;
+    upstreamAdmissionUrl?: string;
+    routeIntentAuthConfigured: boolean;
+    routeIntentTokenGenerated: boolean;
     routeStateUrl?: string;
     managerAddress?: string;
     managerIds?: string;
@@ -161,6 +172,7 @@ interface OperatorAdmissionBundle {
   capabilityReportToken?: string;
   routeStateUrl?: string;
   routeStateToken?: string;
+  upstreamAdmissionUrl?: string;
   payoutAddress?: string;
   reportSigner?: {
     scheme?: string;
@@ -200,6 +212,7 @@ interface OperatorAdmissionRequest {
   requestedRelays: {
     capabilityReportUrl?: string;
     routeStateUrl?: string;
+    upstreamAdmissionUrl?: string;
   };
 }
 
@@ -347,7 +360,7 @@ export async function runOperatorUpgrade(flags: Map<string, string | boolean>, r
   const keepImageOverride = boolFlag(flags, "keep-image-override") || boolFlag(flags, "keep-image-overrides");
   const docker = await checkDocker();
   if (!docker.docker.ok || !docker.compose.ok) {
-    throw new Error("Docker/Compose is not ready; run `switchboard operator setup` first.");
+    throw new Error("Docker/Compose is not ready; run `switchboard gateway setup` first.");
   }
   const migration = await planOperatorImageMigration(envFile, keepImageOverride);
   const composeStyle = docker.composeStyle ?? "docker-compose-plugin";
@@ -368,7 +381,7 @@ export async function runOperatorUpgrade(flags: Map<string, string | boolean>, r
     }
     return;
   }
-  if (!(await confirm(prompt, assumeYes, "Pull current operator images and recreate the operator stack?"))) {
+  if (!(await confirm(prompt, assumeYes, "Pull current gateway images and recreate the gateway stack?"))) {
     console.log("Operator upgrade skipped.");
     return;
   }
@@ -417,10 +430,22 @@ export async function setupOperator(
     process.env.PROOF_CONTAINER_IMAGE_TAG ??
     DEFAULT_OPERATOR_IMAGE_TAG;
   const publicPort = numberFlag(flags, "public-port", numberEnv("PUBLIC_HTTPS_PORT", 443));
+  const gatewayAgentPort = numberFlag(
+    flags,
+    "gateway-agent-port",
+    numberEnv("GATEWAY_AGENT_PORT", numberFromString(envValue(existingEnv, "GATEWAY_AGENT_PORT"), "GATEWAY_AGENT_PORT", 18080))
+  );
   const gatewayAgentBindAddress =
     stringFlag(flags, "gateway-agent-bind-address") ??
     process.env.GATEWAY_AGENT_BIND_ADDR ??
     envValue(existingEnv, "GATEWAY_AGENT_BIND_ADDR");
+  const gatewayAgentExternallyBound = gatewayAgentBindExposesNetwork(gatewayAgentBindAddress);
+  const upstreamAdmissionUrl =
+    stringFlag(flags, "upstream-admission-url") ??
+    process.env.GATEWAY_UPSTREAM_ADMISSION_URL ??
+    envValue(existingEnv, "GATEWAY_UPSTREAM_ADMISSION_URL") ??
+    admissionBundle?.upstreamAdmissionUrl ??
+    defaultUpstreamAdmissionUrl(gatewayAgentBindAddress, gatewayAgentPort);
   const osRelease = process.platform === "linux" ? await readOsRelease() : undefined;
   const supportedInstall = supportsAptDockerInstall(process.platform, osRelease);
   const warnings: string[] = [];
@@ -455,7 +480,12 @@ export async function setupOperator(
       existingEnv,
       admissionBundle?.routeStateToken
     ) || capabilityReportToken;
-  const routeIntentToken = resolveEnvSecret(flags, "route-intent-token-env", "GATEWAY_AGENT_ROUTE_INTENT_TOKEN", existingEnv);
+  const routeIntentTokenResolution = resolveRouteIntentToken({
+    flags,
+    existingEnv,
+    gatewayAgentExternallyBound
+  });
+  const routeIntentToken = routeIntentTokenResolution.token;
   const gatewayId = sanitizeGatewayId(
     stringFlag(flags, "gateway-id") ??
       process.env.GATEWAY_ID ??
@@ -510,10 +540,14 @@ export async function setupOperator(
     publicAddress: wanIp.value,
     publicAddressMode,
     publicPort,
+    gatewayAgentPort,
     gatewayAgentBindAddress,
+    gatewayAgentExternallyBound,
+    upstreamAdmissionUrl,
     routeStateUrl,
     routeStateToken,
     routeIntentToken,
+    routeIntentTokenGenerated: routeIntentTokenResolution.generated,
     managerAddress: manager.managerAddress,
     managerIds: manager.managerIds,
     operatorId,
@@ -577,10 +611,10 @@ export async function setupOperator(
 
   const envUpdates = operatorEnvUpdates(config);
   if (dryRun) {
-    actions.push(`would write operator env file ${envFile}`);
+    actions.push(`would write gateway env file ${envFile}`);
   } else {
     await writeOperatorEnvFile(envFile, envUpdates, projectDir);
-    actions.push(`wrote operator env file ${envFile}`);
+    actions.push(`wrote gateway env file ${envFile}`);
   }
 
   const admissionRequest = prepareAdmission ? buildAdmissionRequest(config, checkedAt) : undefined;
@@ -613,7 +647,7 @@ export async function setupOperator(
     warnings.push("Skipping compose launch because compose file is missing.");
   } else if (!docker.docker.ok || !docker.compose.ok) {
     warnings.push("Skipping compose launch because Docker/Compose is not ready.");
-  } else if (!dryRun && !(await confirm(prompt, assumeYes, `Launch the operator stack with ${localBuild ? "local Docker builds" : "configured images"}?`))) {
+  } else if (!dryRun && !(await confirm(prompt, assumeYes, `Launch the gateway stack with ${localBuild ? "local Docker builds" : "configured images"}?`))) {
     warnings.push("Compose launch skipped by user.");
   } else if (dryRun) {
     if (!localBuild) {
@@ -623,10 +657,10 @@ export async function setupOperator(
   } else {
     if (!localBuild) {
       await runInteractive(composePullCommand[0], composePullCommand.slice(1), { cwd: projectDir });
-      actions.push("pulled operator stack images from the configured registries");
+      actions.push("pulled gateway stack images from the configured registries");
     }
     await runInteractive(composeCommand[0], composeCommand.slice(1), { cwd: projectDir });
-    actions.push("launched operator stack with docker compose");
+    actions.push("launched gateway stack with docker compose");
     launchedCompose = true;
   }
 
@@ -634,7 +668,7 @@ export async function setupOperator(
     await checkCapabilityRegistration(config, actions, warnings);
     await verifyLocalGatewayAfterLaunch(config, actions);
   } else if (config.capabilityReportUrl && config.reportSeed && !dryRun) {
-    warnings.push("Skipped relay capability registration check because compose was not launched; run `switchboard operator discover` after gateway-agent starts.");
+    warnings.push("Skipped relay capability registration check because compose was not launched; run `switchboard gateway discover` after gateway-agent starts.");
   } else if (config.operatorId && !config.reportSeed) {
     warnings.push("Gateway capability submission is not configured; pass --operator-report-seed-env and --capability-url to verify relay/operator allowlist acceptance.");
   }
@@ -662,8 +696,11 @@ export async function setupOperator(
       publicAddressMode,
       source: wanIp.source,
       publicPort,
+      gatewayAgentPort,
       localPortAlreadyOpen,
       gatewayAgentBindAddress,
+      gatewayAgentExternallyBound,
+      upstreamAdmissionUrl,
       routeStateUrl
     },
     config: {
@@ -674,6 +711,10 @@ export async function setupOperator(
       imageTag,
       localBuild,
       gatewayAgentBindAddress,
+      gatewayAgentExternallyBound,
+      upstreamAdmissionUrl,
+      routeIntentAuthConfigured: Boolean(routeIntentToken),
+      routeIntentTokenGenerated: config.routeIntentTokenGenerated,
       routeStateUrl,
       managerAddress: manager.managerAddress,
       managerIds: manager.managerIds,
@@ -697,10 +738,10 @@ export async function setupOperator(
 }
 
 export function printOperatorSetupUsage(): void {
-  console.log(`Usage: switchboard operator setup [options]
+  console.log(`Usage: switchboard gateway setup [options]
 
-Checks the host, prepares operator env config, and launches the local Docker
-Compose operator stack. By default setup pulls prebuilt images from the
+Checks the host, prepares gateway env config, and launches the local Docker
+Compose gateway stack. By default setup pulls prebuilt images from the
 configured registry; use --local-build when developing from a repo checkout.
 
 Options:
@@ -726,8 +767,10 @@ Options:
   --public-port <port>             Public HTTPS port, default PUBLIC_HTTPS_PORT or 443
   --gateway-agent-bind-address <addr>
                                   Bind address for gateway-agent route API, default 127.0.0.1
+  --gateway-agent-port <port>      Gateway-agent API port, default GATEWAY_AGENT_PORT or 18080
+  --upstream-admission-url <url>   URL relay profiles should use for signed gateway upstream admissions
   --route-state-url <url>          Gateway route-state polling URL, default control.switchboard.proof.computer when --operator-id is set
-  --route-intent-token-env <env>   Dev-only env var containing the legacy bearer route-intent API token
+  --route-intent-token-env <env>   Env var containing the gateway route-intent bearer token
   --project-dir <path>             Repo/project directory, default cwd
   --compose-file <path[,path...]>  Compose file(s) relative to project dir, default ${DEFAULT_COMPOSE_FILE}
   --env-file <path>                Compose env file relative to project dir, default ${DEFAULT_ENV_FILE}
@@ -748,9 +791,9 @@ Upgrade-only:
   --keep-image-override            Do not migrate old default operator image refs to switchboard-gateway
 
 Examples:
-  switchboard operator setup
-  switchboard operator setup --manager-address 5... --manager-id <manager-id> --generate-report-seed --prepare-admission
-  switchboard operator setup --admission-file operator-admission.json --yes`);
+  switchboard gateway setup
+  switchboard gateway setup --manager-address 5... --manager-id <manager-id> --generate-report-seed --prepare-admission
+  switchboard gateway setup --admission-file operator-admission.json --yes`);
 }
 
 export function parseOsRelease(input: string): OsRelease {
@@ -953,6 +996,9 @@ export function parseOperatorAdmissionBundle(input: unknown): OperatorAdmissionB
   const routeState = record.routeState && typeof record.routeState === "object" && !Array.isArray(record.routeState)
     ? record.routeState as Record<string, unknown>
     : {};
+  const upstreamAdmission = record.upstreamAdmission && typeof record.upstreamAdmission === "object" && !Array.isArray(record.upstreamAdmission)
+    ? record.upstreamAdmission as Record<string, unknown>
+    : {};
   const reportSigner = signerMetadataFromUnknown(record.reportSigner);
   const acceptedSigner = signerMetadataFromUnknown(record.acceptedSigner ?? record.signer);
   const bundle: OperatorAdmissionBundle = {
@@ -972,6 +1018,9 @@ export function parseOperatorAdmissionBundle(input: unknown): OperatorAdmissionB
       stringField(record, "routeStateToken") ??
       stringField(routeState, "token") ??
       stringField(routeState, "bearerToken"),
+    upstreamAdmissionUrl:
+      stringField(record, "upstreamAdmissionUrl") ??
+      stringField(upstreamAdmission, "url"),
     payoutAddress: stringField(record, "payoutAddress"),
     reportSigner,
     acceptedSigner
@@ -1186,11 +1235,14 @@ function operatorEnvUpdates(config: OperatorSetupConfig): Record<string, string 
     OPERATOR_PAYOUT_ADDRESS: config.payoutAddress,
     PROOF_OPERATOR_CAPABILITY_URL: config.capabilityReportUrl,
     PROOF_OPERATOR_CAPABILITY_TOKEN: config.capabilityReportToken,
+    GATEWAY_AGENT_PORT: String(config.gatewayAgentPort),
     GATEWAY_AGENT_BIND_ADDR: config.gatewayAgentBindAddress,
+    GATEWAY_UPSTREAM_ADMISSION_URL: config.upstreamAdmissionUrl,
     GATEWAY_ROUTE_STATE_URL: config.routeStateUrl,
     GATEWAY_ROUTE_STATE_TOKEN: config.routeStateToken,
     GATEWAY_AGENT_ROUTE_INTENT_TOKEN: config.routeIntentToken,
     ROUTE_INTENT_OUTPUT_URL: process.env.ROUTE_INTENT_OUTPUT_URL ?? "http://gateway-agent:18080/internal/route-intents",
+    ROUTE_INTENT_OUTPUT_TOKEN: config.routeIntentToken,
     OPERATOR_PUBLIC_ADDRESSES: config.publicAddress,
     OPERATOR_PUBLIC_ADDRESS_MODE: config.publicAddressMode,
     OPERATOR_WAN_IP_URL: process.env.OPERATOR_WAN_IP_URL ?? WAN_IP_URL,
@@ -1281,7 +1333,7 @@ async function verifyLocalGatewayAfterLaunch(config: OperatorSetupConfig, action
       [
         "Operator stack launched but local gateway verification failed.",
         `Issues: ${issues.join("; ")}.`,
-        `Next: run \`switchboard operator status --project-dir ${config.projectDir}\` and inspect gateway-agent logs.`
+        `Next: run \`switchboard gateway status --project-dir ${config.projectDir}\` and inspect gateway-agent logs.`
       ].join(" ")
     );
   }
@@ -1369,7 +1421,7 @@ async function checkCapabilityRegistration(
     const warning = capabilityRegistrationWarning(response.status, body);
     if (warning) {
       if (config.mode === "admitted") {
-        throw new Error(`${warning} Next: run \`switchboard operator status --project-dir ${config.projectDir}\`.`);
+        throw new Error(`${warning} Next: run \`switchboard gateway status --project-dir ${config.projectDir}\`.`);
       }
       warnings.push(warning);
       return;
@@ -1378,7 +1430,7 @@ async function checkCapabilityRegistration(
   } catch (error) {
     const message = `Could not verify relay capability registration: ${error instanceof Error ? error.message : String(error)}`;
     if (config.mode === "admitted") {
-      throw new Error(`${message}. Next: run \`switchboard operator status --project-dir ${config.projectDir}\` for the doctor output.`);
+      throw new Error(`${message}. Next: run \`switchboard gateway status --project-dir ${config.projectDir}\` for the doctor output.`);
     }
     warnings.push(message);
     return;
@@ -1390,7 +1442,7 @@ async function checkCapabilityRegistration(
   const relayState = await fetchRelayCapabilityState(config, 10_000, { activeOnly: true });
   if (!relayState.ok || !relayCapabilityIncludesGateway(relayState.value, config.operatorId, config.gatewayId)) {
     throw new Error(
-      `Relay accepted the capability submission but did not return this operatorId + gatewayId in capability state. Next: run \`switchboard operator status --project-dir ${config.projectDir}\`.`
+      `Relay accepted the capability submission but did not return this operatorId + gatewayId in capability state. Next: run \`switchboard gateway status --project-dir ${config.projectDir}\`.`
     );
   }
 }
@@ -1475,7 +1527,7 @@ export function relayAdmissionConfigIssues(config: {
 
 export function relayAdmissionConfigMessage(missing: string[]): string {
   return [
-    "Mainnet operator setup is missing relay admission/reporting configuration.",
+    "Mainnet gateway setup is missing relay admission/reporting configuration.",
     "A gateway launched without this material can be locally healthy but absent from relay capacity.",
     `Missing: ${missing.join("; ")}.`,
     "Pass the missing values, use --prepare-admission to create an admission request, or use --local-only for lab installs."
@@ -1527,7 +1579,8 @@ function buildAdmissionRequest(config: OperatorSetupConfig, createdAt: Date): Op
     reportSigner: config.reportSigner,
     requestedRelays: {
       capabilityReportUrl: config.capabilityReportUrl,
-      routeStateUrl: config.routeStateUrl
+      routeStateUrl: config.routeStateUrl,
+      upstreamAdmissionUrl: config.upstreamAdmissionUrl
     }
   };
 }
@@ -1601,7 +1654,7 @@ async function seedPackagedOperatorAssets(
   const composeSeeded = await writePackagedOperatorAssetIfMissing({
     assetName: "docker-compose.yaml",
     targetFile: composeFile,
-    label: "operator compose file",
+    label: "gateway compose file",
     dryRun,
     actions,
     warnings,
@@ -1611,7 +1664,7 @@ async function seedPackagedOperatorAssets(
   await writePackagedOperatorAssetIfMissing({
     assetName: "operator.env.example",
     targetFile: path.join(projectDir, "docker", "operator.env.example"),
-    label: "operator env template",
+    label: "gateway env template",
     dryRun,
     actions,
     warnings,
@@ -1631,7 +1684,7 @@ async function seedPackagedOperatorAssets(
   await writePackagedOperatorAssetIfMissing({
     assetName: "envoy.yaml",
     targetFile: path.join(projectDir, "docker", "envoy", "envoy.yaml"),
-    label: "operator Envoy config",
+    label: "gateway Envoy config",
     dryRun,
     actions,
     warnings,
@@ -1641,7 +1694,7 @@ async function seedPackagedOperatorAssets(
   await writePackagedOperatorAssetIfMissing({
     assetName: "promscrape.yml",
     targetFile: path.join(projectDir, "docker", "victoria-metrics", "promscrape.yml"),
-    label: "operator VictoriaMetrics scrape config",
+    label: "gateway VictoriaMetrics scrape config",
     dryRun,
     actions,
     warnings,
@@ -1651,7 +1704,7 @@ async function seedPackagedOperatorAssets(
   await writePackagedOperatorAssetIfMissing({
     assetName: "grafana-victoria-metrics.yml",
     targetFile: path.join(projectDir, "docker", "grafana", "provisioning", "datasources", "victoria-metrics.yml"),
-    label: "operator Grafana datasource config",
+    label: "gateway Grafana datasource config",
     dryRun,
     actions,
     warnings,
@@ -2089,6 +2142,31 @@ function resolveEnvSecret(
   return value && value.length > 0 ? value : undefined;
 }
 
+function resolveRouteIntentToken(input: {
+  flags: Map<string, string | boolean>;
+  existingEnv: Map<string, string>;
+  gatewayAgentExternallyBound: boolean;
+}): { token?: string; generated: boolean } {
+  const fromExplicitEnv = resolveEnvSecret(
+    input.flags,
+    "route-intent-token-env",
+    "GATEWAY_AGENT_ROUTE_INTENT_TOKEN",
+    input.existingEnv,
+    process.env.ROUTE_INTENT_OUTPUT_TOKEN ?? envValue(input.existingEnv, "ROUTE_INTENT_OUTPUT_TOKEN")
+  );
+  if (fromExplicitEnv) {
+    return { token: fromExplicitEnv, generated: false };
+  }
+  if (!input.gatewayAgentExternallyBound) {
+    return { generated: false };
+  }
+  return { token: generateRouteIntentToken(), generated: true };
+}
+
+function generateRouteIntentToken(): string {
+  return `sb_rt_${randomBytes(32).toString("base64url")}`;
+}
+
 async function resolveReportSeed(input: {
   flags: Map<string, string | boolean>;
   existingEnv: Map<string, string>;
@@ -2198,6 +2276,16 @@ function numberFlag(flags: Map<string, string | boolean>, name: string, fallback
   return Number(value);
 }
 
+function numberFromString(value: string | undefined, name: string, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return Number(value);
+}
+
 function numberEnv(name: string, fallback: number): number {
   const value = process.env[name];
   if (!value) {
@@ -2207,6 +2295,26 @@ function numberEnv(name: string, fallback: number): number {
     throw new Error(`${name} must be a non-negative integer`);
   }
   return Number(value);
+}
+
+function gatewayAgentBindExposesNetwork(bindAddress: string | undefined): boolean {
+  const normalized = (bindAddress ?? "127.0.0.1").trim().toLowerCase();
+  if (!normalized || normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1" || normalized === "[::1]") {
+    return false;
+  }
+  return true;
+}
+
+function defaultUpstreamAdmissionUrl(bindAddress: string | undefined, port: number): string | undefined {
+  if (!gatewayAgentBindExposesNetwork(bindAddress)) {
+    return undefined;
+  }
+  const normalized = (bindAddress ?? "").trim();
+  if (!normalized || normalized === "0.0.0.0" || normalized === "::" || normalized === "[::]") {
+    return undefined;
+  }
+  const host = net.isIP(normalized) === 6 && !normalized.startsWith("[") ? `[${normalized}]` : normalized;
+  return `http://${host}:${port}/v1/upstream-admissions`;
 }
 
 function stringFlag(flags: Map<string, string | boolean>, name: string): string | undefined {
@@ -2399,7 +2507,7 @@ function printOperatorStatus(report: {
   gatewayAgent: { url: string; ok: boolean; health?: unknown; error?: string };
   capability: { localOk: boolean; local?: unknown; localError?: string; relayUrl?: string; relayOk?: boolean; relay?: unknown; relayError?: string };
 }): void {
-  console.log(`Operator status: ${report.state}${report.ok ? "" : " (needs attention)"}`);
+  console.log(`Gateway status: ${report.state}${report.ok ? "" : " (needs attention)"}`);
   console.log(`Docker: ${report.docker.docker.ok ? "ok" : "missing"}; Compose: ${report.docker.compose.ok ? "ok" : "missing"}`);
   if (report.docker.docker.ok) {
     console.log(`Docker daemon access: ${report.docker.userCanAccessDaemon ? "ok" : `blocked for ${report.docker.currentUser ?? "current user"}`}`);
@@ -2444,17 +2552,26 @@ function printOperatorStatus(report: {
   }
   if (!report.ok) {
     console.log("");
-    console.log(`Next: switchboard operator status --project-dir ${report.projectDir} --json`);
+    console.log(`Next: switchboard gateway status --project-dir ${report.projectDir} --json`);
   }
 }
 
 function printOperatorSetupReport(report: OperatorSetupReport): void {
-  console.log(`Operator setup ${report.config.gatewayId}`);
+  console.log(`Gateway setup ${report.config.gatewayId}`);
   console.log(`OS: ${report.os.osRelease?.name ?? report.os.platform} ${report.os.osRelease?.versionId ?? report.os.release} (${report.os.arch})`);
   console.log(`Docker: ${report.docker.docker.ok ? "ok" : "missing"}; Compose: ${report.docker.compose.ok ? "ok" : "missing"}`);
   console.log(`Public address: ${report.network.publicAddress}:${report.network.publicPort} (${report.network.source}, ${report.network.publicAddressMode})`);
   if (report.network.gatewayAgentBindAddress) {
     console.log(`Gateway-agent bind address: ${report.network.gatewayAgentBindAddress}`);
+  }
+  console.log(`Gateway-agent route-intent auth: ${report.config.routeIntentAuthConfigured ? "configured" : "not configured"}`);
+  if (report.config.routeIntentTokenGenerated) {
+    console.log("Gateway-agent route-intent token: generated and stored in the env file");
+  }
+  if (report.network.upstreamAdmissionUrl) {
+    console.log(`Upstream admission URL: ${report.network.upstreamAdmissionUrl}`);
+  } else if (report.network.gatewayAgentExternallyBound) {
+    console.log("Upstream admission URL: not inferred; pass --upstream-admission-url for relay profile onboarding");
   }
   if (report.network.routeStateUrl) {
     console.log(`Route-state URL: ${report.network.routeStateUrl}`);
@@ -2516,7 +2633,7 @@ if (
 ) {
   main().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[operator:setup] ${message}`);
+    console.error(`[gateway:setup] ${message}`);
     process.exitCode = 1;
   });
 }

@@ -18,11 +18,13 @@ function captureHelp(options?: { advanced?: boolean }): string {
 }
 
 describe("switchboard help", () => {
-  it("shows operator commands in default help while keeping PROOF admin commands advanced", () => {
+  it("shows gateway commands in default help while keeping PROOF admin commands advanced", () => {
     const help = captureHelp();
 
-    assert.match(help, /operator setup/);
-    assert.match(help, /operator discover/);
+    assert.match(help, /gateway setup/);
+    assert.match(help, /gateway discover/);
+    assert.doesNotMatch(help, /operator setup/);
+    assert.doesNotMatch(help, /operator discover/);
     assert.match(help, /launch-demo/);
     assert.match(help, /deploy doctor/);
     assert.match(help, /Deploy doctor:/);
@@ -33,13 +35,13 @@ describe("switchboard help", () => {
     assert.doesNotMatch(help, /^\s+logs$/m);
     assert.doesNotMatch(help, /Decrypt encrypted job logs/);
     assert.doesNotMatch(help, /log-sink/);
-    assert.match(help, /Operator setup:/);
+    assert.match(help, /Gateway setup:/);
     assert.match(help, /--generate-report-seed/);
     assert.match(help, /--prepare-admission/);
     assert.match(help, /--admission-file <path>/);
     assert.match(help, /--payout-address <0xaddress>/);
     assert.match(help, /--processor-file <path>/);
-    assert.match(help, /Operator status and upgrade:/);
+    assert.match(help, /Gateway status and upgrade:/);
     assert.match(help, /--capability-token-env <env>/);
     assert.match(help, /PROOF-required and admin commands are hidden/);
     assert.doesNotMatch(help, /Advanced session commands:/);
@@ -50,7 +52,8 @@ describe("switchboard help", () => {
   it("shows PROOF/admin namespaces with advanced help", () => {
     const help = captureHelp({ advanced: true });
 
-    assert.match(help, /operator setup/);
+    assert.match(help, /gateway setup/);
+    assert.doesNotMatch(help, /operator setup/);
     assert.match(help, /Advanced session commands:/);
     assert.match(help, /PROOF ops commands:/);
     assert.match(help, /Admin relay commands:/);
@@ -77,6 +80,31 @@ describe("switchboard help", () => {
     const help = lines.join("\n");
     assert.match(help, /Switchboard, a PROOF project/);
     assert.match(help, /switchboard launch-demo --yes-spend/);
+  });
+
+  it("can run gateway setup help through the exported CLI runner", async () => {
+    const originalLog = console.log;
+    const lines: string[] = [];
+    console.log = (line?: unknown) => {
+      lines.push(String(line ?? ""));
+    };
+
+    try {
+      await runSwitchboardCli(["gateway", "setup", "--help"], { contextStorePath: "/tmp/switchboard-test-contexts.json" });
+    } finally {
+      console.log = originalLog;
+    }
+
+    const help = lines.join("\n");
+    assert.match(help, /Usage: switchboard gateway setup/);
+    assert.match(help, /--upstream-admission-url/);
+  });
+
+  it("rejects the removed operator command topic", async () => {
+    await assert.rejects(
+      runSwitchboardCli(["operator", "setup", "--help"], { contextStorePath: "/tmp/switchboard-test-contexts.json" }),
+      /Unknown command: operator setup/
+    );
   });
 
   it("rejects removed public deploy and status flags", () => {

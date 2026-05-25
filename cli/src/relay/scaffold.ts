@@ -12,12 +12,19 @@ export interface RunRelayScaffoldOptions {
   positionals?: string[];
   io?: { log: (line: string) => void; warn: (line: string) => void; error: (line: string) => void };
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  createWallet?: () => RelayScaffoldWallet;
 }
 
 export interface RelayScaffoldResult {
   relayId: string;
   filePath: string;
   generatedKey?: { address: string; privateKey: string; envName: string; fishLine: string };
+}
+
+export interface RelayScaffoldWallet {
+  address: string;
+  privateKey: string;
 }
 
 /**
@@ -37,6 +44,7 @@ export interface RelayScaffoldResult {
 export async function runRelayScaffold(options: RunRelayScaffoldOptions): Promise<RelayScaffoldResult> {
   const io = options.io ?? defaultIo();
   const cwd = options.cwd ?? process.cwd();
+  const env = options.env ?? process.env;
   // positionals shape: ["relay", "scaffold", "<id>"]
   const relayId = (options.positionals ?? [])[2];
   if (!relayId || !/^[a-z0-9-]+$/.test(relayId)) {
@@ -46,7 +54,7 @@ export async function runRelayScaffold(options: RunRelayScaffoldOptions): Promis
   if (target !== "acurast" && target !== "bootstrap") {
     throw new Error("--target must be acurast or bootstrap");
   }
-  const apiBaseUrl = stringFlag(options.flags, "api-base-url") ?? defaultRelayApiBaseUrl(relayId);
+  const apiBaseUrl = stringFlag(options.flags, "api-base-url") ?? defaultRelayApiBaseUrl(relayId, env);
 
   const filePath = path.join(cwd, "relays", `${relayId}.json`);
   if (!boolFlag(options.flags, "force") && (await fileExists(filePath))) {
@@ -59,7 +67,7 @@ export async function runRelayScaffold(options: RunRelayScaffoldOptions): Promis
     if (relayerKeyEnv === undefined) {
       relayerKeyEnv = mainnetRecorderEnvName(relayId);
     }
-    const wallet = ethers.Wallet.createRandom();
+    const wallet = (options.createWallet ?? (() => ethers.Wallet.createRandom()))();
     generatedKey = {
       address: wallet.address,
       privateKey: wallet.privateKey,
@@ -106,7 +114,7 @@ export async function runRelayScaffold(options: RunRelayScaffoldOptions): Promis
     composeService: stringFlag(options.flags, "compose-service") ?? relayId,
     composeFile: stringFlag(options.flags, "compose-file") ?? "docker-compose.control-plane.yaml",
     envFile: stringFlag(options.flags, "env-file") ?? ".control-plane/control-plane.env",
-    cnameTarget: stringFlag(options.flags, "cname-target") ?? process.env.SWITCHBOARD_GATEWAY_HOSTNAME,
+    cnameTarget: stringFlag(options.flags, "cname-target") ?? env.SWITCHBOARD_GATEWAY_HOSTNAME,
     generatedAddress: generatedKey?.address
   });
 
@@ -213,10 +221,10 @@ function mainnetRecorderEnvName(relayId: string): string {
   return `PROOF_MAINNET_${upper}_RECORDER_PRIVATE_KEY`;
 }
 
-function defaultRelayApiBaseUrl(relayId: string): string {
+function defaultRelayApiBaseUrl(relayId: string, env: NodeJS.ProcessEnv): string {
   const pattern =
-    process.env.SWITCHBOARD_RELAY_HOSTNAME_PATTERN ??
-    `\${relayId}.${process.env.SWITCHBOARD_SERVICE_DOMAIN ?? DEFAULT_SWITCHBOARD_SERVICE_DOMAIN}`;
+    env.SWITCHBOARD_RELAY_HOSTNAME_PATTERN ??
+    `\${relayId}.${env.SWITCHBOARD_SERVICE_DOMAIN ?? DEFAULT_SWITCHBOARD_SERVICE_DOMAIN}`;
   return `https://${pattern.replace(/\$\{relayId\}/g, relayId)}`;
 }
 

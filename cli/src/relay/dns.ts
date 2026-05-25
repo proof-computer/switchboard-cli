@@ -9,7 +9,7 @@ import {
   upsertCloudflareCnameRecord,
   type CloudflareDnsRecord
 } from "../../../src/cloudflare-dns.js";
-import { validateCnameTarget, type CnameValidationResult } from "../../../src/customer-hostname.js";
+import { validateCnameTarget as defaultValidateCnameTarget, type CnameValidationResult } from "../../../src/customer-hostname.js";
 import { parseRelayDeploymentSpec, type RelayDeploymentSpec } from "../../../src/relay-deployment-spec.js";
 
 export interface RelayDnsIo {
@@ -124,12 +124,20 @@ export async function removeRelayDns(spec: RelayDeploymentSpec, env: NodeJS.Proc
  */
 const DEFAULT_VERIFY_RESOLVERS = ["1.1.1.1", "8.8.8.8"] as const;
 
+export type RelayDnsValidateCnameTarget = (input: {
+  customerHostname: string;
+  expectedTarget: string;
+  resolvers?: string[];
+  maxDepth?: number;
+}) => Promise<CnameValidationResult>;
+
 export async function verifyRelayDns(
   spec: RelayDeploymentSpec,
   env: NodeJS.ProcessEnv,
-  options: { resolvers?: string[] } = {}
+  options: { resolvers?: string[]; validateCnameTarget?: RelayDnsValidateCnameTarget } = {}
 ): Promise<CnameValidationResult> {
   const resolved = resolveRelayDns({ spec, env, tokenOptional: true });
+  const validateCnameTarget = options.validateCnameTarget ?? defaultValidateCnameTarget;
   return validateCnameTarget({
     customerHostname: resolved.hostname,
     expectedTarget: resolved.cnameTarget,
@@ -143,6 +151,7 @@ export interface RelayDnsSubcommandArgs {
   env?: NodeJS.ProcessEnv;
   io?: RelayDnsIo;
   cwd?: string;
+  validateCnameTarget?: RelayDnsValidateCnameTarget;
 }
 
 /**
@@ -189,7 +198,7 @@ export async function runRelayDnsSubcommand(args: RelayDnsSubcommandArgs): Promi
       io.log("  hostname     : (no dns block in spec — nothing to manage)");
       return;
     }
-    const validation = await verifyRelayDns(spec, env, { resolvers });
+    const validation = await verifyRelayDns(spec, env, { resolvers, validateCnameTarget: args.validateCnameTarget });
     io.log(`  hostname     : ${new URL(spec.apiBaseUrl).hostname}`);
     io.log(`  cnameTarget  : ${spec.dns.cnameTarget}`);
     io.log(`  ttl          : ${spec.dns.ttl}`);
@@ -231,7 +240,7 @@ export async function runRelayDnsSubcommand(args: RelayDnsSubcommandArgs): Promi
   }
 
   if (verb === "verify") {
-    const validation = await verifyRelayDns(spec, env, { resolvers });
+    const validation = await verifyRelayDns(spec, env, { resolvers, validateCnameTarget: args.validateCnameTarget });
     io.log(`relay dns verify ${relayId}`);
     io.log(`  hostname     : ${validation.customerHostname}`);
     io.log(`  expectedTgt  : ${validation.expectedTarget}`);

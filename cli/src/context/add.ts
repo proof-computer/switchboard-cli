@@ -88,13 +88,6 @@ export async function contextAddCommand(
   cancelIfCancelled(acurastNetworkAnswer);
   const acurastNetwork = acurastNetworkAnswer as string;
 
-  const operatorIdAnswer = await p.text({
-    message: "Operator ID (bytes32, optional)",
-    placeholder: "0x… (leave blank to skip)"
-  });
-  cancelIfCancelled(operatorIdAnswer);
-  const operatorId = nonEmpty(operatorIdAnswer as string);
-
   const acurastSeedEnvAnswer = await p.text({
     message: "Acurast deploy seed env var",
     initialValue: "ACURAST_MAINNET_SEED",
@@ -139,7 +132,6 @@ export async function contextAddCommand(
 
   const partial: SwitchboardContext = {
     acurastNetwork,
-    operatorId,
     acurastSeedEnv,
     acurastAddressEnv,
     polkadotSigner: signerKind
@@ -263,10 +255,9 @@ export async function contextAddCommand(
     p.log.info("Balance checks skipped (--no-balance-check).");
   }
 
-  const dnsHint = optionalEnv("CLOUDFLARE_API_TOKEN")
-    ? "Cloudflare token detected — attach with `switchboard context dns set cloudflare --token-env CLOUDFLARE_API_TOKEN`."
-    : "Next: `switchboard context dns set cloudflare --token-env <NAME>` for the PROOF-managed DNS path, or skip if you'll BYO TLS.";
-  p.outro(dnsHint);
+  p.outro(
+    "Next: run `switchboard preflight --quote`. PROOF-managed DNS credentials are not needed in normal builder contexts."
+  );
 
   writeOutput(
     flags,

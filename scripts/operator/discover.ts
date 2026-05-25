@@ -593,7 +593,7 @@ function printHumanReport(report: DiscoveryReport, writeEnvPath: string | undefi
 }
 
 export function printOperatorDiscoverUsage(): void {
-  console.log(`Usage: switchboard operator discover --manager-id <id> --public-address <ip-or-host> [options]
+  console.log(`Usage: switchboard gateway discover --manager-id <id> --public-address <ip-or-host> [options]
 
 Options:
   --network <mainnet|canary>       Acurast network, default ACURAST_NETWORK or mainnet
@@ -610,11 +610,11 @@ Options:
   --ready-ttl-ms <ms>              Recent-ready TTL, default ${DEFAULT_READY_TTL_MS}
   --recent-check-ttl-ms <ms>       Recent-check TTL for --limit, default ready TTL
   --no-state                      Do not read or write discovery state
-  --write-env <path>               Write suggested operator env values
+  --write-env <path>               Write suggested gateway env values
   --json                          Print JSON report
 
 Alias:
-  pnpm operator:discover -- --manager-id <id> --public-address <ip-or-host>`);
+  pnpm gateway:discover -- --manager-id <id> --public-address <ip-or-host>`);
 }
 
 function statusLine(result: CheckResult | undefined): string {
@@ -930,7 +930,7 @@ if (
 ) {
   main().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[operator:discover] ${message}`);
+    console.error(`[gateway:discover] ${message}`);
     process.exitCode = 1;
   });
 }

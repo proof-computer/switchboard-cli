@@ -151,7 +151,7 @@ describe("operator setup helpers", () => {
     );
   });
 
-  it("can plan a clean operator install from packaged assets", async () => {
+  it("can plan a clean gateway install from packaged assets", async () => {
     const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-"));
     const report = await setupOperator(
       new Map<string, string | boolean>([
@@ -168,10 +168,10 @@ describe("operator setup helpers", () => {
 
     assert.equal(report.config.composeFile, path.join(projectDir, "docker-compose.yaml"));
     const actions = report.actions.join("\n");
-    assert.match(actions, /would write packaged operator compose file/);
-    assert.match(actions, /would write packaged operator Envoy config/);
-    assert.match(actions, /would write packaged operator VictoriaMetrics scrape config/);
-    assert.match(actions, /would write packaged operator Grafana datasource config/);
+    assert.match(actions, /would write packaged gateway compose file/);
+    assert.match(actions, /would write packaged gateway Envoy config/);
+    assert.match(actions, /would write packaged gateway VictoriaMetrics scrape config/);
+    assert.match(actions, /would write packaged gateway Grafana datasource config/);
     assert.equal(
       report.warnings.some((warning) => warning.includes("Compose file not found")),
       false
@@ -391,6 +391,52 @@ describe("operator setup helpers", () => {
     }
   });
 
+  it("generates shared route-intent auth for non-loopback gateway-agent binds", async () => {
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-gateway-route-auth-"));
+    const previousGatewayToken = process.env.GATEWAY_AGENT_ROUTE_INTENT_TOKEN;
+    const previousOutputToken = process.env.ROUTE_INTENT_OUTPUT_TOKEN;
+    try {
+      delete process.env.GATEWAY_AGENT_ROUTE_INTENT_TOKEN;
+      delete process.env.ROUTE_INTENT_OUTPUT_TOKEN;
+      const report = await setupOperator(
+        new Map<string, string | boolean>([
+          ["project-dir", projectDir],
+          ["public-address", "195.22.134.245"],
+          ["manager-id", "9470"],
+          ["gateway-id", "switchboard-az-token"],
+          ["gateway-agent-bind-address", "192.168.3.4"],
+          ["skip-install", true],
+          ["skip-compose", true],
+          ["local-only", true],
+          ["yes", true]
+        ])
+      );
+
+      assert.equal(report.network.gatewayAgentExternallyBound, true);
+      assert.equal(report.network.upstreamAdmissionUrl, "http://192.168.3.4:18080/v1/upstream-admissions");
+      assert.equal(report.config.routeIntentAuthConfigured, true);
+      assert.equal(report.config.routeIntentTokenGenerated, true);
+
+      const env = await readFile(path.join(projectDir, ".operator-host", "operator.env"), "utf8");
+      const gatewayToken = env.match(/^GATEWAY_AGENT_ROUTE_INTENT_TOKEN=(.+)$/m)?.[1];
+      const outputToken = env.match(/^ROUTE_INTENT_OUTPUT_TOKEN=(.+)$/m)?.[1];
+      assert.match(gatewayToken ?? "", /^sb_rt_/);
+      assert.equal(outputToken, gatewayToken);
+      assert.match(env, /^GATEWAY_UPSTREAM_ADMISSION_URL=http:\/\/192\.168\.3\.4:18080\/v1\/upstream-admissions$/m);
+    } finally {
+      if (previousGatewayToken === undefined) {
+        delete process.env.GATEWAY_AGENT_ROUTE_INTENT_TOKEN;
+      } else {
+        process.env.GATEWAY_AGENT_ROUTE_INTENT_TOKEN = previousGatewayToken;
+      }
+      if (previousOutputToken === undefined) {
+        delete process.env.ROUTE_INTENT_OUTPUT_TOKEN;
+      } else {
+        process.env.ROUTE_INTENT_OUTPUT_TOKEN = previousOutputToken;
+      }
+    }
+  });
+
   it("fails mainnet setup without relay admission material unless local-only", async () => {
     const projectDir = await mkdtemp(path.join(os.tmpdir(), "proof-operator-admission-"));
     await assert.rejects(
@@ -405,7 +451,7 @@ describe("operator setup helpers", () => {
           ["yes", true]
         ])
       ),
-      /Mainnet operator setup is missing relay admission\/reporting configuration/
+      /Mainnet gateway setup is missing relay admission\/reporting configuration/
     );
   });
 
@@ -525,10 +571,12 @@ describe("operator setup helpers", () => {
       gatewayId: "gateway-1",
       capability: { url: "https://control.example/v1/operator-capabilities", token: "cap-token" },
       routeState: { url: "https://control.example/v1/operators/op/gateways/gateway-1/route-state", token: "route-token" },
+      upstreamAdmission: { url: "http://192.168.3.4:18080/v1/upstream-admissions" },
       acceptedSigner: { address: "5Signer", publicKey: "0x" + "11".repeat(32) }
     });
     assert.equal(parsed.capabilityReportToken, "cap-token");
     assert.equal(parsed.routeStateToken, "route-token");
+    assert.equal(parsed.upstreamAdmissionUrl, "http://192.168.3.4:18080/v1/upstream-admissions");
   });
 
   it("applies an admission file and verifies accepted signer metadata", async () => {

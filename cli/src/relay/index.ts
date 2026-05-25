@@ -37,6 +37,7 @@ import {
   upsertRelayCatalogEntry,
   withRelayCatalogState,
   writeRelayCatalogStore,
+  type RebuildSignedCatalogOptions,
   type RelayCatalogStore
 } from "./catalog.js";
 import {
@@ -506,11 +507,16 @@ async function refreshCatalogForDeploy(args: {
   await rebuildSignedRelayCatalog(updated, { cwd, io });
 }
 
-export async function runRelayCatalogSetState(args: {
+export interface RunRelayCatalogSetStateOptions {
   flags: Map<string, string | boolean>;
   positionals: string[];
   io?: RelayCommandIo;
-}): Promise<void> {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  build?: RebuildSignedCatalogOptions["build"];
+}
+
+export async function runRelayCatalogSetState(args: RunRelayCatalogSetStateOptions): Promise<void> {
   const io = args.io ?? DEFAULT_IO;
   // positionals shape: ["relay", "catalog", "set-state", "<id>", "<state>"]
   const relayId = args.positionals[3];
@@ -527,7 +533,7 @@ export async function runRelayCatalogSetState(args: {
   }
   const state: ServiceState = stateResult.data;
 
-  const cwd = process.cwd();
+  const cwd = args.cwd ?? process.cwd();
   const catalogFileFlag = stringFlag(args.flags, "catalog-file");
   const store = await readRelayCatalogStore(cwd, catalogFileFlag);
   const next = withRelayCatalogState(store.entries, relayId, state);
@@ -539,7 +545,7 @@ export async function runRelayCatalogSetState(args: {
     io.log(`Skipped catalog signing because --no-rebuild was passed.`);
     return;
   }
-  await rebuildSignedRelayCatalog(updated, { cwd, io });
+  await rebuildSignedRelayCatalog(updated, { cwd, io, env: args.env, build: args.build });
 }
 
 export async function runRelayStatus(args: {

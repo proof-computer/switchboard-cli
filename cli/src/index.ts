@@ -66,27 +66,32 @@ import { accountFromUri, contractLayerAddress, isReviveAccountMapped, ledgerAcco
 import { signReportPayload } from "../../src/report-signing.js";
 import { validateSwitchboardRoute } from "../../src/route-validation-report.js";
 import { discoverServices, resolveControlApiEndpoints } from "../../src/service-discovery.js";
-import { runRelayCatalogSetState, runRelayDeploy, runRelayStatus } from "./relay/index.js";
-import { runRelaySync } from "./relay/sync.js";
+import {
+  runRelayCatalogSetState,
+  runRelayDeploy,
+  runRelayStatus,
+  type RunRelayCatalogSetStateOptions
+} from "./relay/index.js";
+import { runRelaySync, type RunRelaySyncOptions } from "./relay/sync.js";
 import { runRelayList } from "./relay/list.js";
-import { runRelayCatalogBuild } from "./relay/catalog-build-from-specs.js";
+import { runRelayCatalogBuild, type RunRelayCatalogBuildOptions } from "./relay/catalog-build-from-specs.js";
 import { runRelayDiff } from "./relay/diff.js";
 import { runRelayBackfillSpecs } from "./relay/backfill-specs.js";
-import { runRelayKeygen } from "./relay/keygen.js";
-import { runRelayPickProcessor } from "./relay/pick-processor.js";
-import { runRelayScaffold } from "./relay/scaffold.js";
+import { runRelayKeygen, type RunRelayKeygenOptions } from "./relay/keygen.js";
+import { runRelayPickProcessor, type RunRelayPickProcessorOptions } from "./relay/pick-processor.js";
+import { runRelayScaffold, type RunRelayScaffoldOptions } from "./relay/scaffold.js";
 import { runRelayDrain } from "./relay/drain.js";
 import { runRelayReplace } from "./relay/replace.js";
 import { runRelayRotateKey } from "./relay/rotate-key.js";
 import { runRelayDeployments } from "./relay/history.js";
 import { runRelayLogs } from "./relay/logs.js";
 import { runRelayPromote } from "./relay/promote.js";
-import { runRelayWatch } from "./relay/watch.js";
+import { runRelayWatch, type RunRelayWatchOptions } from "./relay/watch.js";
 import { runRelayVerify } from "./relay/verify.js";
 import { runRelayBudget } from "./relay/budget.js";
 import { runRelayWhoami } from "./relay/whoami.js";
-import { runRelayDeploymentStatus, runRelayInspect } from "./relay/lifecycle.js";
-import { runRelayDnsSubcommand } from "./relay/dns.js";
+import { runRelayDeploymentStatus, runRelayInspect, type RelayLifecycleArgs } from "./relay/lifecycle.js";
+import { runRelayDnsSubcommand, type RelayDnsSubcommandArgs } from "./relay/dns.js";
 import { runBootstrapSubcommand } from "./bootstrap/acurast.js";
 import {
   runCatalogBuild,
@@ -213,10 +218,10 @@ export type CommandName =
   | "hostname-status"
   | "validator-launch"
   | "validator-script"
-  | "operator-setup"
-  | "operator-discover"
-  | "operator-status"
-  | "operator-upgrade"
+  | "gateway-setup"
+  | "gateway-discover"
+  | "gateway-status"
+  | "gateway-upgrade"
   | "relay-deploy"
   | "relay-catalog-set-state"
   | "relay-status"
@@ -398,6 +403,7 @@ const REMOVED_PUBLIC_STATUS_FLAGS = [
   "require-validator"
 ];
 const REMOVED_PROJECT_DEPLOY_FIELDS = [
+  "hostname",
   "validatorMode",
   "realValidator",
   "activate",
@@ -422,12 +428,12 @@ export async function runSwitchboardCli(argv: readonly string[] = process.argv.s
   const parsed = parseArgs([...argv]);
   const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
 
-  if (parsed.command === "operator-discover" && boolFlag(parsed.flags, "help")) {
+  if (parsed.command === "gateway-discover" && boolFlag(parsed.flags, "help")) {
     printOperatorDiscoverUsage();
     return;
   }
 
-  if (parsed.command === "operator-setup" && boolFlag(parsed.flags, "help")) {
+  if (parsed.command === "gateway-setup" && boolFlag(parsed.flags, "help")) {
     printOperatorSetupUsage();
     return;
   }
@@ -586,22 +592,22 @@ export async function runSwitchboardCli(argv: readonly string[] = process.argv.s
     return;
   }
 
-  if (parsed.command === "operator-setup") {
+  if (parsed.command === "gateway-setup") {
     await runOperatorSetup(flags);
     return;
   }
 
-  if (parsed.command === "operator-status") {
+  if (parsed.command === "gateway-status") {
     await runOperatorStatus(flags);
     return;
   }
 
-  if (parsed.command === "operator-upgrade") {
+  if (parsed.command === "gateway-upgrade") {
     await runOperatorUpgrade(flags);
     return;
   }
 
-  if (parsed.command === "operator-discover") {
+  if (parsed.command === "gateway-discover") {
     await runOperatorDiscover(flags);
     return;
   }
@@ -768,6 +774,13 @@ function assertNoLegacyPublicRuntimeConfig(command: CommandName, runtime: CliRun
         "Public deploys are relay-reconciled only; move route repair, validator, activation, and manual fulfillment controls to an ops profile/admin command."
     );
   }
+  if (commandRejectsProjectEndpoint(command) && runtime.projectConfig?.endpoint) {
+    const source = runtime.projectConfigPath ?? SWITCHBOARD_PROJECT_CONFIG_FILE;
+    throw new Error(
+      `${source} uses removed project field: endpoint. ` +
+        "Canonical PROOF endpoints are allocated during deploy; remove endpoint from switchboard.json and attach customer domains after deploy with `switchboard hostname add`."
+    );
+  }
 
   const context = runtime.context as Record<string, unknown> | undefined;
   const legacyContextFields = context
@@ -782,15 +795,26 @@ function assertNoLegacyPublicRuntimeConfig(command: CommandName, runtime: CliRun
 }
 
 function assertNoRemovedProjectInitFlags(flags: Map<string, string | boolean>): void {
-  const removed = [...REMOVED_PUBLIC_DEPLOY_FLAGS, "operator-project-dir", "operator-route-metadata-file"]
+  const removed = [...REMOVED_PUBLIC_DEPLOY_FLAGS, "operator-project-dir", "operator-route-metadata-file", "endpoint", "hostname", "endpoint-id"]
     .filter((flag, index, values) => values.indexOf(flag) === index)
     .filter((flag) => flags.has(flag));
   if (removed.length > 0) {
+    const endpointFlags = removed.filter((flag) => flag === "endpoint" || flag === "hostname" || flag === "endpoint-id");
+    if (endpointFlags.length > 0) {
+      throw new Error(
+        `Removed project deploy option(s): ${endpointFlags.map((flag) => `--${flag}`).join(", ")}. ` +
+          "Canonical PROOF endpoints are allocated during deploy; attach customer domains after deploy with `switchboard hostname add`."
+      );
+    }
     throw new Error(
       `Removed project deploy option(s): ${removed.map((flag) => `--${flag}`).join(", ")}. ` +
         "New projects use relay-reconciled deployment defaults; put recovery/admin settings in an ops profile."
     );
   }
+}
+
+function commandRejectsProjectEndpoint(command: CommandName): boolean {
+  return command === "preflight" || command === "deploy" || command === "launch-demo";
 }
 
 function assertNoRemovedContextSetFlags(flags: Map<string, string | boolean>): void {
@@ -1103,16 +1127,9 @@ async function projectInitCommand(flags: Map<string, string | boolean>) {
   }
 
   const projectName = stringFlag(flags, "project") ?? stringFlag(flags, "name") ?? path.basename(cwd);
-  const endpointHostname = normalizeHostnameForCli(stringFlag(flags, "endpoint") ?? stringFlag(flags, "hostname"));
   const config: SwitchboardProjectConfig = {
     project: projectName,
     context: stringFlag(flags, "context") ?? switchboardContextEnv(),
-    endpoint: endpointHostname
-      ? {
-          id: stringFlag(flags, "endpoint-id") ?? endpointHostname,
-          hostname: endpointHostname
-        }
-      : undefined,
     acurast: {
       project: stringFlag(flags, "acurast-project") ?? projectName,
       network: stringFlag(flags, "acurast-network") ?? "mainnet",
@@ -1120,7 +1137,6 @@ async function projectInitCommand(flags: Map<string, string | boolean>) {
       entrypoint: stringFlag(flags, "entrypoint")
     },
     deploy: {
-      hostname: endpointHostname,
       durationMinutes: numberFlag(flags, "duration-minutes", "SWITCHBOARD_DEPLOY_DURATION_MINUTES", DEFAULT_DEPLOY_DURATION_MINUTES),
       scheduleBufferMinutes: numberFlag(
         flags,
@@ -1156,9 +1172,6 @@ async function projectInitCommand(flags: Map<string, string | boolean>) {
     if (config.context) {
       console.log(`Context: ${config.context}`);
     }
-    if (endpointHostname) {
-      console.log(`Endpoint: ${endpointHostname}`);
-    }
   });
 }
 
@@ -1172,17 +1185,10 @@ async function projectInitSshTemplateCommand(
   }
 
   const projectName = stringFlag(flags, "project") ?? stringFlag(flags, "name") ?? path.basename(options.cwd);
-  const endpointHostname = normalizeHostnameForCli(stringFlag(flags, "endpoint") ?? stringFlag(flags, "hostname"));
   const authorizedKeysSource = stringFlag(flags, "ssh-public-key-file");
   const config: SwitchboardProjectConfig = {
     project: projectName,
     context: stringFlag(flags, "context") ?? switchboardContextEnv(),
-    endpoint: endpointHostname
-      ? {
-          id: stringFlag(flags, "endpoint-id") ?? endpointHostname,
-          hostname: endpointHostname
-        }
-      : undefined,
     acurast: {
       project: stringFlag(flags, "acurast-project") ?? projectName,
       network: stringFlag(flags, "acurast-network") ?? "mainnet",
@@ -1207,7 +1213,6 @@ async function projectInitSshTemplateCommand(
       user: "root"
     },
     deploy: {
-      hostname: endpointHostname,
       durationMinutes: numberFlag(flags, "duration-minutes", "SWITCHBOARD_DEPLOY_DURATION_MINUTES", DEFAULT_DEPLOY_DURATION_MINUTES),
       scheduleBufferMinutes: numberFlag(
         flags,
@@ -2415,7 +2420,7 @@ async function projectShowCommand(flags: Map<string, string | boolean>, runtime:
     console.log(`Config: ${runtime.projectConfigPath}`);
     console.log(`Project: ${runtime.projectConfig?.project ?? "unknown"}`);
     console.log(`Context: ${runtime.contextName ?? runtime.projectConfig?.context ?? "none"}`);
-    const endpoint = runtime.projectConfig?.endpoint?.hostname ?? stringRecordField(runtime.projectState?.latestDeployment, "hostname");
+    const endpoint = stringRecordField(runtime.projectState?.latestDeployment, "hostname");
     if (endpoint) {
       console.log(`Endpoint: ${endpoint}`);
     }
@@ -2657,7 +2662,6 @@ async function preflightCommand(flags: Map<string, string | boolean>, runtime: C
       ? {
           root: runtime.projectRoot,
           name: runtime.projectConfig.project,
-          endpoint: runtime.projectConfig.endpoint,
           latestReport: runtime.projectState?.latestReport
         }
       : undefined,
@@ -4734,6 +4738,11 @@ export interface HostnameStatusAdapters {
   readinessChecks?: (input: HostnameStatusReadinessInput) => Promise<Record<string, any>> | Record<string, any>;
 }
 
+export interface HostnameMutationAdapters {
+  fetchImpl?: typeof fetch;
+  dnsProviderHint?: (customerHostname: string) => Promise<Record<string, any>> | Record<string, any>;
+}
+
 export interface DeployDoctorProbeInput {
   hostname: string;
   port: number;
@@ -4821,6 +4830,24 @@ export async function runSwitchboardProjectShow(
   await projectShowCommand(flags, runtime);
 }
 
+export async function runSwitchboardProjectInit(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "init" || (argv[0] === "project" && argv[1] === "init")
+    ? [...argv]
+    : ["init", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "project-init") {
+    throw new Error(`runSwitchboardProjectInit expected init args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await projectInitCommand(flags);
+}
+
 export async function runSwitchboardPreflight(
   argv: readonly string[] = process.argv.slice(2),
   runtimeOverride?: CliRuntime
@@ -4851,6 +4878,541 @@ export async function runSwitchboardDeploymentStatus(
   assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
   const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
   await deploymentStatusCommand(flags);
+}
+
+export async function runSwitchboardSessionStatus(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "session" && argv[1] === "status" ? [...argv] : ["session", "status", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "session-status") {
+    throw new Error(`runSwitchboardSessionStatus expected session status args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await statusCommand(flags);
+}
+
+export async function runSwitchboardSessionRegister(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "session" && argv[1] === "register" ? [...argv] : ["session", "register", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "session-register") {
+    throw new Error(`runSwitchboardSessionRegister expected session register args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await relayRegistrationCommand(flags);
+}
+
+export async function runSwitchboardValidatorScript(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "validator" && argv[1] === "script" ? [...argv] : ["validator", "script", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "validator-script") {
+    throw new Error(`runSwitchboardValidatorScript expected validator script args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await validatorScriptCommand(flags);
+}
+
+export async function runSwitchboardCatalogInspect(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "catalog" && argv[1] === "inspect" ? [...argv] : ["catalog", "inspect", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "catalog-inspect") {
+    throw new Error(`runSwitchboardCatalogInspect expected catalog inspect args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runCatalogInspect({ flags, positionals: parsed.positionals });
+}
+
+export async function runSwitchboardCatalogBuild(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "catalog" && argv[1] === "build" ? [...argv] : ["catalog", "build", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "catalog-build") {
+    throw new Error(`runSwitchboardCatalogBuild expected catalog build args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runCatalogBuild({ flags, positionals: parsed.positionals });
+}
+
+export async function runSwitchboardCatalogSetState(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "catalog" && argv[1] === "set-state" ? [...argv] : ["catalog", "set-state", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "catalog-set-state") {
+    throw new Error(`runSwitchboardCatalogSetState expected catalog set-state args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runCatalogSetState({ flags, positionals: parsed.positionals });
+}
+
+export async function runSwitchboardCatalogVerify(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "catalog" && argv[1] === "verify" ? [...argv] : ["catalog", "verify", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "catalog-verify") {
+    throw new Error(`runSwitchboardCatalogVerify expected catalog verify args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runCatalogVerify({ flags, positionals: parsed.positionals });
+}
+
+type RelayCatalogBuildRunnerOptions = Pick<RunRelayCatalogBuildOptions, "cwd" | "env" | "io">;
+
+export async function runSwitchboardRelayCatalogBuild(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  catalogOptions: RelayCatalogBuildRunnerOptions = {}
+): Promise<void> {
+  const normalized =
+    argv[0] === "relay" && argv[1] === "catalog"
+      ? [...argv]
+      : ["relay", "catalog", "build", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-catalog-build") {
+    throw new Error(`runSwitchboardRelayCatalogBuild expected relay catalog build args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayCatalogBuild({ flags, positionals: parsed.positionals, ...catalogOptions });
+}
+
+type RelayCatalogSetStateRunnerOptions = Pick<RunRelayCatalogSetStateOptions, "cwd" | "env" | "io" | "build">;
+
+export async function runSwitchboardRelayCatalogSetState(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  catalogOptions: RelayCatalogSetStateRunnerOptions = {}
+): Promise<void> {
+  const normalized =
+    argv[0] === "relay" && argv[1] === "catalog"
+      ? [...argv]
+      : ["relay", "catalog", "set-state", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-catalog-set-state") {
+    throw new Error(`runSwitchboardRelayCatalogSetState expected relay catalog set-state args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayCatalogSetState({ flags, positionals: parsed.positionals, ...catalogOptions });
+}
+
+type RelaySyncRunnerOptions = Pick<RunRelaySyncOptions, "cwd" | "env" | "io" | "fetchImpl">;
+
+export async function runSwitchboardRelaySync(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  syncOptions: RelaySyncRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "sync" ? [...argv] : ["relay", "sync", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-sync") {
+    throw new Error(`runSwitchboardRelaySync expected relay sync args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelaySync({
+    flags: withDiscoveryDefaults(flags, syncOptions.env),
+    positionals: parsed.positionals,
+    ...syncOptions
+  });
+}
+
+export async function runSwitchboardRelayStatus(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "status" ? [...argv] : ["relay", "status", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-status") {
+    throw new Error(`runSwitchboardRelayStatus expected relay status args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayStatus({ flags, positionals: parsed.positionals });
+}
+
+export async function runSwitchboardRelayList(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized =
+    argv[0] === "relay" && (argv[1] === "list" || argv[1] === "ls")
+      ? [...argv]
+      : ["relay", "list", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-list") {
+    throw new Error(`runSwitchboardRelayList expected relay list args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayList({ flags: withDiscoveryDefaults(flags), positionals: parsed.positionals });
+}
+
+export async function runSwitchboardRelayDiff(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "diff" ? [...argv] : ["relay", "diff", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-diff") {
+    throw new Error(`runSwitchboardRelayDiff expected relay diff args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayDiff({ flags: withDiscoveryDefaults(flags), positionals: parsed.positionals });
+}
+
+type RelayKeygenRunnerOptions = Pick<RunRelayKeygenOptions, "io" | "createWallet">;
+
+export async function runSwitchboardRelayKeygen(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  keygenOptions: RelayKeygenRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "keygen" ? [...argv] : ["relay", "keygen", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-keygen") {
+    throw new Error(`runSwitchboardRelayKeygen expected relay keygen args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayKeygen({ flags, positionals: parsed.positionals, ...keygenOptions });
+}
+
+type RelayScaffoldRunnerOptions = Pick<RunRelayScaffoldOptions, "cwd" | "env" | "io" | "createWallet">;
+
+export async function runSwitchboardRelayScaffold(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  scaffoldOptions: RelayScaffoldRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "scaffold"
+    ? [...argv]
+    : ["relay", "scaffold", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-scaffold") {
+    throw new Error(`runSwitchboardRelayScaffold expected relay scaffold args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayScaffold({ flags, positionals: parsed.positionals, ...scaffoldOptions });
+}
+
+type RelayPickProcessorRunnerOptions = Pick<RunRelayPickProcessorOptions, "cwd" | "io" | "discover">;
+
+export async function runSwitchboardRelayPickProcessor(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  pickOptions: RelayPickProcessorRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "pick-processor"
+    ? [...argv]
+    : ["relay", "pick-processor", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-pick-processor") {
+    throw new Error(`runSwitchboardRelayPickProcessor expected relay pick-processor args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayPickProcessor({ flags, positionals: parsed.positionals, ...pickOptions });
+}
+
+export async function runSwitchboardRelayDeployments(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "deployments"
+    ? [...argv]
+    : ["relay", "deployments", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-deployments") {
+    throw new Error(`runSwitchboardRelayDeployments expected relay deployments args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayDeployments({ flags, positionals: parsed.positionals });
+}
+
+export async function runSwitchboardRelayLogs(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "logs" ? [...argv] : ["relay", "logs", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-logs") {
+    throw new Error(`runSwitchboardRelayLogs expected relay logs args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayLogs({ flags, positionals: parsed.positionals });
+}
+
+type RelayWatchRunnerOptions = Pick<RunRelayWatchOptions, "cwd" | "io" | "fetchImpl" | "sleep" | "now">;
+
+export async function runSwitchboardRelayWatch(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  watchOptions: RelayWatchRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "watch" ? [...argv] : ["relay", "watch", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-watch") {
+    throw new Error(`runSwitchboardRelayWatch expected relay watch args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayWatch({ flags, positionals: parsed.positionals, ...watchOptions });
+}
+
+export async function runSwitchboardRelayVerify(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "verify" ? [...argv] : ["relay", "verify", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-verify") {
+    throw new Error(`runSwitchboardRelayVerify expected relay verify args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  const result = await runRelayVerify({ flags: withDiscoveryDefaults(flags), positionals: parsed.positionals });
+  if (!result.ok) {
+    throw new Error(`relay verify ${result.relayId}: ${result.checks.filter((check) => !check.ok).length} check(s) failed`);
+  }
+}
+
+type RelayDnsRunnerOptions = Pick<RelayDnsSubcommandArgs, "cwd" | "env" | "io" | "validateCnameTarget">;
+
+export async function runSwitchboardRelayDnsPlan(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  dnsOptions: RelayDnsRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "dns" ? [...argv] : ["relay", "dns", "plan", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-dns" || parsed.positionals[2] !== "plan") {
+    throw new Error(`runSwitchboardRelayDnsPlan expected relay dns plan args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayDnsSubcommand({ flags, positionals: parsed.positionals, ...dnsOptions });
+}
+
+export async function runSwitchboardRelayDnsVerify(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  dnsOptions: RelayDnsRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "dns" ? [...argv] : ["relay", "dns", "verify", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-dns" || parsed.positionals[2] !== "verify") {
+    throw new Error(`runSwitchboardRelayDnsVerify expected relay dns verify args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayDnsSubcommand({ flags, positionals: parsed.positionals, ...dnsOptions });
+}
+
+export async function runSwitchboardRelayBudget(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "budget" ? [...argv] : ["relay", "budget", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-budget") {
+    throw new Error(`runSwitchboardRelayBudget expected relay budget args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayBudget({ flags, positionals: parsed.positionals });
+}
+
+type RelayLifecycleRunnerOptions = Pick<RelayLifecycleArgs, "cwd" | "env" | "io" | "spawnPnpm">;
+
+export async function runSwitchboardRelayInspect(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  lifecycleOptions: RelayLifecycleRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "inspect"
+    ? [...argv]
+    : ["relay", "inspect", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-inspect") {
+    throw new Error(`runSwitchboardRelayInspect expected relay inspect args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayInspect({ flags, positionals: parsed.positionals, ...lifecycleOptions });
+}
+
+export async function runSwitchboardRelayDeploymentStatus(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  lifecycleOptions: RelayLifecycleRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "deployment-status"
+    ? [...argv]
+    : ["relay", "deployment-status", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-deployment-status") {
+    throw new Error(`runSwitchboardRelayDeploymentStatus expected relay deployment-status args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayDeploymentStatus({ flags, positionals: parsed.positionals, ...lifecycleOptions });
+}
+
+export async function runSwitchboardRelayWhoami(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "whoami" ? [...argv] : ["relay", "whoami", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-whoami") {
+    throw new Error(`runSwitchboardRelayWhoami expected relay whoami args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayWhoami({ flags, positionals: parsed.positionals });
+}
+
+export async function runSwitchboardGatewaySetup(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "gateway" && argv[1] === "setup" ? [...argv] : ["gateway", "setup", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "gateway-setup") {
+    throw new Error(`runSwitchboardGatewaySetup expected gateway setup args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runOperatorSetup(flags);
+}
+
+export async function runSwitchboardGatewayDiscover(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "gateway" && argv[1] === "discover" ? [...argv] : ["gateway", "discover", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "gateway-discover") {
+    throw new Error(`runSwitchboardGatewayDiscover expected gateway discover args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runOperatorDiscover(flags);
+}
+
+export async function runSwitchboardGatewayStatus(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "gateway" && argv[1] === "status" ? [...argv] : ["gateway", "status", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "gateway-status") {
+    throw new Error(`runSwitchboardGatewayStatus expected gateway status args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runOperatorStatus(flags);
+}
+
+export async function runSwitchboardGatewayUpgrade(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "gateway" && argv[1] === "upgrade" ? [...argv] : ["gateway", "upgrade", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "gateway-upgrade") {
+    throw new Error(`runSwitchboardGatewayUpgrade expected gateway upgrade args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runOperatorUpgrade(flags);
 }
 
 export async function runSwitchboardContextList(
@@ -4989,6 +5551,22 @@ export async function runSwitchboardClaimable(
   await claimCommand(flags, { readOnly: true });
 }
 
+export async function runSwitchboardClaim(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "claim" ? [...argv] : ["claim", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "claim") {
+    throw new Error(`runSwitchboardClaim expected claim args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await claimCommand(flags);
+}
+
 export async function runSwitchboardRefundable(
   argv: readonly string[] = process.argv.slice(2),
   runtimeOverride?: CliRuntime
@@ -5007,6 +5585,24 @@ export async function runSwitchboardRefundable(
   await refundCommand(flags, { readOnly: true });
 }
 
+export async function runSwitchboardRefund(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "refund" || (argv[0] === "session" && argv[1] === "refund")
+    ? [...argv]
+    : ["refund", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "session-refund") {
+    throw new Error(`runSwitchboardRefund expected refund args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await refundCommand(flags);
+}
+
 export async function runSwitchboardHostnameStatus(
   argv: readonly string[] = process.argv.slice(2),
   runtimeOverride?: CliRuntime,
@@ -5022,6 +5618,40 @@ export async function runSwitchboardHostnameStatus(
   assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
   const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
   await hostnameStatusCommand(flags, parsed.positionals, adapters);
+}
+
+export async function runSwitchboardHostnameAdd(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  adapters: HostnameMutationAdapters = {}
+): Promise<void> {
+  const normalized = argv[0] === "hostname" && argv[1] === "add" ? [...argv] : ["hostname", "add", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "hostname-attach") {
+    throw new Error(`runSwitchboardHostnameAdd expected hostname add args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await hostnameAttachCommand(flags, parsed.positionals, adapters);
+}
+
+export async function runSwitchboardHostnameRemove(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  adapters: HostnameMutationAdapters = {}
+): Promise<void> {
+  const normalized = argv[0] === "hostname" && argv[1] === "remove" ? [...argv] : ["hostname", "remove", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "hostname-remove") {
+    throw new Error(`runSwitchboardHostnameRemove expected hostname remove args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await hostnameRemoveCommand(flags, parsed.positionals, adapters);
 }
 
 export async function runSwitchboardDeployStatus(
@@ -7735,7 +8365,11 @@ async function deploymentStatusCommand(flags: Map<string, string | boolean>) {
   writeOutput(flags, output, () => printDeploymentStatus(output));
 }
 
-async function hostnameAttachCommand(flags: Map<string, string | boolean>, positionals: string[]) {
+async function hostnameAttachCommand(
+  flags: Map<string, string | boolean>,
+  positionals: string[],
+  adapters: HostnameMutationAdapters = {}
+) {
   const reportPath = deploymentReportPath(flags);
   const report = reportPath ? (JSON.parse(await readFile(reportPath, "utf8")) as Record<string, any>) : undefined;
   const manifestConfig = await resolveCliNetworkConfig(flags);
@@ -7783,7 +8417,9 @@ async function hostnameAttachCommand(flags: Map<string, string | boolean>, posit
     nonce,
     deadline
   });
-  const dnsProviderHint = lookupDnsProviderHintForCli(customerHostname);
+  const dnsProviderHint = adapters.dnsProviderHint
+    ? Promise.resolve(adapters.dnsProviderHint(customerHostname))
+    : lookupDnsProviderHintForCli(customerHostname);
   const signer = await resolveCustomerHostnameSigner(flags, manifestConfig, target, reportSessionDeveloper(report));
   try {
     const signature = await signCustomerHostnameAttachmentForCli(signer, chainId, registryAddress, attachment);
@@ -7796,11 +8432,18 @@ async function hostnameAttachCommand(flags: Map<string, string | boolean>, posit
         cli: "switchboard hostname add",
         reportPath
       }
-    });
+    }, adapters.fetchImpl);
     const waitSeconds = numberFlag(flags, "wait-seconds", "PROOF_CUSTOMER_HOSTNAME_WAIT_SECONDS", boolFlag(flags, "wait") ? 300 : 0);
     const output =
       waitSeconds > 0
-        ? await waitForCustomerHostname(relayUrl, endpointId, customerHostname, waitSeconds, numberFlag(flags, "poll-seconds", "PROOF_CUSTOMER_HOSTNAME_POLL_SECONDS", 10))
+        ? await waitForCustomerHostname(
+            relayUrl,
+            endpointId,
+            customerHostname,
+            waitSeconds,
+            numberFlag(flags, "poll-seconds", "PROOF_CUSTOMER_HOSTNAME_POLL_SECONDS", 10),
+            adapters.fetchImpl
+          )
         : response;
     const enrichedOutput = {
       ...output,
@@ -7814,7 +8457,11 @@ async function hostnameAttachCommand(flags: Map<string, string | boolean>, posit
   }
 }
 
-async function hostnameRemoveCommand(flags: Map<string, string | boolean>, positionals: string[]) {
+async function hostnameRemoveCommand(
+  flags: Map<string, string | boolean>,
+  positionals: string[],
+  adapters: HostnameMutationAdapters = {}
+) {
   const reportPath = deploymentReportPath(flags);
   const report = reportPath ? (JSON.parse(await readFile(reportPath, "utf8")) as Record<string, any>) : undefined;
   const manifestConfig = await resolveCliNetworkConfig(flags);
@@ -7870,7 +8517,7 @@ async function hostnameRemoveCommand(flags: Map<string, string | boolean>, posit
         cli: "switchboard hostname remove",
         reportPath
       }
-    });
+    }, adapters.fetchImpl);
 
     writeOutput(flags, { ...output, signer: signerOutput(signer) }, () => printCustomerHostnameRemovalResult(output));
   } finally {
@@ -9293,10 +9940,11 @@ function deploymentIntentDnsMaterialization(
 async function postCustomerHostnameAttachment(
   relayUrl: string,
   endpointId: string,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  fetchImpl: typeof fetch = fetch
 ): Promise<Record<string, any>> {
   const url = new URL(`/v1/endpoints/${encodeURIComponent(endpointId)}/customer-hostnames`, relayUrl);
-  const response = await fetch(url, {
+  const response = await fetchImpl(url, {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -9341,13 +9989,14 @@ async function deleteCustomerHostnameAttachment(
   relayUrl: string,
   endpointId: string,
   customerHostname: string,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  fetchImpl: typeof fetch = fetch
 ): Promise<Record<string, any>> {
   const url = new URL(
     `/v1/endpoints/${encodeURIComponent(endpointId)}/customer-hostnames/${encodeURIComponent(customerHostname)}`,
     relayUrl
   );
-  const response = await fetch(url, {
+  const response = await fetchImpl(url, {
     method: "DELETE",
     headers: {
       "content-type": "application/json"
@@ -10303,13 +10952,16 @@ function deploymentReportPath(flags: Map<string, string | boolean>): string | un
  * value (set explicitly or by context) → env → production constants.
  * Used by relay/catalog admin commands that need discovery defaults.
  */
-function withDiscoveryDefaults(flags: Map<string, string | boolean>): Map<string, string | boolean> {
+function withDiscoveryDefaults(
+  flags: Map<string, string | boolean>,
+  env: NodeJS.ProcessEnv = process.env
+): Map<string, string | boolean> {
   const next = new Map(flags);
   if (!next.has("manifest-url")) {
-    next.set("manifest-url", optionalEnv("PROOF_NETWORK_MANIFEST_URL") ?? PROOF_NETWORK_MANIFEST_URL);
+    next.set("manifest-url", optionalEnvFrom(env, "PROOF_NETWORK_MANIFEST_URL") ?? PROOF_NETWORK_MANIFEST_URL);
   }
-  if (!next.has("manifest-signer")) {
-    next.set("manifest-signer", optionalEnv("PROOF_NETWORK_MANIFEST_SIGNER") ?? PROOF_NETWORK_MANIFEST_SIGNER);
+  if (!next.has("manifest-signer") && !boolFlag(next, "allow-unpinned-signer")) {
+    next.set("manifest-signer", optionalEnvFrom(env, "PROOF_NETWORK_MANIFEST_SIGNER") ?? PROOF_NETWORK_MANIFEST_SIGNER);
   }
   return next;
 }
@@ -10628,8 +11280,8 @@ function commandLoadsOpsProfile(command: CommandName | undefined): boolean {
   return (
     command === "ops" ||
     command === "bootstrap" ||
-    command === "operator-setup" ||
-    command === "operator-discover" ||
+    command === "gateway-setup" ||
+    command === "gateway-discover" ||
     command === "catalog-build" ||
     command === "catalog-inspect" ||
     command === "catalog-verify" ||
@@ -10643,8 +11295,8 @@ function commandLoadsContextSecrets(command: CommandName | undefined): boolean {
   return !(
     command === "ops" ||
     command === "bootstrap" ||
-    command === "operator-setup" ||
-    command === "operator-discover" ||
+    command === "gateway-setup" ||
+    command === "gateway-discover" ||
     command === "catalog-build" ||
     command === "catalog-inspect" ||
     command === "catalog-verify" ||
@@ -10699,9 +11351,6 @@ function applyRuntimeDefaults(
   const deploy = project?.deploy;
   const useProjectDeployDefaults = command === "deploy" || command === "deployment-status";
   setString("context", runtime.contextName);
-  setString("endpoint", project?.endpoint?.hostname);
-  setString("endpoint-hostname", project?.endpoint?.hostname);
-  setString("endpoint-id", project?.endpoint?.id);
   if (useProjectDeployDefaults) {
     setString("duration-minutes", deploy?.durationMinutes);
     setString("schedule-buffer-minutes", deploy?.scheduleBufferMinutes);
@@ -11182,17 +11831,17 @@ function normalizeCommand(positionals: string[]): CommandName {
   if (positionals.length >= 2 && positionals[0] === "hostname" && positionals[1] === "status") {
     return "hostname-status";
   }
-  if (positionals.length === 2 && positionals[0] === "operator" && positionals[1] === "discover") {
-    return "operator-discover";
+  if (positionals.length === 2 && positionals[0] === "gateway" && positionals[1] === "discover") {
+    return "gateway-discover";
   }
-  if (positionals.length === 2 && positionals[0] === "operator" && positionals[1] === "status") {
-    return "operator-status";
+  if (positionals.length === 2 && positionals[0] === "gateway" && positionals[1] === "status") {
+    return "gateway-status";
   }
-  if (positionals.length === 2 && positionals[0] === "operator" && positionals[1] === "upgrade") {
-    return "operator-upgrade";
+  if (positionals.length === 2 && positionals[0] === "gateway" && positionals[1] === "upgrade") {
+    return "gateway-upgrade";
   }
-  if (positionals.length === 2 && positionals[0] === "operator" && positionals[1] === "setup") {
-    return "operator-setup";
+  if (positionals.length === 2 && positionals[0] === "gateway" && positionals[1] === "setup") {
+    return "gateway-setup";
   }
   if (positionals.length === 2 && positionals[0] === "validator" && positionals[1] === "launch") {
     return "validator-launch";
@@ -11306,6 +11955,11 @@ export function stringFlag(flags: Map<string, string | boolean>, name: string): 
 
 export function optionalEnv(name: string): string | undefined {
   const value = process.env[name];
+  return value && value.length > 0 ? value : undefined;
+}
+
+function optionalEnvFrom(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const value = env[name];
   return value && value.length > 0 ? value : undefined;
 }
 
@@ -11454,14 +12108,10 @@ Public beta deployer commands:
   context add [name]
           Interactive wizard for developer/payment context setup.
           Pass --no-balance-check to skip network calls.
-  context dns set cloudflare --token-env <NAME>
-          Attach a DNS provider API token by env-var name.
-  context dns clear [provider]
-          Detach a DNS provider from the context.
   context list | context current | context use <name> | context set <name>
-          Manage named developer/payment/beta-access contexts.
+          Manage named developer/payment contexts.
   preflight
-          Check manifest, RPCs, credentials, payment, DNS, and deploy readiness.
+          Check manifest, RPCs, credentials, payment, and deploy readiness.
   launch-demo
           Launch the bundled demo on current live operator capacity.
   deploy
@@ -11488,14 +12138,14 @@ Public beta deployer commands:
           Remove a customer CNAME from an endpoint and gateway route.
   hostname status <hostname>
           Check customer CNAME validation and certificate authorization status.
-  operator setup
-          Prepare host Docker/Compose config and launch an operator stack.
-  operator discover
-          Check manager-scoped operator readiness and suggest env config.
-  operator status
+  gateway setup
+          Prepare host Docker/Compose config and launch a gateway stack.
+  gateway discover
+          Check manager-scoped gateway readiness and suggest env config.
+  gateway status
           Show local compose, gateway-agent, and relay capability registration state.
-  operator upgrade
-          Pull current operator images and recreate the Docker Compose stack.
+  gateway upgrade
+          Pull current gateway images and recreate the Docker Compose stack.
 ${advancedCommands}
 Common flags:
   --project-dir <path>             Project directory, defaults to current directory/ancestor
@@ -11520,7 +12170,7 @@ Common flags:
   --session-id <bytes32>           Explicit derived session ID
   --session-salt <bytes32>         Explicit session salt for deterministic ID derivation
   --job-id <bytes32>               Explicit job ID
-  --operator-id <bytes32>          Explicit operator ID
+  --operator-id <bytes32>          Optional capacity pin; normal deploys auto-select
   --processor-id <bytes32>         Explicit processor ID
   --endpoint-hostname <hostname>   Hostname bound into endpointHash
   --json                           Machine-readable output
@@ -11553,7 +12203,7 @@ ${advanced ? "  switchboard session refund --session-id <bytes32> --yes\n" : ""}
   --no-map-account                 Do not submit revive.mapAccount first
 
 Project config:
-  switchboard init --project <name> --endpoint <hostname> --context <name>
+  switchboard init --project <name> --context <name>
   switchboard init --template ssh --distro ubuntu --project-dir ./switchboard-ssh-demo
   switchboard project show
   Directory-local config is stored in switchboard.json. Deployment state,
@@ -11588,9 +12238,15 @@ Contexts:
   --ledger-chain <chain>           Ledger chain key, default polkadot or statemint legacy
   --ledger-slip44 <n>              Generic Ledger slip44, default 354
   --developer-private-key-env <env> Env var containing the EVM developer key
-  --cloudflare-api-token-env <env> Env var containing DNS authority token
+  --cloudflare-api-token-env <env> PROOF/internal DNS provider token env name
 
-${advanced ? `Ops profiles:
+${advanced ? `PROOF DNS context commands:
+  switchboard context dns set cloudflare --token-env <NAME>
+  switchboard context dns clear [provider]
+  Support/admin commands for PROOF-managed DNS authority. Normal app deploys
+  and customer-domain setup do not require DNS provider tokens.
+
+Ops profiles:
   switchboard ops init mainnet --domain switchboard.proof.computer
   switchboard ops show mainnet
   switchboard ops paths mainnet --context mainnet
@@ -11628,8 +12284,8 @@ Customer hostnames:
   --check-timeout-ms <n>           HTTPS readiness timeout, default 10000
   --skip-readiness-checks          Only show relay DNS/certificate authorization state
 
-Operator setup:
-  switchboard operator setup --manager-address <address> --manager-id <id>
+Gateway setup:
+  switchboard gateway setup --manager-address <address> --manager-id <id>
   --management-address <address>   Alias for --manager-address
   --public-address <ip-or-host>    Default fetched with curl --ipv4 https://ifconfig.me/ip
   --processor-file <path>          Read processor include list from JSON, CSV, or newline text
@@ -11642,14 +12298,17 @@ Operator setup:
   --image-tag <tag>                Default latest
   --skip-install                   Do not install Docker/Compose if missing
   --skip-compose                   Write config but do not launch compose
+  --gateway-agent-port <port>      Gateway-agent API port, default 18080
+  --upstream-admission-url <url>   URL relays should use for gateway upstream admission
   --route-state-url <url>          Default control-plane route-state polling URL when OPERATOR_ID is known
   --route-state-token-env <env>    Env var containing route-state bearer token
+  --route-intent-token-env <env>   Env var containing gateway route-intent bearer token
   --local-build                    Build local repo images instead of pulling prebuilt images
   --local-only                     Allow lab setup without relay admission/reporting material
   --dry-run                        Print checks and planned actions only
 
-Operator discover:
-  switchboard operator discover --manager-id <id> --public-address <ip-or-host>
+Gateway discover:
+  switchboard gateway discover --manager-id <id> --public-address <ip-or-host>
   --gateway-agent-url <url>        Default http://127.0.0.1:18080
   --available                      Check Acurast schedule conflicts; enabled by default
   --skip-availability              Skip existing-job/schedule conflict checks
@@ -11659,11 +12318,11 @@ Operator discover:
   --ready-ttl-ms <ms>              Recent-ready TTL for cached readiness
   --recent-check-ttl-ms <ms>       Recent-check TTL for --limit
   --no-state                       Do not read or write discovery state
-  --write-env <path>               Write suggested operator env values
+  --write-env <path>               Write suggested gateway env values
 
-Operator status and upgrade:
-  switchboard operator status
-  switchboard operator upgrade --yes
+Gateway status and upgrade:
+  switchboard gateway status
+  switchboard gateway upgrade --yes
   --project-dir <path>             Operator project directory
   --compose-file <path[,path...]>  Compose file(s), default docker-compose.yaml
   --env-file <path>                Env file, default .operator-host/operator.env

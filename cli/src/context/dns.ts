@@ -20,7 +20,7 @@ export async function contextDnsSetCommand(
   const provider = positionals[3];
   if (!provider) {
     throw new Error(
-      "Missing DNS provider. Use `switchboard context dns set cloudflare --token-env CLOUDFLARE_API_TOKEN`."
+      "Missing DNS provider. PROOF DNS authority is a support/admin path; if instructed, use `switchboard context dns set cloudflare --token-env <NAME>`."
     );
   }
   if (!SUPPORTED_PROVIDERS.has(provider)) {
