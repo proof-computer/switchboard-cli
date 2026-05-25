@@ -667,6 +667,51 @@ describe("switchboard launch-demo workflow shell", () => {
     });
   });
 
+  it("rejects stale launch-demo runtime packages before a paid install or deployment", async () => {
+    const operatorId = hex32("aa");
+    const processorId = hex32("11");
+    const report = launchDemoCapacityReport({ operatorId, gatewayId: "gateway-demo-stale-package", processorId, routeStateAvailable: true });
+
+    await withControlPlane([report], async ({ baseUrl, manifestSigner, createIntentRequests }) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "switchboard-launch-demo-stale-package-"));
+      try {
+        const result = await runCli(cwd, [
+          "launch-demo",
+          "--yes-spend",
+          "--json",
+          "--manifest-url",
+          `${baseUrl}/v1/network-manifest`,
+          "--manifest-signer",
+          manifestSigner,
+          "--relay-url",
+          baseUrl,
+          "--allow-local-relay",
+          "--demo-package",
+          "github:proof-computer/switchboard-express-demo#v0.1.8",
+          "--operator-id",
+          operatorId,
+          "--processor",
+          processorId,
+          "--quote-preview-timeout-ms",
+          "1000"
+        ]);
+
+        assert.equal(result.code, 1);
+        assert.doesNotMatch(result.stderr, /\[switchboard\]/);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.ok, false);
+        assert.equal(output.action, "launch-demo");
+        assert.equal(output.code, "SB_LAUNCH_DEMO_RUNTIME_STALE");
+        assert.match(output.error, /gateway upstream admission/);
+        assert.equal(output.demoProject.packageVersion, "0.1.8");
+        assert.equal(output.required.packageSpec, "github:proof-computer/switchboard-express-demo#v0.1.9");
+        assert.equal(createIntentRequests.length, 0);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("runs the single-replica compatibility runner from deploy_action_required and records the runner receipt", async () => {
     const operatorId = hex32("aa");
     const processorId = hex32("11");

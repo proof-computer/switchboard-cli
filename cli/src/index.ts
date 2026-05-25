@@ -159,7 +159,9 @@ const DEFAULT_LAUNCH_DEMO_DURATION_MINUTES = 10;
 const DEFAULT_LAUNCH_DEMO_START_DELAY_MS = 180_000;
 const DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION = "40000000000";
 const DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS = 900;
-const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.8";
+const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.9";
+const MIN_GATEWAY_UPSTREAM_ADMISSION_DEMO_VERSION = "0.1.9";
+const MIN_GATEWAY_UPSTREAM_ADMISSION_SDK_VERSION = "0.1.3";
 const LAUNCH_DEMO_ENTRYPOINT = "src/server.ts";
 const SSH_TEMPLATE_NAME = "ssh";
 const SSH_TEMPLATE_DISTRO = "ubuntu";
@@ -2747,6 +2749,7 @@ interface LaunchDemoProject {
   dir: string;
   entrypoint: string;
   packageSpec: string;
+  packageName?: string;
   packageVersion?: string;
 }
 
@@ -2822,6 +2825,9 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
   }
   const demoProject = await createLaunchDemoProject(flags);
   launchDemoDebug("created demo project");
+  if (!boolFlag(flags, "dry-run")) {
+    assertLaunchDemoRuntimePackageFresh(demoProject, flags);
+  }
 
   const childArgs = [
     INTERNAL_DEPLOY_RUNNER_SCRIPT,
@@ -3052,7 +3058,7 @@ async function createLaunchDemoProject(flags: Map<string, string | boolean>): Pr
     stringFlag(flags, "demo-package") ??
     optionalEnv("SWITCHBOARD_LAUNCH_DEMO_PACKAGE_SPEC") ??
     DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC;
-  const packageVersion = await launchDemoPackageVersion(packageSpec);
+  const packageMetadata = await launchDemoPackageMetadata(packageSpec);
   const dir = await mkdtemp(path.join(tmpdir(), "switchboard-launch-demo-"));
   await mkdir(path.join(dir, "src"), { recursive: true });
   await writeFile(
@@ -3090,22 +3096,102 @@ void startSwitchboardExpressDemo().catch((error) => {
 `
   );
   await writeFile(path.join(dir, ".gitignore"), "node_modules/\ndist/\n.acurast/\n.switchboard/\n.env\n.env.*\n");
-  return { dir, entrypoint: LAUNCH_DEMO_ENTRYPOINT, packageSpec, packageVersion };
+  return {
+    dir,
+    entrypoint: LAUNCH_DEMO_ENTRYPOINT,
+    packageSpec,
+    packageName: packageMetadata.name,
+    packageVersion: packageMetadata.version
+  };
 }
 
-async function launchDemoPackageVersion(packageSpec: string): Promise<string | undefined> {
+async function launchDemoPackageMetadata(packageSpec: string): Promise<{ name?: string; version?: string }> {
   if (packageSpec.startsWith("file:")) {
     const rawPath = packageSpec.slice("file:".length);
     const packageDir = rawPath.startsWith("/") ? rawPath : path.resolve(process.cwd(), rawPath);
     try {
-      const parsed = JSON.parse(await readFile(path.join(packageDir, "package.json"), "utf8")) as { version?: unknown };
-      return typeof parsed.version === "string" && parsed.version.length > 0 ? parsed.version : undefined;
+      const parsed = JSON.parse(await readFile(path.join(packageDir, "package.json"), "utf8")) as {
+        name?: unknown;
+        version?: unknown;
+      };
+      return {
+        name: typeof parsed.name === "string" && parsed.name.length > 0 ? parsed.name : undefined,
+        version: typeof parsed.version === "string" && parsed.version.length > 0 ? parsed.version : undefined
+      };
     } catch {
-      return undefined;
+      return {};
     }
   }
   const tag = packageSpec.match(/#v?([0-9]+(?:\.[0-9]+){1,2}(?:[-+][A-Za-z0-9.-]+)?)$/)?.[1];
-  return tag;
+  const npmVersion = packageSpec.match(/@([0-9]+(?:\.[0-9]+){1,2}(?:[-+][A-Za-z0-9.-]+)?)$/)?.[1];
+  const knownDemoPackage = /(^|[/@:])switchboard-express-demo($|[#@?])/.test(packageSpec);
+  return {
+    name: knownDemoPackage ? "@proofcomputer/switchboard-express-demo" : undefined,
+    version: tag ?? npmVersion
+  };
+}
+
+function assertLaunchDemoRuntimePackageFresh(project: LaunchDemoProject, flags: Map<string, string | boolean>): void {
+  if (!launchDemoPackageIsKnownExpressDemo(project) || !project.packageVersion) {
+    return;
+  }
+  const comparison = compareSemver(project.packageVersion, MIN_GATEWAY_UPSTREAM_ADMISSION_DEMO_VERSION);
+  if (comparison === undefined || comparison >= 0) {
+    return;
+  }
+
+  const error =
+    `SB_LAUNCH_DEMO_RUNTIME_STALE: launch-demo package ${project.packageSpec} resolves to ` +
+    `@proofcomputer/switchboard-express-demo v${project.packageVersion}, which cannot perform the gateway upstream admission required by current route activation. ` +
+    `Use ${DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC}, or publish a demo package built with @proofcomputer/switchboard-sdk >= ${MIN_GATEWAY_UPSTREAM_ADMISSION_SDK_VERSION}.`;
+  if (boolFlag(flags, "json")) {
+    const handled = new Error(error);
+    writeOutput(flags, {
+      ok: false,
+      action: "launch-demo",
+      code: "SB_LAUNCH_DEMO_RUNTIME_STALE",
+      error,
+      demoProject: project,
+      required: {
+        package: "@proofcomputer/switchboard-express-demo",
+        minVersion: MIN_GATEWAY_UPSTREAM_ADMISSION_DEMO_VERSION,
+        minSdkVersion: MIN_GATEWAY_UPSTREAM_ADMISSION_SDK_VERSION,
+        packageSpec: DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC
+      }
+    }, () => undefined);
+    markErrorOutputHandled(handled);
+    throw handled;
+  }
+  throw new Error(error);
+}
+
+function launchDemoPackageIsKnownExpressDemo(project: LaunchDemoProject): boolean {
+  return (
+    project.packageName === "@proofcomputer/switchboard-express-demo" ||
+    /(^|[/@:])switchboard-express-demo($|[#@?])/.test(project.packageSpec)
+  );
+}
+
+function compareSemver(left: string, right: string): number | undefined {
+  const leftParts = parseStableSemver(left);
+  const rightParts = parseStableSemver(right);
+  if (!leftParts || !rightParts) {
+    return undefined;
+  }
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) {
+      return leftParts[index] < rightParts[index] ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+function parseStableSemver(value: string): [number, number, number] | undefined {
+  const match = value.match(/^([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+].*)?$/);
+  if (!match) {
+    return undefined;
+  }
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
 
 async function installLaunchDemoProject(project: LaunchDemoProject, flags: Map<string, string | boolean>): Promise<void> {
