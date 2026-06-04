@@ -26,7 +26,12 @@ describe("launch-demo runner resolution", () => {
       );
 
       const runner = await resolveLaunchDemoEstimateRunner(
-        { ACURAST_ENTRYPOINT: "src/server.ts" },
+        {
+          ACURAST_ENTRYPOINT: "src/server.ts",
+          ACURAST_NETWORK: "mainnet",
+          ACURAST_MAINNET_SEED: "mainnet seed",
+          ACURAST_MAINNET_ADDRESS: "5MainnetAddress"
+        },
         { cwd: workDir, currentFile, workDir }
       );
 
@@ -37,6 +42,8 @@ describe("launch-demo runner resolution", () => {
       assert.equal(runner.env.SWITCHBOARD_INTERNAL_BIN_DIR, internalDir);
       assert.equal(runner.env.SWITCHBOARD_PACKAGED_ASSETS_DIR, assetsDir);
       assert.equal(runner.env.SWITCHBOARD_PREBUILT_JOB_BUNDLE, undefined);
+      assert.equal(runner.env.ACURAST_SEED, "mainnet seed");
+      assert.equal(runner.env.ACURAST_ADDRESS, "5MainnetAddress");
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(workDir, { recursive: true, force: true });
@@ -53,7 +60,12 @@ describe("launch-demo runner resolution", () => {
       );
 
       const runner = await resolveLaunchDemoEstimateRunner(
-        { ACURAST_ENTRYPOINT: "src/server.ts" },
+        {
+          ACURAST_ENTRYPOINT: "src/server.ts",
+          ACURAST_NETWORK: "canary",
+          ACURAST_CANARY_SEED: "canary seed",
+          ACURAST_CANARY_ADDRESS: "5CanaryAddress"
+        },
         { cwd: root, currentFile: path.join(root, "cli", "src", "index.ts"), workDir: "/tmp/demo-project" }
       );
 
@@ -62,6 +74,8 @@ describe("launch-demo runner resolution", () => {
       assert.equal(runner.cwd, root);
       assert.equal(runner.env.SWITCHBOARD_WORK_DIR, "/tmp/demo-project");
       assert.equal(runner.env.ACURAST_ENTRYPOINT, "src/server.ts");
+      assert.equal(runner.env.ACURAST_SEED, "canary seed");
+      assert.equal(runner.env.ACURAST_ADDRESS, "5CanaryAddress");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -78,7 +92,12 @@ describe("launch-demo runner resolution", () => {
 
       const runner = await resolveDeployRunner(
         ["switchboard:internal:deploy-runner", "--", "--yes", "--relay-url", "https://relay.test"],
-        { SWITCHBOARD_LAUNCH_DEMO: "true" },
+        {
+          SWITCHBOARD_LAUNCH_DEMO: "true",
+          ACURAST_NETWORK: "canary",
+          ACURAST_CANARY_SEED: "canary seed",
+          ACURAST_CANARY_ADDRESS: "5CanaryAddress"
+        },
         { currentFile: path.join(root, "cli", "src", "index.ts"), workDir: "/tmp/demo-project" }
       );
 
@@ -87,6 +106,8 @@ describe("launch-demo runner resolution", () => {
       assert.equal(runner.cwd, root);
       assert.equal(runner.env.SWITCHBOARD_WORK_DIR, "/tmp/demo-project");
       assert.equal(runner.env.SWITCHBOARD_LAUNCH_DEMO, "true");
+      assert.equal(runner.env.ACURAST_SEED, "canary seed");
+      assert.equal(runner.env.ACURAST_ADDRESS, "5CanaryAddress");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -108,7 +129,12 @@ describe("launch-demo runner resolution", () => {
 
       const runner = await resolveDeployRunner(
         ["switchboard:internal:deploy-runner", "--", "--yes", "--relay-url", "https://relay.test"],
-        { SWITCHBOARD_LAUNCH_DEMO: "true" },
+        {
+          SWITCHBOARD_LAUNCH_DEMO: "true",
+          ACURAST_NETWORK: "mainnet",
+          ACURAST_MAINNET_SEED: "mainnet seed",
+          ACURAST_MAINNET_ADDRESS: "5MainnetAddress"
+        },
         { currentFile, workDir }
       );
 
@@ -119,6 +145,8 @@ describe("launch-demo runner resolution", () => {
       assert.equal(runner.env.SWITCHBOARD_INTERNAL_BIN_DIR, internalDir);
       assert.equal(runner.env.SWITCHBOARD_PACKAGED_ASSETS_DIR, assetsDir);
       assert.equal(runner.env.SWITCHBOARD_LAUNCH_DEMO, "true");
+      assert.equal(runner.env.ACURAST_SEED, "mainnet seed");
+      assert.equal(runner.env.ACURAST_ADDRESS, "5MainnetAddress");
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(workDir, { recursive: true, force: true });

@@ -156,6 +156,7 @@ const DEFAULT_DEPLOY_DURATION_MINUTES = 60;
 const DEFAULT_DEPLOY_SCHEDULE_BUFFER_MINUTES = 10;
 const RUNTIME_DEFAULT_FLAG_PREFIX = "__runtime-default:";
 const DEFAULT_LAUNCH_DEMO_DURATION_MINUTES = 10;
+const DEFAULT_LAUNCH_DEMO_SCHEDULE_BUFFER_MINUTES = 0;
 const DEFAULT_LAUNCH_DEMO_START_DELAY_MS = 180_000;
 const DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION = "40000000000";
 const DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS = 900;
@@ -2791,11 +2792,12 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
   const paidSeconds = String(durationMinutes * 60);
   const requestedProcessorCount = launchDemoProcessorCount(flags);
   const minReadyProcessors = launchDemoMinReady(flags, requestedProcessorCount);
-  const scheduleBufferMinutes = DEFAULT_DEPLOY_SCHEDULE_BUFFER_MINUTES;
+  const scheduleBufferMinutes = DEFAULT_LAUNCH_DEMO_SCHEDULE_BUFFER_MINUTES;
   const maxCostPerExecution =
     stringFlag(flags, "max-cost-per-execution") ??
     optionalEnv("ACURAST_MAX_COST_PER_EXECUTION") ??
     DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION;
+  const privateAcurastEnv = acurastCliCredentialEnv(runtime, acurastNetwork);
   const selection = await selectLaunchDemoCapacity({
     relayUrl,
     relayUrls,
@@ -2878,6 +2880,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
     OPERATOR_ID: selection.operatorId,
     GATEWAY_ID: selection.gatewayId,
     ACURAST_MANAGER_ID: selection.managerId,
+    ACURAST_NETWORK: acurastNetwork,
     SWITCHBOARD_DEPLOY_PROCESSOR: selection.processor,
     SWITCHBOARD_DEPLOY_GATEWAY_ID: selection.gatewayId,
     SWITCHBOARD_DEPLOY_CAPABILITY_REPORT_ID: selection.reportId,
@@ -2986,6 +2989,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
   await installLaunchDemoProject(demoProject, flags);
   const estimate = await estimateLaunchDemoAcurastCost({
     runtime,
+    privateEnv: privateAcurastEnv,
     env: childEnv,
     workDir: demoProject.dir
   });
@@ -3010,6 +3014,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
         workflowStore,
         childArgs,
         childEnv,
+        privateEnv: privateAcurastEnv,
         runtime,
         action: "launch-demo",
         json: boolFlag(flags, "json"),
@@ -3020,6 +3025,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
         workflowStore,
         childArgs,
         childEnv,
+        privateEnv: privateAcurastEnv,
         runtime,
         action: "launch-demo",
         json: boolFlag(flags, "json"),
@@ -4157,13 +4163,15 @@ export function formatLaunchDemoQuotePreview(preview: LaunchDemoQuotePreview): s
 
 async function estimateLaunchDemoAcurastCost(input: {
   runtime: CliRuntime;
+  privateEnv?: Record<string, string | undefined>;
   env: Record<string, string | undefined>;
   workDir: string;
 }): Promise<{ ok: true; summary?: string; output?: unknown } | { ok: false; error: string }> {
-  const env = {
+  const env = normalizeAcurastCliCredentialEnv({
     ...contextRuntimeEnv(input.runtime),
+    ...input.privateEnv,
     ...input.env
-  };
+  });
   let result: { stdout: string; stderr: string; exitCode: number };
   try {
     const estimateRunner = await resolveLaunchDemoEstimateRunner(env, { workDir: input.workDir });
@@ -4201,7 +4209,7 @@ export async function resolveLaunchDemoEstimateRunner(
       command: "pnpm",
       args: ["--silent", "acurast:estimate-express", "--", "--json"],
       env: {
-        ...env,
+        ...normalizeAcurastCliCredentialEnv(env),
         SWITCHBOARD_WORK_DIR: workDir
       },
       cwd: cliRoot
@@ -4222,13 +4230,43 @@ export async function resolveLaunchDemoEstimateRunner(
     command: process.execPath,
     args: [acurastExpress, "estimate-fee", "--json"],
     env: {
-      ...env,
+      ...normalizeAcurastCliCredentialEnv(env),
       SWITCHBOARD_WORK_DIR: workDir,
       SWITCHBOARD_INTERNAL_BIN_DIR: internalDir,
       SWITCHBOARD_PACKAGED_ASSETS_DIR: assetsDir,
       SWITCHBOARD_PREBUILT_JOB_BUNDLE: bundleName ? path.join(assetsDir, "jobs", bundleName, "bundle.cjs") : undefined
     }
   };
+}
+
+function normalizeAcurastCliCredentialEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const network = env.ACURAST_NETWORK === "canary" ? "canary" : "mainnet";
+  const seed = network === "canary"
+    ? env.ACURAST_CANARY_SEED ?? env.ACURAST_SEED
+    : env.ACURAST_MAINNET_SEED ?? env.ACURAST_SEED;
+  const address = network === "canary"
+    ? env.ACURAST_CANARY_ADDRESS ?? env.ACURAST_ADDRESS
+    : env.ACURAST_MAINNET_ADDRESS ?? env.ACURAST_ADDRESS;
+  return {
+    ...env,
+    ACURAST_SEED: seed,
+    ACURAST_ADDRESS: address,
+    ...(network === "canary"
+      ? { ACURAST_CANARY_SEED: seed, ACURAST_CANARY_ADDRESS: address }
+      : { ACURAST_MAINNET_SEED: seed, ACURAST_MAINNET_ADDRESS: address })
+  };
+}
+
+function acurastCliCredentialEnv(runtime: CliRuntime, network: AcurastNetwork): Record<string, string | undefined> {
+  const seedEnvName = network === "canary" ? "ACURAST_CANARY_SEED" : "ACURAST_MAINNET_SEED";
+  const addressEnvName = network === "canary" ? "ACURAST_CANARY_ADDRESS" : "ACURAST_MAINNET_ADDRESS";
+  return normalizeAcurastCliCredentialEnv({
+    ACURAST_NETWORK: network,
+    ACURAST_SEED: optionalEnv("ACURAST_SEED"),
+    ACURAST_ADDRESS: optionalEnv("ACURAST_ADDRESS"),
+    [seedEnvName]: contextEnv(runtime.context?.acurastSeedEnv) ?? optionalEnv(seedEnvName),
+    [addressEnvName]: contextEnv(runtime.context?.acurastAddressEnv) ?? optionalEnv(addressEnvName)
+  });
 }
 
 function packagedJobBundleName(_entrypoint: string | undefined): undefined {
@@ -7492,6 +7530,7 @@ async function runDeployWorkflowCompatibilityRunner(input: {
   workflowStore: ReturnType<typeof deployWorkflowStore> | undefined;
   childArgs: string[];
   childEnv: Record<string, string | undefined>;
+  privateEnv?: Record<string, string | undefined>;
   runtime: CliRuntime;
   action: "launch-demo" | "deploy";
   json: boolean;
@@ -7508,6 +7547,7 @@ async function runDeployWorkflowCompatibilityRunner(input: {
     env: {
       ...process.env,
       ...contextRuntimeEnv(input.runtime),
+      ...input.privateEnv,
       ...input.childEnv,
       SWITCHBOARD_DEPLOY_RUN_DIR: argValue(input.childArgs, "--run-dir"),
       SWITCHBOARD_DEPLOY_PRECREATED_INTENT_JSON: JSON.stringify(deployAction.payload)
@@ -7542,6 +7582,7 @@ async function runDeployWorkflowGroupRunner(input: {
   workflowStore: ReturnType<typeof deployWorkflowStore> | undefined;
   childArgs: string[];
   childEnv: Record<string, string | undefined>;
+  privateEnv?: Record<string, string | undefined>;
   runtime: CliRuntime;
   action: "launch-demo" | "deploy";
   json: boolean;
@@ -7555,6 +7596,7 @@ async function runDeployWorkflowGroupRunner(input: {
   const deployAction = requireDeployWorkflowAcurastAction(deployActionSnapshot);
   const deployRunner = await resolveDeployRunner(input.childArgs, {
     ...contextRuntimeEnv(input.runtime),
+    ...input.privateEnv,
     ...input.childEnv,
     SWITCHBOARD_DEPLOY_RUNNER_MODE: "acurast-group-submit-only",
     SWITCHBOARD_DEPLOY_PRECREATED_GROUP_JSON: JSON.stringify(deployAction.payload)
@@ -11187,6 +11229,7 @@ export async function resolveDeployRunner(
 ): Promise<{ command: string; args: string[]; env: Record<string, string | undefined>; cwd?: string }> {
   const workDir = path.resolve(context.workDir ?? process.cwd());
   const cliRoot = cliPackageRoot(context.currentFile);
+  const normalizedChildEnv = normalizeAcurastCliCredentialEnv(childEnv);
   const repoScript = (await repoScriptAvailable(INTERNAL_DEPLOY_RUNNER_SCRIPT, { cwd: cliRoot, currentFile: context.currentFile }))
     ? INTERNAL_DEPLOY_RUNNER_SCRIPT
     : undefined;
@@ -11195,7 +11238,7 @@ export async function resolveDeployRunner(
       command: "pnpm",
       args: ["--silent", repoScript, ...repoChildArgs.slice(1)],
       env: {
-        ...childEnv,
+        ...normalizedChildEnv,
         SWITCHBOARD_WORK_DIR: workDir
       },
       cwd: cliRoot
@@ -11217,7 +11260,7 @@ export async function resolveDeployRunner(
     command: process.execPath,
     args: [deployRunner, ...repoChildArgs.slice(2)],
     env: {
-      ...childEnv,
+      ...normalizedChildEnv,
       SWITCHBOARD_WORK_DIR: workDir,
       SWITCHBOARD_INTERNAL_BIN_DIR: internalDir,
       SWITCHBOARD_PACKAGED_ASSETS_DIR: assetsDir

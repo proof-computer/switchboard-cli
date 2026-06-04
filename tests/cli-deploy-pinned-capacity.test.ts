@@ -538,10 +538,16 @@ describe("switchboard launch-demo workflow shell", () => {
         assert.equal(output.selection.processorId, processorId);
         assert.equal(output.env.SWITCHBOARD_DEPLOY_GATEWAY_ID, "gateway-demo");
         assert.equal(output.env.SWITCHBOARD_DEPLOY_CAPABILITY_REPORT_ID, "report-gateway-demo");
+        assert.equal(output.durationMinutes, 10);
+        assert.equal(output.scheduleBufferMinutes, 0);
+        assert.equal(output.env.SWITCHBOARD_DEPLOY_SCHEDULE_BUFFER_MINUTES, "0");
+        assert.equal(output.env.ACURAST_EXECUTION_MS, "600000");
+        assert.equal("ACURAST_SEED" in output.env, false);
         assert.equal(output.demoProject.packageSpec, `file:${demoPackage}`);
         assert.equal(output.note, "No Acurast deployment, Hub transaction, DNS change, or route mutation was attempted.");
         assert.equal(output.workflow.input.capacity.gatewayId, "gateway-demo");
         assert.equal(output.workflow.input.capacity.processorId, processorId);
+        assert.equal(output.workflow.input.durationSeconds, 600);
         assert.equal(output.workflow.input.runtime.kind, "switchboard-express-demo");
         assert.equal(output.workflow.input.validatorMode, "skip");
         assert.equal(output.workflow.snapshot.step, "capacity_selected");
