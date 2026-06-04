@@ -2,9 +2,6 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { parseRelayDeploymentSpec, type RelayDeploymentSpec } from "../../../src/relay-deployment-spec.js";
-import { readLatestAcurastDeployState } from "../relay/acurast-deploy-state.js";
-import { parseDuration } from "../relay/duration.js";
-import { runRelayDeploy, type RelayCommandIo } from "../relay/index.js";
 import { probeRelay, summarizeRelayStatus, type RelayStatusResult } from "../relay/status.js";
 import {
   DEFAULT_SWITCHBOARD_OPS_PROFILE,
@@ -16,10 +13,12 @@ import { runBootstrapHostSubcommand } from "./host.js";
 
 const DEFAULT_BOOTSTRAP_RELAY_ID = "bootstrap-acurast";
 const BOOTSTRAP_STATE_FILE = "bootstrap-acurast.json";
-const DEFAULT_BOOTSTRAP_PORT = "3000";
-const DEFAULT_BOOTSTRAP_DURATION = "30m";
 
-export interface BootstrapCommandIo extends RelayCommandIo {}
+export interface BootstrapCommandIo {
+  log: (line: string) => void;
+  warn: (line: string) => void;
+  error: (line: string) => void;
+}
 
 const DEFAULT_IO: BootstrapCommandIo = {
   log: (line) => console.log(line),
@@ -35,7 +34,6 @@ export interface BootstrapAcurastArgs {
   io?: BootstrapCommandIo;
   fetchImpl?: typeof fetch;
   now?: () => Date;
-  relayDeploy?: typeof runRelayDeploy;
 }
 
 interface BootstrapAcurastState {
@@ -82,13 +80,8 @@ export async function runBootstrapAcurastSubcommand(args: BootstrapAcurastArgs):
     printBootstrapAcurastUsage(io);
     return;
   }
-  if (verb === "plan") {
-    await runPlan(args);
-    return;
-  }
-  if (verb === "deploy") {
-    await runDeploy(args);
-    return;
+  if (verb === "plan" || verb === "deploy") {
+    throw removedBootstrapAcurastDeployError(verb);
   }
   if (verb === "use") {
     await runUse(args);
@@ -133,10 +126,6 @@ function printBootstrapAcurastUsage(io: BootstrapCommandIo): void {
   io.log(`switchboard bootstrap acurast
 
 Commands:
-  bootstrap acurast plan [relay-id] [--spec-file <path>] [--duration 30m]
-      Print the temporary Acurast bootstrap deploy plan.
-  bootstrap acurast deploy [relay-id] [--spec-file <path>] --yes
-      Delegate to relay deploy and persist local bootstrap state.
   bootstrap acurast use --url <https-url>
       Record the temporary bootstrap endpoint under the ops profile.
   bootstrap acurast endpoint [--json]
@@ -156,85 +145,6 @@ Flags:
   --url <url>                   Temporary bootstrap endpoint URL.
   --allow-insecure-bootstrap    Allow non-local http:// endpoints.
 `);
-}
-
-async function runPlan(args: BootstrapAcurastArgs): Promise<void> {
-  const io = args.io ?? DEFAULT_IO;
-  validateBootstrapPort(args.flags);
-  const relayId = relayIdFromArgs(args);
-  const profile = profileFromArgs(args);
-  const stateFile = statePath(args, profile);
-  io.log("bootstrap acurast plan");
-  io.log(`  profile    : ${profile}`);
-  io.log(`  relay id   : ${relayId}`);
-  io.log(`  state file : ${stateFile}`);
-  io.log(`  transport  : direct Acurast IPv6 / explicit-port bootstrap`);
-  io.log(`  default port/duration: ${DEFAULT_BOOTSTRAP_PORT} / ${DEFAULT_BOOTSTRAP_DURATION}`);
-  io.log("");
-
-  const relayFlags = relayDeployFlags(args.flags, {
-    dryRun: true,
-    noCatalogDefault: true
-  });
-  await (args.relayDeploy ?? runRelayDeploy)({
-    flags: relayFlags,
-    positionals: ["relay", "deploy", relayId],
-    io,
-    skipReadinessPoll: true,
-    skipPeerCheck: true
-  });
-}
-
-async function runDeploy(args: BootstrapAcurastArgs): Promise<void> {
-  const io = args.io ?? DEFAULT_IO;
-  validateBootstrapPort(args.flags);
-  const relayId = relayIdFromArgs(args);
-  const profile = profileFromArgs(args);
-  const spec = await readRelaySpec(args, relayId);
-  if (spec.target !== "acurast") {
-    throw new Error(`bootstrap acurast deploy requires target=acurast; ${relayId} has target=${spec.target}`);
-  }
-
-  const relayFlags = relayDeployFlags(args.flags, {
-    dryRun: false,
-    noCatalogDefault: true
-  });
-  await (args.relayDeploy ?? runRelayDeploy)({
-    flags: relayFlags,
-    positionals: ["relay", "deploy", relayId],
-    io
-  });
-
-  const latest = spec.acurast?.stageDir
-    ? await readLatestAcurastDeployState(resolveStageDir(args, spec)).catch(() => undefined)
-    : undefined;
-  const endpointUrl = normalizeUrl(
-    stringFlag(args.flags, "url") ??
-      stringFlag(args.flags, "api-base-url") ??
-      spec.apiBaseUrl
-  );
-  assertBootstrapUrlSafe(endpointUrl, args.flags, true);
-  const now = (args.now ?? (() => new Date()))();
-  const state: BootstrapAcurastState = {
-    ...(await loadState(args, profile).catch(() => undefined)),
-    version: 1,
-    kind: "acurast-direct",
-    profile,
-    relayId,
-    endpointUrl,
-    deploymentId: latest?.deploymentId,
-    origin: latest?.origin,
-    ipfsHash: latest?.ipfsHash,
-    managerId: spec.acurast?.managerId,
-    processor: spec.acurast?.instantMatchProcessors[0],
-    stageDir: spec.acurast?.stageDir,
-    status: "active",
-    startedAt: now.toISOString(),
-    expiresAt: expiresAtFromSpec(args, spec, now),
-    updatedAt: now.toISOString()
-  };
-  await writeState(args, profile, state);
-  printStateSummary(io, state, statePath(args, profile));
 }
 
 async function runUse(args: BootstrapAcurastArgs): Promise<void> {
@@ -375,30 +285,6 @@ async function runPublish(args: BootstrapAcurastArgs, kind: "service-catalogs" |
   }
 }
 
-function relayDeployFlags(flags: Map<string, string | boolean>, options: { dryRun: boolean; noCatalogDefault: boolean }): Map<string, string | boolean> {
-  const next = new Map(flags);
-  next.set("target", "acurast");
-  if (options.dryRun) next.set("dry-run", true);
-  if (options.noCatalogDefault && !boolFlag(flags, "catalog")) {
-    next.set("no-catalog", true);
-  }
-  const endpointUrl = stringFlag(flags, "url");
-  if (endpointUrl && !stringFlag(next, "api-base-url")) {
-    next.set("api-base-url", endpointUrl);
-  }
-  if (!stringFlag(next, "duration")) {
-    next.set("duration", DEFAULT_BOOTSTRAP_DURATION);
-  }
-  return next;
-}
-
-function validateBootstrapPort(flags: Map<string, string | boolean>): void {
-  const port = stringFlag(flags, "port");
-  if (port && port !== DEFAULT_BOOTSTRAP_PORT) {
-    throw new Error(`bootstrap acurast currently supports only --port ${DEFAULT_BOOTSTRAP_PORT}; got ${port}`);
-  }
-}
-
 function relayIdFromArgs(args: BootstrapAcurastArgs): string {
   const relayId = stringFlag(args.flags, "relay-id") ?? args.positionals[3] ?? DEFAULT_BOOTSTRAP_RELAY_ID;
   if (!/^[a-z0-9-]+$/.test(relayId)) {
@@ -476,20 +362,6 @@ async function resolveEndpointUrl(
   throw new Error("No bootstrap endpoint found. Pass --url <url> or run `switchboard bootstrap acurast use --url <url>`.");
 }
 
-function resolveStageDir(args: BootstrapAcurastArgs, spec: RelayDeploymentSpec): string {
-  const cwd = args.cwd ?? process.cwd();
-  const stageDir = spec.acurast?.stageDir ?? "";
-  return path.isAbsolute(stageDir) ? stageDir : path.resolve(cwd, stageDir);
-}
-
-function expiresAtFromSpec(args: BootstrapAcurastArgs, spec: RelayDeploymentSpec, now: Date): string | undefined {
-  const rawDuration = stringFlag(args.flags, "duration");
-  const durationMs = rawDuration
-    ? parseDuration(rawDuration)
-    : spec.acurast?.executionMs;
-  return durationMs ? new Date(now.getTime() + durationMs).toISOString() : undefined;
-}
-
 function normalizeUrl(raw: string): string {
   const url = new URL(raw);
   return url.toString().replace(/\/+$/, "");
@@ -532,6 +404,14 @@ function parseJsonMaybe(text: string): unknown {
   } catch {
     return text;
   }
+}
+
+function removedBootstrapAcurastDeployError(verb: string): Error {
+  return new Error(
+    `SB_RELAY_DEPLOYMENT_COMMAND_REMOVED: switchboard bootstrap acurast ${verb} was removed. ` +
+      "Relay lifecycle is operated through Fly.io and current ops runbooks; use docs/fly-pre-acurast-runbook.md or the current relay ops runbook instead. " +
+      "The remaining bootstrap acurast commands only record, probe, or publish to an already-operated endpoint."
+  );
 }
 
 function shellQuote(value: string): string {

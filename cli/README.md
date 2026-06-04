@@ -1,7 +1,7 @@
 # Switchboard CLI
 
 Status: active CLI reference
-Last reviewed: 2026-05-25
+Last reviewed: 2026-06-04
 
 Developer-facing command wrapper for Switchboard.
 
@@ -25,7 +25,6 @@ pnpm switchboard -- validator script --json
 pnpm switchboard -- relay list --json
 pnpm switchboard -- relay diff --json
 pnpm switchboard -- relay sync --dry-run
-pnpm switchboard -- relay deployments relay-d --json
 pnpm switchboard -- relay whoami relay-d --json
 pnpm switchboard -- relay status relay-d --catalog-file relays/catalog.json
 pnpm switchboard -- relay verify relay-d
@@ -44,9 +43,9 @@ The public-beta deployer/gateway surface is `init`, `context add`,
 `context dns`, `context list/current/use/set`, `project`, `preflight`,
 `deploy`, `status`, `logs`, `claimable`, `claim`, `refundable`, `refund`,
 `hostname`, `validator script`, `gateway`, read-only
-`relay list/diff/deployments/whoami/logs/status/verify/deployment-status/inspect`,
-local inventory `relay sync`, read-only `relay dns plan`/`relay dns verify`,
-local `relay budget`, and local spec generation `relay scaffold`.
+`relay list/diff/whoami/logs/status/verify/watch`, local inventory
+`relay sync`, read-only `relay dns plan`/`relay dns verify`, local
+`relay budget`, and local spec generation `relay scaffold`.
 `switchboard.json` is
 directory-local project config, `.switchboard/` is directory-local deployment
 state, and `~/.switchboard/contexts.json` stores named identity/access
@@ -158,11 +157,13 @@ and creates missing local relay stub specs while preserving existing local
 spec files. It is exposed through `runSwitchboardRelaySync(argv)` and
 preserves `--dry-run`, signer validation, and the no live publish, DNS,
 deploy, chain, or context mutation boundary.
-`relay deployments <relay-id>` reads
-`.switchboard/relays/<relay-id>.history.json` and prints local deployment
-history. It is exposed through `runSwitchboardRelayDeployments(argv)` and
-preserves the existing text/JSON output while remaining local-file read-only.
-`relay whoami [relay-id]` resolves the relay deployer seed from env/spec
+Relay lifecycle-management commands are removed from the public CLI surface.
+The retired verbs are `relay deploy`, `relay replace`, `relay rotate-key`,
+`relay drain`, `relay promote`, `relay deployments`,
+`relay deployment-status`, and `relay inspect`. Current relay lifecycle
+operations are handled through Fly.io and ops runbooks; the remaining relay
+commands are audited/provisional diagnostics or local inventory tools.
+`relay whoami [relay-id]` resolves the Acurast relay seed from env/spec
 configuration, derives the Acurast deployer addresses, and compares them with
 any configured Acurast address env. It is exposed through
 `runSwitchboardRelayWhoami(argv)` and remains local/env/spec read-only.
@@ -203,18 +204,6 @@ spec DNS block and public CNAME state. They are exposed through
 preserve `--spec`/`--spec-file`, `--resolvers`, no-DNS no-op behavior, and
 drift failure behavior, and do not require Cloudflare credentials. `relay dns
 apply` and `relay dns remove` remain mutating Cloudflare/admin surfaces.
-`relay deployment-status <relay-id>` resolves the relay's Acurast deployment
-spec and reads Acurast status for an explicit `--deployment-id` or the latest
-local stage/history deployment id. It is exposed through
-`runSwitchboardRelayDeploymentStatus(argv)` and preserves the existing helper
-output while remaining read-only; it does not deploy jobs, publish catalogs,
-submit transactions, or mutate relay state.
-`relay inspect <relay-id>` resolves the same Acurast deployment context and
-runs the read-only inspection helper for an explicit `--deployment-id` or the
-latest local stage/history deployment id. It is exposed through
-`runSwitchboardRelayInspect(argv)` and preserves `--watch`/`--events`
-passthrough and helper output without deploying jobs, publishing catalogs,
-submitting transactions, or mutating relay state.
 `relay watch [relay-id]` reads the local relay catalog, repeatedly probes
 relay `/health`, `/v1/relay-status`, and `/v1/service-catalogs/relay`
 endpoints, and prints state transitions. It is exposed through

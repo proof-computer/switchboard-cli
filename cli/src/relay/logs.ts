@@ -32,8 +32,9 @@ interface SavedLogSinkState {
  *   --encryption-key-env  > $SWITCHBOARD_LOG_ENCRYPTION_KEY > saved sink state
  *
  * The saved sink state is `.switchboard/relays/<id>.log-sink.json`,
- * written by `relay deploy` when `relay.enableLogs=true`. That makes
- * `switchboard relay logs <id>` work without flags after a deploy.
+ * written by current relay ops runbooks or older lifecycle tooling when
+ * encrypted relay logging is enabled. That makes `switchboard relay logs <id>`
+ * work without flags once read-side state has been provisioned.
  *
  * The log encryption key is purely client-side (AES-256-GCM); the relay
  * only sees ciphertext. This command does not store the key anywhere
@@ -54,7 +55,7 @@ export async function runRelayLogs(options: RunRelayLogsOptions): Promise<void> 
   const readUrl = stringFlag(options.flags, "read-url") ?? env.PROOF_LOG_READ_URL ?? savedState?.readUrl;
   if (!readUrl) {
     throw new Error(
-      `relay logs requires --read-url <url>, PROOF_LOG_READ_URL, or a saved sink state at .switchboard/relays/${relayId ?? "<id>"}.log-sink.json (run \`relay deploy\` with relay.enableLogs=true to create one).`
+      `relay logs requires --read-url <url>, PROOF_LOG_READ_URL, or a saved sink state at .switchboard/relays/${relayId ?? "<id>"}.log-sink.json.`
     );
   }
   const readTokenEnv = stringFlag(options.flags, "read-token-env");

@@ -68,7 +68,6 @@ import { validateSwitchboardRoute } from "../../src/route-validation-report.js";
 import { discoverServices, resolveControlApiEndpoints } from "../../src/service-discovery.js";
 import {
   runRelayCatalogSetState,
-  runRelayDeploy,
   runRelayStatus,
   type RunRelayCatalogSetStateOptions
 } from "./relay/index.js";
@@ -80,17 +79,11 @@ import { runRelayBackfillSpecs } from "./relay/backfill-specs.js";
 import { runRelayKeygen, type RunRelayKeygenOptions } from "./relay/keygen.js";
 import { runRelayPickProcessor, type RunRelayPickProcessorOptions } from "./relay/pick-processor.js";
 import { runRelayScaffold, type RunRelayScaffoldOptions } from "./relay/scaffold.js";
-import { runRelayDrain } from "./relay/drain.js";
-import { runRelayReplace } from "./relay/replace.js";
-import { runRelayRotateKey } from "./relay/rotate-key.js";
-import { runRelayDeployments } from "./relay/history.js";
 import { runRelayLogs } from "./relay/logs.js";
-import { runRelayPromote } from "./relay/promote.js";
 import { runRelayWatch, type RunRelayWatchOptions } from "./relay/watch.js";
 import { runRelayVerify } from "./relay/verify.js";
 import { runRelayBudget } from "./relay/budget.js";
 import { runRelayWhoami } from "./relay/whoami.js";
-import { runRelayDeploymentStatus, runRelayInspect, type RelayLifecycleArgs } from "./relay/lifecycle.js";
 import { runRelayDnsSubcommand, type RelayDnsSubcommandArgs } from "./relay/dns.js";
 import { runBootstrapSubcommand } from "./bootstrap/acurast.js";
 import {
@@ -146,8 +139,6 @@ import {
   projectStatePath as switchboardProjectStatePath,
   projectStateReadCandidates
 } from "./switchboard-paths.js";
-
-export { resolveAcurastScriptRunner } from "./relay/acurast-script-runner.js";
 
 const DEFAULT_CONTROL_PLANE_URL = "https://control.switchboard.proof.computer";
 const DEFAULT_ROUTE_INTENT_URL = "http://127.0.0.1:18080/route-intents";
@@ -225,7 +216,6 @@ export type CommandName =
   | "gateway-discover"
   | "gateway-status"
   | "gateway-upgrade"
-  | "relay-deploy"
   | "relay-catalog-set-state"
   | "relay-status"
   | "relay-sync"
@@ -236,18 +226,11 @@ export type CommandName =
   | "relay-keygen"
   | "relay-pick-processor"
   | "relay-scaffold"
-  | "relay-drain"
-  | "relay-replace"
-  | "relay-rotate-key"
-  | "relay-deployments"
   | "relay-logs"
-  | "relay-promote"
   | "relay-watch"
   | "relay-verify"
   | "relay-budget"
   | "relay-whoami"
-  | "relay-inspect"
-  | "relay-deployment-status"
   | "relay-dns"
   | "bootstrap"
   | "ops"
@@ -615,11 +598,6 @@ export async function runSwitchboardCli(argv: readonly string[] = process.argv.s
     return;
   }
 
-  if (parsed.command === "relay-deploy") {
-    await runRelayDeploy({ flags, positionals: parsed.positionals });
-    return;
-  }
-
   if (parsed.command === "relay-catalog-set-state") {
     await runRelayCatalogSetState({ flags, positionals: parsed.positionals });
     return;
@@ -662,28 +640,8 @@ export async function runSwitchboardCli(argv: readonly string[] = process.argv.s
     await runRelayScaffold({ flags, positionals: parsed.positionals });
     return;
   }
-  if (parsed.command === "relay-drain") {
-    await runRelayDrain({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-replace") {
-    await runRelayReplace({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-rotate-key") {
-    await runRelayRotateKey({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-deployments") {
-    await runRelayDeployments({ flags, positionals: parsed.positionals });
-    return;
-  }
   if (parsed.command === "relay-logs") {
     await runRelayLogs({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-promote") {
-    await runRelayPromote({ flags, positionals: parsed.positionals });
     return;
   }
   if (parsed.command === "relay-watch") {
@@ -703,14 +661,6 @@ export async function runSwitchboardCli(argv: readonly string[] = process.argv.s
   }
   if (parsed.command === "relay-whoami") {
     await runRelayWhoami({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-inspect") {
-    await runRelayInspect({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-deployment-status") {
-    await runRelayDeploymentStatus({ flags, positionals: parsed.positionals });
     return;
   }
   if (parsed.command === "relay-dns") {
@@ -5296,24 +5246,6 @@ export async function runSwitchboardRelayPickProcessor(
   await runRelayPickProcessor({ flags, positionals: parsed.positionals, ...pickOptions });
 }
 
-export async function runSwitchboardRelayDeployments(
-  argv: readonly string[] = process.argv.slice(2),
-  runtimeOverride?: CliRuntime
-): Promise<void> {
-  const normalized = argv[0] === "relay" && argv[1] === "deployments"
-    ? [...argv]
-    : ["relay", "deployments", ...argv];
-  const parsed = parseArgs(normalized);
-  if (parsed.command !== "relay-deployments") {
-    throw new Error(`runSwitchboardRelayDeployments expected relay deployments args, got ${normalized.join(" ")}`);
-  }
-  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
-  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
-  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
-  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
-  await runRelayDeployments({ flags, positionals: parsed.positionals });
-}
-
 export async function runSwitchboardRelayLogs(
   argv: readonly string[] = process.argv.slice(2),
   runtimeOverride?: CliRuntime
@@ -5418,46 +5350,6 @@ export async function runSwitchboardRelayBudget(
   assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
   const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
   await runRelayBudget({ flags, positionals: parsed.positionals });
-}
-
-type RelayLifecycleRunnerOptions = Pick<RelayLifecycleArgs, "cwd" | "env" | "io" | "spawnPnpm">;
-
-export async function runSwitchboardRelayInspect(
-  argv: readonly string[] = process.argv.slice(2),
-  runtimeOverride?: CliRuntime,
-  lifecycleOptions: RelayLifecycleRunnerOptions = {}
-): Promise<void> {
-  const normalized = argv[0] === "relay" && argv[1] === "inspect"
-    ? [...argv]
-    : ["relay", "inspect", ...argv];
-  const parsed = parseArgs(normalized);
-  if (parsed.command !== "relay-inspect") {
-    throw new Error(`runSwitchboardRelayInspect expected relay inspect args, got ${normalized.join(" ")}`);
-  }
-  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
-  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
-  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
-  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
-  await runRelayInspect({ flags, positionals: parsed.positionals, ...lifecycleOptions });
-}
-
-export async function runSwitchboardRelayDeploymentStatus(
-  argv: readonly string[] = process.argv.slice(2),
-  runtimeOverride?: CliRuntime,
-  lifecycleOptions: RelayLifecycleRunnerOptions = {}
-): Promise<void> {
-  const normalized = argv[0] === "relay" && argv[1] === "deployment-status"
-    ? [...argv]
-    : ["relay", "deployment-status", ...argv];
-  const parsed = parseArgs(normalized);
-  if (parsed.command !== "relay-deployment-status") {
-    throw new Error(`runSwitchboardRelayDeploymentStatus expected relay deployment-status args, got ${normalized.join(" ")}`);
-  }
-  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
-  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
-  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
-  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
-  await runRelayDeploymentStatus({ flags, positionals: parsed.positionals, ...lifecycleOptions });
 }
 
 export async function runSwitchboardRelayWhoami(
@@ -11979,9 +11871,6 @@ function normalizeCommand(positionals: string[]): CommandName {
   if (positionals.length === 2 && positionals[0] === "validator" && positionals[1] === "script") {
     return "validator-script";
   }
-  if (positionals.length >= 2 && positionals[0] === "relay" && positionals[1] === "deploy") {
-    return "relay-deploy";
-  }
   if (
     positionals.length >= 3 &&
     positionals[0] === "relay" &&
@@ -12019,18 +11908,11 @@ function normalizeCommand(positionals: string[]): CommandName {
     if (verb === "keygen") return "relay-keygen";
     if (verb === "pick-processor") return "relay-pick-processor";
     if (verb === "scaffold") return "relay-scaffold";
-    if (verb === "drain") return "relay-drain";
-    if (verb === "replace") return "relay-replace";
-    if (verb === "rotate-key") return "relay-rotate-key";
-    if (verb === "deployments") return "relay-deployments";
     if (verb === "logs") return "relay-logs";
-    if (verb === "promote") return "relay-promote";
     if (verb === "watch") return "relay-watch";
     if (verb === "verify") return "relay-verify";
     if (verb === "budget") return "relay-budget";
     if (verb === "whoami") return "relay-whoami";
-    if (verb === "inspect") return "relay-inspect";
-    if (verb === "deployment-status") return "relay-deployment-status";
     if (
       positionals.length >= 3 &&
       verb === "catalog" &&
@@ -12212,15 +12094,15 @@ Admin catalog commands:
           Build, inspect, verify, or update signed service catalog artifacts.
 
 Admin relay commands:
-  bootstrap acurast plan|deploy|use|endpoint|status|publish-catalog|publish-manifest|teardown
+  bootstrap acurast use|endpoint|status|publish-catalog|publish-manifest|teardown
   bootstrap host plan|sync|catalog|env|deploy|status|logs
   relay sync|list|diff|backfill-specs|keygen|scaffold|pick-processor
-  relay drain|replace|rotate-key|deployments|logs|promote|watch|verify
-  relay budget|whoami|inspect|deployment-status|deploy|status
+  relay logs|watch|verify|budget|whoami|status
   relay catalog build|set-state
   relay dns plan|apply|verify|remove
-          Internal relay and bootstrap operations. These load the selected
-          ops profile and keep builder context secrets separate.
+          Audited/provisional relay diagnostics and local inventory tools.
+          Relay lifecycle is operated through Fly.io/current ops
+          runbooks, not public CLI subcommands.
 `
     : `
 PROOF-required and admin commands are hidden from the default help.

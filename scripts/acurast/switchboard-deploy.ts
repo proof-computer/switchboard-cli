@@ -4242,7 +4242,7 @@ function paymentModeFlag(flags: Map<string, string | boolean>): HarnessConfig["p
     throw new Error(`Unsupported payment mode: ${value}`);
   }
   if (value === "public-price") {
-    throw new Error("switchboard deploy now requires signed quote funding through relay deployment intents");
+    throw new Error("switchboard deploy now requires signed quote funding through relay-side deployment intents");
   }
   return value;
 }

@@ -5,7 +5,6 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import { runBootstrapAcurastSubcommand } from "../cli/src/bootstrap/acurast.js";
-import type { runRelayDeploy } from "../cli/src/relay/index.js";
 
 interface CapturedIo {
   log: string[];
@@ -75,80 +74,37 @@ describe("switchboard bootstrap acurast", () => {
     await rm(workDir, { recursive: true, force: true });
   });
 
-  it("plans by delegating to relay deploy dry-run with bootstrap defaults", async () => {
-    const { io, captured } = makeIo();
-    let relayed: Parameters<typeof runRelayDeploy>[0] | undefined;
-
-    await runBootstrapAcurastSubcommand({
-      flags: new Map<string, string | boolean>([
-        ["state-file", stateFile],
-        ["port", "3000"],
-        ["manager-id", "1234"]
-      ]),
-      positionals: ["bootstrap", "acurast", "plan", "bootstrap-acurast"],
-      cwd: workDir,
-      env: { SWITCHBOARD_HOME: home },
-      io,
-      relayDeploy: async (args) => {
-        relayed = args;
-        args.io?.log("relay dry-run stub");
-      }
-    });
-
-    assert.equal(relayed?.positionals.join(" "), "relay deploy bootstrap-acurast");
-    assert.equal(relayed?.flags.get("target"), "acurast");
-    assert.equal(relayed?.flags.get("dry-run"), true);
-    assert.equal(relayed?.flags.get("no-catalog"), true);
-    assert.equal(relayed?.flags.get("duration"), "30m");
-    assert.equal(relayed?.flags.get("manager-id"), "1234");
-    assert.match(captured.log.join("\n"), /bootstrap acurast plan/);
+  it("rejects removed Acurast bootstrap planning", async () => {
+    const { io } = makeIo();
+    await assert.rejects(
+      runBootstrapAcurastSubcommand({
+        flags: new Map<string, string | boolean>([
+          ["state-file", stateFile]
+        ]),
+        positionals: ["bootstrap", "acurast", "plan", "bootstrap-acurast"],
+        cwd: workDir,
+        env: { SWITCHBOARD_HOME: home },
+        io
+      }),
+      /SB_RELAY_DEPLOYMENT_COMMAND_REMOVED.*bootstrap acurast plan/
+    );
   });
 
-  it("rejects unsupported bootstrap ports for now", async () => {
+  it("rejects removed Acurast bootstrap deploys", async () => {
     const { io } = makeIo();
     await assert.rejects(
       runBootstrapAcurastSubcommand({
         flags: new Map<string, string | boolean>([
           ["state-file", stateFile],
-          ["port", "8080"]
+          ["yes", true]
         ]),
-        positionals: ["bootstrap", "acurast", "plan", "bootstrap-acurast"],
+        positionals: ["bootstrap", "acurast", "deploy", "bootstrap-acurast"],
         cwd: workDir,
         env: { SWITCHBOARD_HOME: home },
-        io,
-        relayDeploy: async () => {}
+        io
       }),
-      /supports only --port 3000/
+      /SB_RELAY_DEPLOYMENT_COMMAND_REMOVED.*bootstrap acurast deploy/
     );
-  });
-
-  it("deploys through relay deploy and records local bootstrap state", async () => {
-    const { io } = makeIo();
-    let relayed: Parameters<typeof runRelayDeploy>[0] | undefined;
-    const now = new Date("2026-05-05T12:00:00.000Z");
-
-    await runBootstrapAcurastSubcommand({
-      flags: new Map<string, string | boolean>([
-        ["state-file", stateFile],
-        ["yes", true]
-      ]),
-      positionals: ["bootstrap", "acurast", "deploy", "bootstrap-acurast"],
-      cwd: workDir,
-      env: { SWITCHBOARD_HOME: home },
-      io,
-      now: () => now,
-      relayDeploy: async (args) => {
-        relayed = args;
-      }
-    });
-
-    assert.equal(relayed?.flags.get("target"), "acurast");
-    assert.equal(relayed?.flags.get("no-catalog"), true);
-    const state = JSON.parse(await readFile(stateFile, "utf8")) as Record<string, any>;
-    assert.equal(state.kind, "acurast-direct");
-    assert.equal(state.status, "active");
-    assert.equal(state.endpointUrl, "https://bootstrap.switchboard.proof.computer:3000");
-    assert.equal(state.expiresAt, "2026-05-05T12:30:00.000Z");
   });
 
   it("records and prints an explicitly selected endpoint", async () => {

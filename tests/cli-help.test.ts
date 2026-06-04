@@ -120,7 +120,7 @@ describe("switchboard help", () => {
       () => assertNoRemovedPublicCommandFlags("deployment-status", new Map([["repair-route", true]])),
       /Removed public status option\(s\): --repair-route/
     );
-    assert.doesNotThrow(() => assertNoRemovedPublicCommandFlags("relay-deploy", new Map([["route-activation-mode", "control-plane"]])));
+    assert.doesNotThrow(() => assertNoRemovedPublicCommandFlags("relay-status", new Map([["route-activation-mode", "control-plane"]])));
   });
 
   it("redacts JSON output secrets while preserving env var references", () => {

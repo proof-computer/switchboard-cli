@@ -23,7 +23,7 @@ export const FORBIDDEN_ACURAST_ENV_NAMES = [
 // These are not equivalent to quote/manifest/catalog roots, because provider
 // tokens can be scoped and job-owned TLS still protects traffic content. They
 // are still high-authority and must be explicit bootstrap-only in managed
-// Acurast relay deploys.
+// Acurast relay specs.
 export const HIGH_AUTHORITY_ACURAST_ENV_NAMES = [
   "ACME_EAB_HMAC_KEY",
   "CLOUDFLARE_API_TOKEN",

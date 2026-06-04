@@ -37,7 +37,7 @@ const validAcurastSpec = {
   }
 };
 
-describe("relay deployment spec", () => {
+describe("relay spec schema", () => {
   it("parses a valid Acurast candidate spec and applies defaults", () => {
     const spec = parseRelayDeploymentSpec(validAcurastSpec);
     assert.equal(spec.version, 1);
