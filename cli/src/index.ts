@@ -159,9 +159,9 @@ const DEFAULT_LAUNCH_DEMO_DURATION_MINUTES = 10;
 const DEFAULT_LAUNCH_DEMO_START_DELAY_MS = 180_000;
 const DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION = "40000000000";
 const DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS = 900;
-const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.9";
-const MIN_GATEWAY_UPSTREAM_ADMISSION_DEMO_VERSION = "0.1.9";
-const MIN_GATEWAY_UPSTREAM_ADMISSION_SDK_VERSION = "0.1.3";
+const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.10";
+const MIN_LAUNCH_DEMO_RUNTIME_VERSION = "0.1.10";
+const MIN_LAUNCH_DEMO_SDK_VERSION = "0.1.4";
 const LAUNCH_DEMO_ENTRYPOINT = "src/server.ts";
 const SSH_TEMPLATE_NAME = "ssh";
 const SSH_TEMPLATE_DISTRO = "ubuntu";
@@ -3135,15 +3135,15 @@ function assertLaunchDemoRuntimePackageFresh(project: LaunchDemoProject, flags: 
   if (!launchDemoPackageIsKnownExpressDemo(project) || !project.packageVersion) {
     return;
   }
-  const comparison = compareSemver(project.packageVersion, MIN_GATEWAY_UPSTREAM_ADMISSION_DEMO_VERSION);
+  const comparison = compareSemver(project.packageVersion, MIN_LAUNCH_DEMO_RUNTIME_VERSION);
   if (comparison === undefined || comparison >= 0) {
     return;
   }
 
   const error =
     `SB_LAUNCH_DEMO_RUNTIME_STALE: launch-demo package ${project.packageSpec} resolves to ` +
-    `@proofcomputer/switchboard-express-demo v${project.packageVersion}, which cannot perform the gateway upstream admission required by current route activation. ` +
-    `Use ${DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC}, or publish a demo package built with @proofcomputer/switchboard-sdk >= ${MIN_GATEWAY_UPSTREAM_ADMISSION_SDK_VERSION}.`;
+    `@proofcomputer/switchboard-express-demo v${project.packageVersion}, which lacks the current runtime support for gateway upstream admission and bounded certificate-prep progress with ECDSA CSRs. ` +
+    `Use ${DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC}, or publish a demo package built with @proofcomputer/switchboard-sdk >= ${MIN_LAUNCH_DEMO_SDK_VERSION}.`;
   if (boolFlag(flags, "json")) {
     const handled = new Error(error);
     writeOutput(flags, {
@@ -3154,8 +3154,9 @@ function assertLaunchDemoRuntimePackageFresh(project: LaunchDemoProject, flags: 
       demoProject: project,
       required: {
         package: "@proofcomputer/switchboard-express-demo",
-        minVersion: MIN_GATEWAY_UPSTREAM_ADMISSION_DEMO_VERSION,
-        minSdkVersion: MIN_GATEWAY_UPSTREAM_ADMISSION_SDK_VERSION,
+        minVersion: MIN_LAUNCH_DEMO_RUNTIME_VERSION,
+        minSdkVersion: MIN_LAUNCH_DEMO_SDK_VERSION,
+        capabilities: ["gateway_upstream_admission", "certificate_prep_progress", "ecdsa_p256_csr"],
         packageSpec: DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC
       }
     }, () => undefined);

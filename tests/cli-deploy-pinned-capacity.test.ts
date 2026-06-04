@@ -703,8 +703,12 @@ describe("switchboard launch-demo workflow shell", () => {
         assert.equal(output.action, "launch-demo");
         assert.equal(output.code, "SB_LAUNCH_DEMO_RUNTIME_STALE");
         assert.match(output.error, /gateway upstream admission/);
+        assert.match(output.error, /certificate-prep progress/);
         assert.equal(output.demoProject.packageVersion, "0.1.8");
-        assert.equal(output.required.packageSpec, "github:proof-computer/switchboard-express-demo#v0.1.9");
+        assert.equal(output.required.minVersion, "0.1.10");
+        assert.equal(output.required.minSdkVersion, "0.1.4");
+        assert.deepEqual(output.required.capabilities, ["gateway_upstream_admission", "certificate_prep_progress", "ecdsa_p256_csr"]);
+        assert.equal(output.required.packageSpec, "github:proof-computer/switchboard-express-demo#v0.1.10");
         assert.equal(createIntentRequests.length, 0);
       } finally {
         await rm(cwd, { recursive: true, force: true });

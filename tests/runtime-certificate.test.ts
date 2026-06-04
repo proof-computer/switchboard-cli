@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { createPrivateKey } from "node:crypto";
 import { describe, it } from "node:test";
 
 import {
+  createSwitchboardCertificateSigningRequest,
   createEncryptedSwitchboardLogger,
   generateProofLogEncryptionKey,
   requestCertificateWithRelay,
@@ -103,6 +105,79 @@ describe("Switchboard runtime certificate requests", () => {
       ),
       /unsupported URL protocol file:/
     );
+  });
+
+  it("uses ECDSA CSRs by default while keeping the rsa escape hatch", async () => {
+    const defaultCsr = await createSwitchboardCertificateSigningRequest("demo.example.com");
+    const rsaCsr = await createSwitchboardCertificateSigningRequest("demo.example.com", {
+      keyAlgorithm: "rsa-2048"
+    });
+
+    assert.equal(createPrivateKey(defaultCsr.privateKeyPem).asymmetricKeyType, "ec");
+    assert.equal(createPrivateKey(rsaCsr.privateKeyPem).asymmetricKeyType, "rsa");
+  });
+
+  it("rejects invalid key algorithms and pre-fetch signing timeouts", async () => {
+    let fetches = 0;
+    await assert.rejects(
+      () => requestCertificateWithRelay(
+        {
+          ...exampleCertificateConfig(),
+          csrPem: undefined,
+          privateKeyPem: undefined,
+          certificateKeyAlgorithm: "ed25519" as never
+        },
+        async () => {
+          fetches += 1;
+          return new Response("{}", { status: 200 });
+        }
+      ),
+      (error) => {
+        assert.ok(error instanceof SwitchboardCertificateError);
+        assert.equal(error.stage, "certificate_config");
+        assert.equal(error.hostname, "demo.example.com");
+        assert.equal(error.details?.certificateKeyAlgorithm, "ed25519");
+        return true;
+      }
+    );
+    assert.equal(fetches, 0);
+
+    const progress: Array<{ stage: string; hostname: string }> = [];
+    await assert.rejects(
+      () => requestCertificateWithRelay(
+        {
+          ...exampleCertificateConfig(),
+          jobSigner: {
+            async getAddress() {
+              return JOB_SIGNER;
+            },
+            async signRegistration() {
+              return SIGNATURE;
+            },
+            async signCertificateRequest() {
+              return new Promise<string>(() => undefined);
+            }
+          },
+          requestTimeoutMs: 5,
+          onProgress: (event) => {
+            progress.push(event);
+          }
+        },
+        async () => {
+          fetches += 1;
+          return new Response("{}", { status: 200 });
+        }
+      ),
+      (error) => {
+        assert.ok(error instanceof SwitchboardCertificateError);
+        assert.equal(error.stage, "request_signing");
+        assert.equal(error.hostname, "demo.example.com");
+        assert.equal(error.details?.timeoutMs, 5);
+        return true;
+      }
+    );
+    assert.deepEqual(progress.map((event) => event.stage), ["request_signing"]);
+    assert.equal(fetches, 0);
   });
 });
 
