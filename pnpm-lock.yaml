@@ -27,7 +27,7 @@ importers:
         specifier: ^14.0.3
         version: 14.0.3(@polkadot/util@14.0.3)
       '@proofcomputer/switchboard-sdk':
-        specifier: github:proof-computer/switchboard-sdk#v0.1.4
+        specifier: github:proof-computer/switchboard-sdk#v0.1.5
         version: https://codeload.github.com/proof-computer/switchboard-sdk/tar.gz/d6b02cf1a3298a486d7828c9b9122c1e94f189dd
       acme-client:
         specifier: ^5.4.0

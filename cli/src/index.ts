@@ -49,8 +49,8 @@ import {
   type GatewayCapabilityReport,
   type ProcessorScope
 } from "../../src/operator-capability.js";
-import { printOperatorDiscoverUsage, runOperatorDiscover } from "../../scripts/operator/discover.js";
-import { printOperatorSetupUsage, runOperatorSetup, runOperatorStatus, runOperatorUpgrade } from "../../scripts/operator/setup.js";
+import { runOperatorDiscover } from "../../scripts/operator/discover.js";
+import { runOperatorSetup, runOperatorStatus, runOperatorUpgrade } from "../../scripts/operator/setup.js";
 import { getSwitchboardTarget, type SwitchboardTargetConfig } from "../../src/chains.js";
 import {
   customerHostnameAttachmentSubstratePayload,
@@ -112,7 +112,7 @@ import {
   type GroupedDeployTranscriptWriter,
   type OutputRow
 } from "./output.js";
-import { printOpsUsage, runOpsSubcommand, type OpsSubcommandArgs } from "./ops.js";
+import { runOpsSubcommand, type OpsSubcommandArgs } from "./ops.js";
 import {
   DEFAULT_SWITCHBOARD_OPS_PROFILE,
   SWITCHBOARD_CONTEXT_SECRET_FILE_ENV,
@@ -151,9 +151,9 @@ const DEFAULT_LAUNCH_DEMO_SCHEDULE_BUFFER_MINUTES = 0;
 const DEFAULT_LAUNCH_DEMO_START_DELAY_MS = 180_000;
 const DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION = "40000000000";
 const DEFAULT_LAUNCH_DEMO_PROCESSOR_MAX_AGE_SECONDS = 900;
-const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.10";
-const MIN_LAUNCH_DEMO_RUNTIME_VERSION = "0.1.10";
-const MIN_LAUNCH_DEMO_SDK_VERSION = "0.1.4";
+const DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC = "github:proof-computer/switchboard-express-demo#v0.1.11";
+const MIN_LAUNCH_DEMO_RUNTIME_VERSION = "0.1.11";
+const MIN_LAUNCH_DEMO_SDK_VERSION = "0.1.5";
 const LAUNCH_DEMO_ENTRYPOINT = "src/server.ts";
 const SSH_TEMPLATE_NAME = "ssh";
 const SSH_TEMPLATE_DISTRO = "ubuntu";
@@ -410,290 +410,21 @@ const REMOVED_CONTEXT_SET_FLAGS = [
 const ACURAST_IPFS_UPLOAD_ENV_VARS = ["ACURAST_IPFS_URL", "ACURAST_IPFS_API_KEY"] as const;
 type AcurastIpfsUploadEnvName = (typeof ACURAST_IPFS_UPLOAD_ENV_VARS)[number];
 
-export async function runSwitchboardCli(argv: readonly string[] = process.argv.slice(2), runtimeOverride?: CliRuntime): Promise<void> {
-  const parsed = parseArgs([...argv]);
-  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
-
-  if (parsed.command === "gateway-discover" && boolFlag(parsed.flags, "help")) {
-    printOperatorDiscoverUsage();
+export async function runStandaloneSwitchboardCli(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
+  if (argv.length === 0 || argv.includes("help") || argv.includes("--help") || argv.includes("-h")) {
+    printHelp({ command: argv });
     return;
   }
 
-  if (parsed.command === "gateway-setup" && boolFlag(parsed.flags, "help")) {
-    printOperatorSetupUsage();
-    return;
-  }
+  throw new Error(standaloneSwitchboardMigratedMessage(argv));
+}
 
-  if (parsed.command === "ops" && boolFlag(parsed.flags, "help")) {
-    printOpsUsage();
-    return;
-  }
-
-  if (parsed.command === "help" || boolFlag(parsed.flags, "help")) {
-    printHelp({ advanced: boolFlag(parsed.flags, "advanced") || boolFlag(parsed.flags, "all") });
-    return;
-  }
-
-  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
-  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
-  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
-
-  if (parsed.command === "project-init") {
-    await projectInitCommand(flags);
-    return;
-  }
-
-  if (parsed.command === "project-show") {
-    await projectShowCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "context-list") {
-    await contextListCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "context-current") {
-    await contextCurrentCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "context-use") {
-    await contextUseCommand(flags, parsed.positionals, runtime);
-    return;
-  }
-
-  if (parsed.command === "context-set") {
-    await contextSetCommand(flags, parsed.positionals, runtime);
-    return;
-  }
-
-  if (parsed.command === "context-add") {
-    await contextAddCommand(flags, parsed.positionals, runtime);
-    return;
-  }
-
-  if (parsed.command === "context-dns-set") {
-    await contextDnsSetCommand(flags, parsed.positionals, runtime);
-    return;
-  }
-
-  if (parsed.command === "context-dns-clear") {
-    await contextDnsClearCommand(flags, parsed.positionals, runtime);
-    return;
-  }
-
-  if (parsed.command === "ops") {
-    await runOpsSubcommand({ flags, positionals: parsed.positionals });
-    return;
-  }
-
-  if (parsed.command === "preflight") {
-    await preflightCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "claim") {
-    await claimCommand(flags);
-    return;
-  }
-
-  if (parsed.command === "claimable") {
-    await claimCommand(flags, { readOnly: true });
-    return;
-  }
-
-  if (parsed.command === "session-register") {
-    await relayRegistrationCommand(flags);
-    return;
-  }
-
-  if (parsed.command === "session-status") {
-    await statusCommand(flags);
-    return;
-  }
-
-  if (parsed.command === "session-refund") {
-    await refundCommand(flags);
-    return;
-  }
-
-  if (parsed.command === "session-refundable") {
-    await refundCommand(flags, { readOnly: true });
-    return;
-  }
-
-  if (parsed.command === "launch-demo") {
-    await launchDemoCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "deploy") {
-    await deployCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "deploy-status") {
-    await deployWorkflowStatusCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "deploy-doctor") {
-    await deployDoctorCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "deploy-resume") {
-    await deployWorkflowResumeCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "deployment-status") {
-    await deploymentStatusCommand(flags);
-    return;
-  }
-
-  if (parsed.command === "hostname-attach") {
-    await hostnameAttachCommand(flags, parsed.positionals);
-    return;
-  }
-
-  if (parsed.command === "hostname-remove") {
-    await hostnameRemoveCommand(flags, parsed.positionals);
-    return;
-  }
-
-  if (parsed.command === "hostname-status") {
-    await hostnameStatusCommand(flags, parsed.positionals);
-    return;
-  }
-
-  if (parsed.command === "validator-launch") {
-    await validatorLaunchCommand(flags, runtime);
-    return;
-  }
-
-  if (parsed.command === "validator-script") {
-    await validatorScriptCommand(flags);
-    return;
-  }
-
-  if (parsed.command === "gateway-setup") {
-    await runOperatorSetup(flags);
-    return;
-  }
-
-  if (parsed.command === "gateway-status") {
-    await runOperatorStatus(flags);
-    return;
-  }
-
-  if (parsed.command === "gateway-upgrade") {
-    await runOperatorUpgrade(flags);
-    return;
-  }
-
-  if (parsed.command === "gateway-discover") {
-    await runOperatorDiscover(flags);
-    return;
-  }
-
-  if (parsed.command === "relay-catalog-set-state") {
-    await runRelayCatalogSetState({ flags, positionals: parsed.positionals });
-    return;
-  }
-
-  if (parsed.command === "relay-status") {
-    await runRelayStatus({ flags, positionals: parsed.positionals });
-    return;
-  }
-
-  if (parsed.command === "relay-sync") {
-    await runRelaySync({ flags: withDiscoveryDefaults(flags), positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-list") {
-    await runRelayList({ flags: withDiscoveryDefaults(flags), positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-catalog-build") {
-    await runRelayCatalogBuild({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-diff") {
-    await runRelayDiff({ flags: withDiscoveryDefaults(flags), positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-backfill-specs") {
-    await runRelayBackfillSpecs({ flags: withDiscoveryDefaults(flags), positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-keygen") {
-    await runRelayKeygen({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-pick-processor") {
-    await runRelayPickProcessor({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-scaffold") {
-    await runRelayScaffold({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-logs") {
-    await runRelayLogs({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-watch") {
-    await runRelayWatch({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-verify") {
-    const result = await runRelayVerify({ flags: withDiscoveryDefaults(flags), positionals: parsed.positionals });
-    if (!result.ok) {
-      throw new Error(`relay verify ${result.relayId}: ${result.checks.filter((c) => !c.ok).length} check(s) failed`);
-    }
-    return;
-  }
-  if (parsed.command === "relay-budget") {
-    await runRelayBudget({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-whoami") {
-    await runRelayWhoami({ flags, positionals: parsed.positionals });
-    return;
-  }
-  if (parsed.command === "relay-dns") {
-    await runRelayDnsSubcommand({ flags, positionals: parsed.positionals });
-    return;
-  }
-
-  if (parsed.command === "bootstrap") {
-    await runBootstrapSubcommand({ flags, positionals: parsed.positionals });
-    return;
-  }
-
-  if (parsed.command === "catalog-build") {
-    await runCatalogBuild({ flags, positionals: parsed.positionals });
-    return;
-  }
-
-  if (parsed.command === "catalog-inspect") {
-    await runCatalogInspect({ flags, positionals: parsed.positionals });
-    return;
-  }
-
-  if (parsed.command === "catalog-verify") {
-    await runCatalogVerify({ flags, positionals: parsed.positionals });
-    return;
-  }
-
-  if (parsed.command === "catalog-set-state") {
-    await runCatalogSetState({ flags, positionals: parsed.positionals });
-    return;
-  }
-
-  assert.fail(`Unsupported command: ${parsed.command}`);
+function standaloneSwitchboardMigratedMessage(argv: readonly string[]): string {
+  const command = argv.filter((arg) => arg !== "--").join(" ").trim();
+  const suffix = command.length > 0 ? ` ${command}` : "";
+  return `SB_STANDALONE_SWITCHBOARD_MIGRATED: standalone switchboard command routing has moved to ` +
+    `proof switchboard. Run \`proof switchboard${suffix}\` or \`proof switchboard --help\`. ` +
+    `@proof-computer/switchboard-cli now exposes shared runner exports for the PROOF plugin.`;
 }
 
 export function assertNoRemovedPublicCommandFlags(command: CommandName, flags: Map<string, string | boolean>): void {
@@ -2709,7 +2440,7 @@ async function launchDemoCommand(flags: Map<string, string | boolean>, runtime: 
   if (!boolFlag(flags, "dry-run") && !boolFlag(flags, "yes-spend")) {
     const hint = boolFlag(flags, "yes")
       ? "`--yes` no longer authorizes spending for launch-demo; use `--yes-spend`."
-      : "Use `switchboard launch-demo --yes-spend` to confirm spend.";
+      : "Use `proof switchboard launch-demo --yes-spend` to confirm spend.";
     throw new Error(`Refusing to launch a paid demo without --yes-spend. ${hint}`);
   }
   for (const flag of ["start-delay-ms", "max-allowed-start-delay-ms", "instant-match-start-delay-ms", "execution-ms"]) {
@@ -3098,7 +2829,7 @@ function assertLaunchDemoRuntimePackageFresh(project: LaunchDemoProject, flags: 
 
   const error =
     `SB_LAUNCH_DEMO_RUNTIME_STALE: launch-demo package ${project.packageSpec} resolves to ` +
-    `@proofcomputer/switchboard-express-demo v${project.packageVersion}, which lacks the current runtime support for gateway upstream admission and bounded certificate-prep progress with ECDSA CSRs. ` +
+    `@proofcomputer/switchboard-express-demo v${project.packageVersion}, which lacks the current runtime support for gateway upstream admission, bounded certificate-prep progress with ECDSA CSRs, and post-certificate readiness progress. ` +
     `Use ${DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC}, or publish a demo package built with @proofcomputer/switchboard-sdk >= ${MIN_LAUNCH_DEMO_SDK_VERSION}.`;
   if (boolFlag(flags, "json")) {
     const handled = new Error(error);
@@ -3112,7 +2843,7 @@ function assertLaunchDemoRuntimePackageFresh(project: LaunchDemoProject, flags: 
         package: "@proofcomputer/switchboard-express-demo",
         minVersion: MIN_LAUNCH_DEMO_RUNTIME_VERSION,
         minSdkVersion: MIN_LAUNCH_DEMO_SDK_VERSION,
-        capabilities: ["gateway_upstream_admission", "certificate_prep_progress", "ecdsa_p256_csr"],
+        capabilities: ["gateway_upstream_admission", "certificate_prep_progress", "ecdsa_p256_csr", "post_certificate_readiness_progress"],
         packageSpec: DEFAULT_LAUNCH_DEMO_PACKAGE_SPEC
       }
     }, () => undefined);
@@ -7643,7 +7374,7 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
   }
   if (!stringFlag(flags, "entrypoint") && !optionalEnv("ACURAST_ENTRYPOINT")) {
     throw new Error(
-      "switchboard deploy is for project workloads. The bundled demo moved to `switchboard launch-demo --yes-spend`; configure acurast.entrypoint in switchboard.json or pass --entrypoint for project deploys."
+      "proof switchboard deploy is for project workloads. The bundled demo moved to `proof switchboard launch-demo --yes-spend`; configure acurast.entrypoint in switchboard.json or pass --entrypoint for project deploys."
     );
   }
   const deployRuntimeConfig = await resolveDeployRuntimeConfig(flags, {
@@ -7654,7 +7385,7 @@ async function deployCommand(flags: Map<string, string | boolean>, runtime: CliR
   const manifestConfig = await resolveCliNetworkConfig(flags);
   for (const flag of ["hostname", "hostname-suffix", "hostname-suffixes", "domain-pool", "validation-hostname", "certificate-hostnames"]) {
     if (stringFlag(flags, flag)) {
-      throw new Error("Canonical deploy hostnames are relay-allocated; use `switchboard hostname add` for customer domains after deploy.");
+      throw new Error("Canonical deploy hostnames are relay-allocated; use `proof switchboard hostname add` for customer domains after deploy.");
     }
   }
   const relayUrl =
@@ -8532,7 +8263,7 @@ async function hostnameAttachCommand(
     throw new Error("Missing --endpoint, --endpoint-hostname, ENDPOINT_HOSTNAME, or --report");
   }
   if (!customerHostname) {
-    throw new Error("Missing customer hostname. Use `switchboard hostname add app.example.com` from a project directory, or pass --report <report>.");
+    throw new Error("Missing customer hostname. Use `proof switchboard hostname add app.example.com` from a project directory, or pass --report <report>.");
   }
   if (!sessionId) {
     throw new Error("Missing --session-id, SESSION_ID, or --report");
@@ -8564,7 +8295,7 @@ async function hostnameAttachCommand(
       certificateValidationMode,
       ...signature,
       source: {
-        cli: "switchboard hostname add",
+        cli: "proof switchboard hostname add",
         reportPath
       }
     }, adapters.fetchImpl);
@@ -8624,7 +8355,7 @@ async function hostnameRemoveCommand(
     throw new Error("Missing --endpoint, --endpoint-hostname, ENDPOINT_HOSTNAME, or --report");
   }
   if (!customerHostname) {
-    throw new Error("Missing customer hostname. Use `switchboard hostname remove app.example.com` from a project directory, or pass --report <report>.");
+    throw new Error("Missing customer hostname. Use `proof switchboard hostname remove app.example.com` from a project directory, or pass --report <report>.");
   }
   if (!sessionId) {
     throw new Error("Missing --session-id, SESSION_ID, or --report");
@@ -8649,7 +8380,7 @@ async function hostnameRemoveCommand(
       ...attachment,
       ...signature,
       source: {
-        cli: "switchboard hostname remove",
+        cli: "proof switchboard hostname remove",
         reportPath
       }
     }, adapters.fetchImpl);
@@ -8692,7 +8423,7 @@ async function hostnameStatusCommand(
     throw new Error("Missing --endpoint, --endpoint-id, ENDPOINT_HOSTNAME, or --report");
   }
   if (!customerHostname) {
-    throw new Error("Missing customer hostname. Use `switchboard hostname status app.example.com --endpoint <endpoint>`.");
+    throw new Error("Missing customer hostname. Use `proof switchboard hostname status app.example.com --endpoint <endpoint>`.");
   }
   const endpointId = normalizeEndpointIdForCli(stringFlag(flags, "endpoint-id") ?? endpointHostname ?? "");
   const waitSeconds = numberFlag(flags, "wait-seconds", "PROOF_CUSTOMER_HOSTNAME_WAIT_SECONDS", boolFlag(flags, "wait") ? 300 : 0);
@@ -9358,7 +9089,7 @@ function printClaimResult(output: any) {
   } else if (output.claimable.raw === "0") {
     console.log("Nothing to claim.");
   } else if (output.action === "claimable") {
-    console.log("Run `switchboard claim --yes` with the matching signer to withdraw.");
+    console.log("Run `proof switchboard claim --yes` with the matching signer to withdraw.");
   } else if (output.dryRun) {
     console.log("Submit with --yes to claim.");
   }
@@ -9390,7 +9121,7 @@ function printRefundResult(output: any) {
       console.log(`Block: ${output.tx.blockHash}`);
     }
   } else if (output.action === "refundable" && output.refund.eligible) {
-    console.log("Run `switchboard refund --yes` with the developer signer to withdraw.");
+    console.log("Run `proof switchboard refund --yes` with the developer signer to withdraw.");
   } else if (output.refund.eligible) {
     console.log("Submit with --yes to refund.");
   }
@@ -9740,7 +9471,7 @@ function printCustomerHostnameResult(action: "attach" | "status", output: any) {
   printCustomerHostnameReadiness(output.readiness);
   printCustomerHostnameNextSteps(output.nextSteps);
   if (action === "attach" && output.status !== "dns_validated") {
-    console.log(`Check again: switchboard hostname status ${output.customerHostname} --endpoint ${output.endpointHostname}`);
+    console.log(`Check again: proof switchboard hostname status ${output.customerHostname} --endpoint ${output.endpointHostname}`);
   }
 }
 
@@ -12175,330 +11906,19 @@ function optionalNumberEnv(name: string): number | undefined {
   return Number(value);
 }
 
-export function printHelp(options: { advanced?: boolean } = {}) {
-  const advanced = options.advanced === true;
-  const advancedCommands = advanced
-    ? `
-Advanced session commands:
-  session register
-          Sign and relay registration for a funded session.
-  session status
-          Read raw Hub session state.
-  session refund
-          Refund an eligible unactivated or unfulfilled developer session.
-  session refundable
-          Check whether a developer session has an available refund.
-
-PROOF ops commands:
-  ops init|show|paths|env [profile]
-          Manage CLI-owned ops config and secrets under ~/.switchboard/ops/.
-
-Validator commands:
-  validator launch
-          Request validator admission, deploy the approved Acurast validator
-          script, and register the job. Auto-selects exact fresh manager
-          processor capacity unless --processor/--processors is provided.
-          --manager-id <id> is required when ACURAST_MANAGER_ID is not set.
-  validator script
-          Look up the approved validator IPFS script pin from the network
-          manifest or a validator script manifest URL/file.
-
-Admin catalog commands:
-  catalog build|inspect|verify|set-state
-          Build, inspect, verify, or update signed service catalog artifacts.
-
-Admin relay commands:
-  bootstrap acurast use|endpoint|status|publish-catalog|publish-manifest|teardown
-  bootstrap host plan|sync|catalog|env|deploy|status|logs
-  relay sync|list|diff|backfill-specs|keygen|scaffold|pick-processor
-  relay logs|watch|verify|budget|whoami|status
-  relay catalog build|set-state
-  relay dns plan|apply|verify|remove
-          Audited/provisional relay diagnostics and local inventory tools.
-          Relay lifecycle is operated through Fly.io/current ops
-          runbooks, not public CLI subcommands.
-`
-    : `
-PROOF-required and admin commands are hidden from the default help.
-Run \`switchboard --help --advanced\` to list them.
-`;
-
+export function printHelp(options: { advanced?: boolean; command?: readonly string[] } = {}) {
+  const requestedCommand = options.command?.filter((arg) => arg !== "--").join(" ").trim();
+  const requestedLine = requestedCommand && requestedCommand.length > 0
+    ? `\nRequested standalone command:\n  switchboard ${requestedCommand}\n\nUse:\n  proof switchboard ${requestedCommand}\n`
+    : "\nUse:\n  proof switchboard --help\n";
   console.log(`switchboard
 ${SWITCHBOARD_LOCKUP}
 
-Public beta deployer commands:
-  init
-          Create switchboard.json and .switchboard/ in the current project.
-  project show
-          Show the current directory project config, latest deployment, and context.
-  context add [name]
-          Interactive wizard for developer/payment context setup.
-          Pass --no-balance-check to skip network calls.
-  context list | context current | context use <name> | context set <name>
-          Manage named developer/payment contexts.
-  preflight
-          Check manifest, RPCs, credentials, payment, and deploy readiness.
-  launch-demo
-          Launch the bundled demo on current live operator capacity.
-  deploy
-          Deploy a project workload from switchboard.json or --entrypoint.
-  deploy status
-          Read local deploy workflow/report state and print the next recovery action.
-  deploy doctor
-          Diagnose local workflow, relay, route-state, DNS/TLS, and SSH banner state.
-  deploy resume
-          Resume a single-replica deploy workflow from local private state.
-  status
-          Diagnose a deployment from its report.
-  claimable
-          Check released operator, validator, or PROOF rewards without submitting.
-  claim
-          Inspect and withdraw released operator, validator, or PROOF rewards.
-  refundable
-          Check whether a developer session has an available refund.
-  refund
-          Refund an eligible unactivated or unfulfilled developer session.
-  hostname add <hostname>
-          Add a customer CNAME to an endpoint with a developer signature.
-  hostname remove <hostname>
-          Remove a customer CNAME from an endpoint and gateway route.
-  hostname status <hostname>
-          Check customer CNAME validation and certificate authorization status.
-  gateway setup
-          Prepare host Docker/Compose config and launch a gateway stack.
-  gateway discover
-          Check manager-scoped gateway readiness and suggest env config.
-  gateway status
-          Show local compose, gateway-agent, and relay capability registration state.
-  gateway upgrade
-          Pull current gateway images and recreate the Docker Compose stack.
-${advancedCommands}
-Common flags:
-  --project-dir <path>             Project directory, defaults to current directory/ancestor
-  --context <name>                 Named identity/access context
-  --no-project                     Ignore switchboard.json and .switchboard state
-  --target <name>                  revive-local, polkadot-hub-testnet, polkadot-hub
-  --registry <address>             IngressRegistry contract address
-  --eth-rpc-url <url>              Hub Ethereum JSON-RPC URL
-  --substrate-ws-url <url>         Hub Substrate WebSocket URL
-  --polkadot-signer <mode>         seed (default) or ledger
-  --hub-signer <mode>              evm or polkadot for claim/refund transactions
-  --polkadot-address <address>     Native account used for USDC quote funding
-  --polkadot-seed <uri>            Native account seed for USDC quote funding; defaults to the Acurast seed when unset
-  --ledger                         Alias for --polkadot-signer ledger
-  --ledger-mode <mode>             generic (Polkadot app) or legacy (Statemint app)
-  --ledger-account <n>             Ledger account index, default 0
-  --ledger-address-index <n>       Ledger address index, default 0
-  --ledger-metadata-chain-id <id>  Zondax metadata-service chain ID for generic signing
-  --ledger-metadata-url <url>      Generic app metadata service URL
-  --job-signer-address <address>   Expected job signer for the funded session
-  --session-label <label>          Derive session/job IDs from a label
-  --session-id <bytes32>           Explicit derived session ID
-  --session-salt <bytes32>         Explicit session salt for deterministic ID derivation
-  --job-id <bytes32>               Explicit job ID
-  --operator-id <bytes32>          Optional capacity pin; normal deploys auto-select
-  --processor-id <bytes32>         Explicit processor ID
-  --endpoint-hostname <hostname>   Hostname bound into endpointHash
-  --json                           Machine-readable output
-  --manifest-url <url>             Default ${PROOF_NETWORK_MANIFEST_URL}
-  --manifest-signer <signer>       Expected signed manifest signer
-  --allow-expired-manifest         Accept an expired manifest for diagnostics only
-  --yes                            Required for deploy, claim/refund, and session register
-  --relay-url <url>                Relay API URL for session register
-
-Claim and refund:
-  switchboard claimable --recipient <address>
-  switchboard claim --recipient <address>
-  switchboard claim --claim-private-key-env OPERATOR_CLAIM_PRIVATE_KEY --yes
-  switchboard refundable --session-id <bytes32>
-  switchboard refund --session-id <bytes32>
-${advanced ? "  switchboard session refund --session-id <bytes32> --yes\n" : ""}  switchboard refund --session-id <bytes32> --yes
-  claimable and refundable are read-only checks, even if --yes is present.
-  claim withdraws claimableBalances(asset, msg.sender) for operator, validator,
-  and PROOF reward recipients. refund calls the session-specific developer
-  refund path: refundAfterActivationTimeout or refundUnfulfilled.
-  --asset <address>                Asset to claim, default first manifest asset
-  --recipient <address>            Read claimable balance without a signer
-  --claim-private-key <key>        EVM reward-recipient private key
-  --claim-private-key-env <env>    Env var containing EVM reward key
-  --private-key <key>              Generic EVM key for claim/refund
-  --refund-reason <reason>         activation-timeout or unfulfilled
-  --storage-deposit-limit <n>      Native revive.call storage deposit limit
-  --ref-time <n>                   Native revive.call refTime limit
-  --proof-size <n>                 Native revive.call proofSize limit
-  --no-map-account                 Do not submit revive.mapAccount first
-
-Project config:
-  switchboard init --project <name> --context <name>
-  switchboard init --template ssh --distro ubuntu --project-dir ./switchboard-ssh-demo
-  switchboard project show
-  Directory-local config is stored in switchboard.json. Deployment state,
-  latest report pointers, and local caches are stored in .switchboard/.
-  The SSH template generates an inspectable Script/Cargo project whose
-  bootstrap uses the Cargo bridge signer for registration and job-ACME.
-
-Deploy doctor:
-  switchboard deploy doctor --run-dir .switchboard/runs/<id>
-  switchboard deploy doctor --intent-id di_... --relay-url https://control.switchboard.proof.computer --intent-token-env SWITCHBOARD_INTENT_TOKEN
-  switchboard deploy doctor --report report.json --probe
-  deploy doctor is read-only. --probe performs only public TLS/SNI and SSH
-  banner checks. It never spends, deploys, mutates DNS/routes, or records
-  settlement.
-
-Contexts:
-  switchboard context add mainnet
-  switchboard context set mainnet --use --acurast-seed-env ACURAST_MAINNET_SEED --acurast-address-env ACURAST_MAINNET_ADDRESS
-  switchboard context set mainnet --use --polkadot-address-env POLKADOT_ADDRESS --polkadot-seed-env POLKADOT_SEED
-  switchboard context set ledger --use --polkadot-signer ledger --polkadot-address <address> --ledger-account 0
-  switchboard context use mainnet
-  Contexts live in ~/.switchboard/contexts.json by default and store env var
-  names for secrets, not secret values. The CLI also auto-loads
-  ~/.switchboard/secrets/<context>.env when the selected context exists.
-  Override with SWITCHBOARD_HOME or SWITCHBOARD_CONTEXT_SECRET_FILE.
-  --acurast-seed-env <env>         Env var containing the Acurast deploy seed
-  --acurast-address-env <env>      Env var containing the expected Acurast address
-  --polkadot-seed-env <env>        Env var containing the Polkadot payment seed
-  --polkadot-address-env <env>     Env var containing the Polkadot payment address
-  --polkadot-address <address>     Store non-secret Polkadot payment address directly
-  --polkadot-ss58-format <n>       Store preferred ss58 format for local native seed signing
-  --ledger-chain <chain>           Ledger chain key, default polkadot or statemint legacy
-  --ledger-slip44 <n>              Generic Ledger slip44, default 354
-  --developer-private-key-env <env> Env var containing the EVM developer key
-  --cloudflare-api-token-env <env> PROOF/internal DNS provider token env name
-
-${advanced ? `PROOF DNS context commands:
-  switchboard context dns set cloudflare --token-env <NAME>
-  switchboard context dns clear [provider]
-  Support/admin commands for PROOF-managed DNS authority. Normal app deploys
-  and customer-domain setup do not require DNS provider tokens.
-
-Ops profiles:
-  switchboard ops init mainnet --domain switchboard.proof.computer
-  switchboard ops show mainnet
-  switchboard ops paths mainnet --context mainnet
-  Ops config lives in ~/.switchboard/ops/<profile>/config.json and secrets
-  in ~/.switchboard/ops/<profile>/secrets.env. Use --ops-profile <name> or
-  SWITCHBOARD_OPS_PROFILE to select a profile for relay/catalog/operator admin
-  commands. Managed ops commands treat the profile config as authoritative for
-  non-secret config; explicit command flags still win, and non-empty shell
-  secrets are preserved over blank secret-file placeholders.
-
-` : ""}
-Customer hostnames:
-  switchboard hostname add app.example.com --developer-private-key <key>
-  switchboard hostname remove app.example.com --developer-private-key <key>
-  switchboard hostname status app.example.com
-  The CLI looks up NS records and prints the likely DNS control-panel link.
-  --endpoint <hostname>            Canonical PROOF endpoint, defaults from --report
-  --endpoint-id <id>               Stable endpoint ID, defaults to endpoint hostname
-  --customer-hostname <hostname>   Alternative to positional hostname
-  --tls-mode <mode>                proof-acme (default) or byo-certificate
-  --byo-tls                        Alias for --tls-mode byo-certificate
-  --manual-dns01                   Use manual _acme-challenge TXT instead of CNAME delegation
-  --certificate-validation-mode <mode>
-                                  dns01-cname-delegation (default) or dns01-manual
-  --developer-private-key <key>    EVM developer key matching the funded session
-  --hub-signer <mode>              evm or polkadot; auto-detects matching signer when possible
-  --polkadot-seed <uri>            Native signer seed for sessions funded from a mapped Polkadot account
-  --polkadot-address <address>     Expected native signer address
-  --chain-id <id>                  EIP-712 chain ID, default from target/CHAIN_ID
-  --wait                           Poll until DNS validates, default 300 seconds
-  --wait-seconds <n>               Explicit wait duration
-  --poll-seconds <n>               Poll interval, default 10
-  --route-intent-url <url>         Gateway route-intent API for customer SNI status
-  --operator-ssh-host <host>       SSH host when the route-intent API is on the operator
-  --check-timeout-ms <n>           HTTPS readiness timeout, default 10000
-  --skip-readiness-checks          Only show relay DNS/certificate authorization state
-
-Gateway setup:
-  switchboard gateway setup --manager-address <address> --manager-id <id>
-  --management-address <address>   Alias for --manager-address
-  --public-address <ip-or-host>    Default fetched with curl --ipv4 https://ifconfig.me/ip
-  --processor-file <path>          Read processor include list from JSON, CSV, or newline text
-  --payout-address <0xaddress>     Operator payout recipient to advertise
-  --generate-report-seed           Generate and store a new local sr25519 report seed
-  --prepare-admission              Write redacted operator-admission-request.json for PROOF admission
-  --admission-file <path>          Apply a PROOF-issued admission bundle
-  --env-file <path>                Default .operator-host/operator.env
-  --image-registry <registry/ns>   Default ghcr.io/proof-computer/switchboard-gateway
-  --image-tag <tag>                Default latest
-  --skip-install                   Do not install Docker/Compose if missing
-  --skip-compose                   Write config but do not launch compose
-  --gateway-agent-port <port>      Gateway-agent API port, default 18080
-  --upstream-admission-url <url>   URL relays should use for gateway upstream admission
-  --route-state-url <url>          Default control-plane route-state polling URL when OPERATOR_ID is known
-  --route-state-token-env <env>    Env var containing route-state bearer token
-  --route-intent-token-env <env>   Env var containing gateway route-intent bearer token
-  --local-build                    Build local repo images instead of pulling prebuilt images
-  --local-only                     Allow lab setup without relay admission/reporting material
-  --dry-run                        Print checks and planned actions only
-
-Gateway discover:
-  switchboard gateway discover --manager-id <id> --public-address <ip-or-host>
-  --gateway-agent-url <url>        Default http://127.0.0.1:18080
-  --available                      Check Acurast schedule conflicts; enabled by default
-  --skip-availability              Skip existing-job/schedule conflict checks
-  --limit <n>                      Test next n processors not checked recently
-  --smoke-hostname <hostname>      Temporarily route and TLS-probe this SNI name
-  --state-file <path>              Operator-local discovery state file
-  --ready-ttl-ms <ms>              Recent-ready TTL for cached readiness
-  --recent-check-ttl-ms <ms>       Recent-check TTL for --limit
-  --no-state                       Do not read or write discovery state
-  --write-env <path>               Write suggested gateway env values
-
-Gateway status and upgrade:
-  switchboard gateway status
-  switchboard gateway upgrade --yes
-  --project-dir <path>             Operator project directory
-  --compose-file <path[,path...]>  Compose file(s), default docker-compose.yaml
-  --env-file <path>                Env file, default .operator-host/operator.env
-  --gateway-agent-url <url>        Status check URL, default http://127.0.0.1:18080
-  --capability-url <url>           Relay capability lookup URL
-  --capability-token-env <env>     Env var containing relay capability read/write token
-  --dry-run                        For upgrade, print docker compose commands only
-  --keep-image-override            For upgrade, keep old/custom image env overrides
-
-Launch demo:
-  switchboard launch-demo --yes-spend
-  --yes-spend                      Required; spends ACU and the configured Hub payment asset
-  --dry-run                        Print selected capacity and planned config without side effects
-  Relay                            Default ${DEFAULT_CONTROL_PLANE_URL} from the signed manifest/control plane
-  Operator/manager/processor       Auto-selected from live operator capacity
-  --duration-minutes <minutes>     Default ${DEFAULT_LAUNCH_DEMO_DURATION_MINUTES}
-  --ha                             Request a 3-processor HA endpoint group
-  --processor-count <n>            Number of processors to launch for HA, default 1 or 3 with --ha
-  --min-ready <n>                  Minimum successful replicas required, default processor-count
-  --demo-package <spec>            Demo package spec; use file:/path/to/switchboard-express-demo for local clones
-  Ingress estimate                 Previewed before Acurast deploy/funding
-  --quote-preview-timeout-ms <ms>  Default 15000; retried on transient relay failures
-  Acurast start delay              Fixed 3 minutes
-  --max-cost-per-execution <n>     Default ${DEFAULT_LAUNCH_DEMO_MAX_COST_PER_EXECUTION}
-
-Deploy defaults:
-  --yes                            Required; spends ACU and the configured Hub payment asset
-  --dry-run                        Print the deploy runner command without side effects
-  --entrypoint <path>              Required unless switchboard.json has acurast.entrypoint
-  --runtime <node|script>          Default node; script maps to Acurast Cargo Shell
-  --script-image-url <url>         Required for script runtime unless switchboard.json sets acurast.scriptImage.url
-  --script-image-sha256 <sha256>   Required for script runtime unless switchboard.json sets acurast.scriptImage.sha256
-  --ssh-public-key-file <path>     Authorized SSH public keys for Script SSH templates
-  Canonical hostname               Relay-allocated under ingress.<tld>
-  --relay-url <url>                Default ${DEFAULT_CONTROL_PLANE_URL}
-  Operator/manager/processor       Auto-selected from live operator capacity unless pinned
-  --operator-id <bytes32>          Pin to one operator ID
-  --gateway-id <id>                Pin launch-demo/deploy capacity to one gateway ID
-  --processor <account>            Pin to one Acurast processor
-  --duration-minutes <minutes>     Default ${DEFAULT_DEPLOY_DURATION_MINUTES}; derives lease seconds and job runtime
-  --lease-minutes <minutes>        Alias for --duration-minutes
-  --schedule-buffer-minutes <n>    Extra runtime beyond lease, default ${DEFAULT_DEPLOY_SCHEDULE_BUFFER_MINUTES}
-  --quote                          Default; fund through a signed deployment-intent quote
-  --payment-mode <mode>            quote only
-  --report <path>                  Deployment report JSON to diagnose
-  --run-dir <path>                 Deploy run directory for workflow snapshots
-  --snapshot <path>                Deploy workflow snapshot for status/resume
-  --allow-late-funding             Resume funding after an expired Acurast start/end window
-${advanced ? "  --execution-ms <ms>              Override derived Acurast job runtime\n" : ""}
-`);
+The standalone switchboard command router has moved to the native PROOF CLI.
+${requestedLine}
+This package now supplies command-specific shared runner exports for
+@proof-computer/proof-cli-switchboard. No standalone command compatibility
+fallback remains in switchboard-cli.`);
 }
 
 function isMainModule(): boolean {
@@ -12512,7 +11932,7 @@ function isMainModule(): boolean {
 }
 
 if (isMainModule()) {
-  runSwitchboardCli().catch((error: unknown) => {
+  runStandaloneSwitchboardCli().catch((error: unknown) => {
     if (!errorOutputHandled(error)) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[switchboard] ${message}`);

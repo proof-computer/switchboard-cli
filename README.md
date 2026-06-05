@@ -1,16 +1,20 @@
-# Switchboard CLI
+# Switchboard CLI Shared Runners
 
-Install Switchboard, launch the Switchboard Express demo, and get a public
-HTTPS URL.
+Legacy command-specific shared runners for the native
+`proof switchboard ...` CLI.
 
-Switchboard is in private beta. The CLI is public, while hosted capacity and
-registry access are invite-gated.
+The standalone `switchboard` command router has been retired. The packaged
+`switchboard` bin now prints a migration handoff and no longer dispatches
+migrated commands. Use the PROOF umbrella CLI for user-facing Switchboard
+commands. New CLI work belongs in `@proof-computer/proof-cli-switchboard`, not
+in this legacy non-oclif package.
 
 ## Quickstart
 
 ```bash
-curl -fsSL https://github.com/proof-computer/switchboard-cli/releases/latest/download/install.sh | bash
-switchboard --help
+npm install -g @proof-computer/proof-cli
+proof plugins install @proof-computer/proof-cli-switchboard
+proof switchboard --help
 ```
 
 ```bash
@@ -21,17 +25,17 @@ export POLKADOT_ADDRESS='<polkadot ss58 address>'
 ```
 
 ```bash
-switchboard context add mainnet
-switchboard preflight
+proof switchboard context add mainnet
+proof switchboard preflight
 ```
 
 ```bash
 mkdir -p switchboard-demo
 cd switchboard-demo
-switchboard init --project switchboard-demo --context mainnet
-switchboard launch-demo --dry-run
-switchboard launch-demo --yes-spend
-switchboard status
+proof switchboard init --project switchboard-demo --context mainnet
+proof switchboard launch-demo --dry-run
+proof switchboard launch-demo --yes-spend
+proof switchboard status
 ```
 
 You need ACU on Acurast mainnet for the demo job, Hub USDC for the Switchboard
@@ -44,6 +48,10 @@ the `switchboard-express-demo` repository; the CLI does not carry a copied
 demo renderer.
 
 ## Install Details
+
+This legacy installer path is retained only for already-published standalone
+release assets and migration diagnostics. New installs should use
+`@proof-computer/proof-cli` plus `@proof-computer/proof-cli-switchboard`.
 
 The installer downloads the `switchboard-cli.tgz` package from GitHub Releases,
 installs it into `~/.local/share/switchboard`, and writes a `switchboard`
@@ -74,15 +82,16 @@ pnpm test
 pnpm build
 ```
 
-Run the CLI from source:
+Run the standalone migration handoff from source:
 
 ```bash
 pnpm switchboard --help
 ```
 
-The PROOF umbrella CLI plugin calls command-specific shared runners from this
-package when available, falling back to the packaged `switchboard` binary for
-older installs. Deploy, launch-demo, validator launch, relay DNS
+The PROOF umbrella CLI plugin temporarily calls command-specific shared runners
+from this package. It does not fall back to the packaged `switchboard` binary.
+Deploy,
+launch-demo, validator launch, relay DNS
 apply/remove, relay spec backfill, bootstrap, ops, and the read-only/local
 diagnostic surfaces are exported as Switchboard runners for native
 `proof switchboard ...` oclif commands. Acurast remains an implementation

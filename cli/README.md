@@ -1,35 +1,39 @@
-# Switchboard CLI
+# Switchboard CLI Shared Runner Reference
 
-Status: active CLI reference
-Last reviewed: 2026-06-04
+Status: shared runner reference
+Last reviewed: 2026-06-05
 
-Developer-facing command wrapper for Switchboard.
+Developer-facing Switchboard commands are now native `proof switchboard ...`
+entrypoints in `@proof-computer/proof-cli-switchboard`. This package keeps the
+temporary command-specific shared runner implementations that those entrypoints
+call while code is migrated into oclif plugin/shared-library code.
+The standalone `switchboard` command router is retired and prints a migration
+handoff only. Do not add new user-facing CLI behavior here.
 
-Run from the repo root:
+Run user-facing commands through the PROOF CLI:
 
 ```text
-pnpm switchboard -- help
-pnpm switchboard -- init --project hello-api --context mainnet
-pnpm switchboard -- context add mainnet
-pnpm switchboard -- preflight --quote
-pnpm switchboard -- deploy --yes --dry-run --json
-pnpm switchboard -- status
-pnpm switchboard -- logs
-pnpm switchboard -- claimable --recipient 0x...
-pnpm switchboard -- claim --recipient 0x...
-pnpm switchboard -- refundable --session-id <bytes32>
-pnpm switchboard -- refund --session-id <bytes32>
-pnpm switchboard -- hostname add app.example.com
-pnpm switchboard -- hostname add app.example.com --byo-tls
-pnpm switchboard -- validator script --json
-pnpm switchboard -- relay list --json
-pnpm switchboard -- relay diff --json
-pnpm switchboard -- relay sync --dry-run
-pnpm switchboard -- relay whoami relay-d --json
-pnpm switchboard -- relay status relay-d --catalog-file relays/catalog.json
-pnpm switchboard -- relay verify relay-d
-pnpm switchboard -- relay dns plan relay-d
-pnpm switchboard -- relay dns verify relay-d
+proof switchboard --help
+proof switchboard init --project hello-api --context mainnet
+proof switchboard context add mainnet
+proof switchboard preflight --quote
+proof switchboard deploy --yes --dry-run --json
+proof switchboard status
+proof switchboard claimable --recipient 0x...
+proof switchboard claim --recipient 0x...
+proof switchboard refundable --session-id <bytes32>
+proof switchboard refund --session-id <bytes32>
+proof switchboard hostname add app.example.com
+proof switchboard hostname add app.example.com --byo-tls
+proof switchboard validator script --json
+proof switchboard relay list --json
+proof switchboard relay diff --json
+proof switchboard relay sync --dry-run
+proof switchboard relay whoami relay-d --json
+proof switchboard relay status relay-d --catalog-file relays/catalog.json
+proof switchboard relay verify relay-d
+proof switchboard relay dns plan relay-d
+proof switchboard relay dns verify relay-d
 ```
 
 `context add` is interactive: it prompts for Acurast/Polkadot env vars,
@@ -68,23 +72,23 @@ Local config ownership is split by intent:
 - Switchboard/PROOF ops secrets live in
   `~/.switchboard/ops/<profile>/secrets.env`.
 
-Use `pnpm switchboard -- ops init mainnet` to create the mainnet ops profile,
-`pnpm switchboard -- ops show mainnet` to inspect current non-secret config,
-and `pnpm switchboard -- ops paths mainnet` to see the concrete files.
+Use `proof switchboard ops init mainnet` to create the mainnet ops profile,
+`proof switchboard ops show mainnet` to inspect current non-secret config,
+and `proof switchboard ops paths mainnet` to see the concrete files.
 Low-level Hub session recovery tools are still available under the `session`
 namespace for development and recovery:
 
 ```text
-pnpm switchboard -- session register --relay-url https://control.switchboard.proof.computer --yes --json
-pnpm switchboard -- session status --json --session-id <bytes32>
-pnpm switchboard -- session refund --session-id <bytes32> --yes
+proof switchboard session register --relay-url https://control.switchboard.proof.computer --yes --json
+proof switchboard session status --json --session-id <bytes32>
+proof switchboard session refund --session-id <bytes32> --yes
 ```
 
 For Ledger-backed PROOF payment/funding, configure the context with the
 Ledger-derived Polkadot address:
 
 ```text
-pnpm switchboard -- context set ledger --use --polkadot-signer ledger --polkadot-address <ledger-polkadot-address> --ledger-account 0 --ledger-address-index 0 --ledger-metadata-chain-id <zondax-chain-id>
+proof switchboard context set ledger --use --polkadot-signer ledger --polkadot-address <ledger-polkadot-address> --ledger-account 0 --ledger-address-index 0 --ledger-metadata-chain-id <zondax-chain-id>
 ```
 
 `--ledger-mode generic` uses the Polkadot Generic app. The legacy Statemint app

@@ -7,7 +7,6 @@ import { describe, it } from "node:test";
 import { ethers } from "ethers";
 
 import {
-  runSwitchboardCli,
   runSwitchboardCatalogBuild,
   runSwitchboardCatalogInspect,
   runSwitchboardCatalogSetState,
@@ -3404,7 +3403,7 @@ describe("native command runners", () => {
           assert.equal(request.payload?.certificateValidationMode, "dns01-manual");
           assert.equal(request.payload?.signatureScheme, "eip712-secp256k1");
           assert.equal(request.payload?.signer, new ethers.Wallet(hostnameDeveloperPrivateKey).address);
-          assert.equal((request.payload?.source as Record<string, unknown>)?.cli, "switchboard hostname add");
+          assert.equal((request.payload?.source as Record<string, unknown>)?.cli, "proof switchboard hostname add");
           assert.equal(typeof request.payload?.signature, "string");
         }
       });
@@ -3458,7 +3457,7 @@ describe("native command runners", () => {
           assert.equal(request.payload?.nonce, "123");
           assert.equal(request.payload?.signatureScheme, "eip712-secp256k1");
           assert.equal(request.payload?.signer, new ethers.Wallet(hostnameDeveloperPrivateKey).address);
-          assert.equal((request.payload?.source as Record<string, unknown>)?.cli, "switchboard hostname remove");
+          assert.equal((request.payload?.source as Record<string, unknown>)?.cli, "proof switchboard hostname remove");
           assert.equal(typeof request.payload?.signature, "string");
         }
       });
@@ -3476,7 +3475,7 @@ describe("native command runners", () => {
         );
         await assert.rejects(
           runSwitchboardHostnameAdd(["--endpoint", "demo.ingress.example", ...manifestArgs], runtimeWithoutLatestReport, hostnameMutationAdapters()),
-          /Missing customer hostname\. Use `switchboard hostname add app\.example\.com`/
+          /Missing customer hostname\. Use `proof switchboard hostname add app\.example\.com`/
         );
         await assert.rejects(
           runSwitchboardHostnameAdd(["app.example.com", "--endpoint", "demo.ingress.example", ...manifestArgs], runtimeWithoutLatestReport, hostnameMutationAdapters()),
@@ -3523,7 +3522,7 @@ describe("native command runners", () => {
         );
         await assert.rejects(
           runSwitchboardHostnameRemove(["--endpoint", "demo.ingress.example", ...manifestArgs], runtimeWithoutLatestReport, hostnameMutationAdapters()),
-          /Missing customer hostname\. Use `switchboard hostname remove app\.example\.com`/
+          /Missing customer hostname\. Use `proof switchboard hostname remove app\.example\.com`/
         );
         await assert.rejects(
           runSwitchboardHostnameRemove(["app.example.com", "--endpoint", "demo.ingress.example", ...manifestArgs], runtimeWithoutLatestReport, hostnameMutationAdapters()),
@@ -3688,7 +3687,7 @@ describe("native command runners", () => {
 
       await assert.rejects(
         runSwitchboardHostnameStatus(["--endpoint", "demo.ingress.example", ...manifestArgs], runtimeWithoutLatestReport),
-        /Missing customer hostname\. Use `switchboard hostname status app\.example\.com --endpoint <endpoint>`\./
+        /Missing customer hostname\. Use `proof switchboard hostname status app\.example\.com --endpoint <endpoint>`\./
       );
     });
   });

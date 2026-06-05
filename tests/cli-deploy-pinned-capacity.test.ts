@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 import { encodeAddress } from "@polkadot/util-crypto";
 
@@ -693,7 +693,7 @@ describe("switchboard launch-demo workflow shell", () => {
           baseUrl,
           "--allow-local-relay",
           "--demo-package",
-          "github:proof-computer/switchboard-express-demo#v0.1.8",
+          "github:proof-computer/switchboard-express-demo#v0.1.10",
           "--operator-id",
           operatorId,
           "--processor",
@@ -710,11 +710,12 @@ describe("switchboard launch-demo workflow shell", () => {
         assert.equal(output.code, "SB_LAUNCH_DEMO_RUNTIME_STALE");
         assert.match(output.error, /gateway upstream admission/);
         assert.match(output.error, /certificate-prep progress/);
-        assert.equal(output.demoProject.packageVersion, "0.1.8");
-        assert.equal(output.required.minVersion, "0.1.10");
-        assert.equal(output.required.minSdkVersion, "0.1.4");
-        assert.deepEqual(output.required.capabilities, ["gateway_upstream_admission", "certificate_prep_progress", "ecdsa_p256_csr"]);
-        assert.equal(output.required.packageSpec, "github:proof-computer/switchboard-express-demo#v0.1.10");
+        assert.match(output.error, /post-certificate readiness progress/);
+        assert.equal(output.demoProject.packageVersion, "0.1.10");
+        assert.equal(output.required.minVersion, "0.1.11");
+        assert.equal(output.required.minSdkVersion, "0.1.5");
+        assert.deepEqual(output.required.capabilities, ["gateway_upstream_admission", "certificate_prep_progress", "ecdsa_p256_csr", "post_certificate_readiness_progress"]);
+        assert.equal(output.required.packageSpec, "github:proof-computer/switchboard-express-demo#v0.1.11");
         assert.equal(createIntentRequests.length, 0);
       } finally {
         await rm(cwd, { recursive: true, force: true });
@@ -1418,7 +1419,7 @@ function runCli(
   return new Promise((resolve, reject) => {
     const [command, ...rest] = args;
     const cliArgs = command ? [command, "--project-dir", cwd, ...rest] : args;
-    const child = spawn(process.execPath, ["--import", "tsx", cliPath, ...cliArgs], {
+    const child = spawn(process.execPath, ["--import", "tsx", "--eval", runnerEvalScript(cliArgs)], {
       cwd: cliRoot,
       env: {
         ...process.env,
@@ -1442,6 +1443,50 @@ function runCli(
       });
     });
   });
+}
+
+function runnerEvalScript(args: string[]): string {
+  return `
+const module = await import(${JSON.stringify(pathToFileURL(cliPath).href)});
+const args = ${JSON.stringify(args)};
+const positionals = positionalsFrom(args);
+const runner = positionals[0] === "launch-demo"
+  ? module.runSwitchboardLaunchDemo
+  : positionals[0] === "deploy"
+    ? module.runSwitchboardDeploy
+    : positionals[0] === "init"
+      ? module.runSwitchboardProjectInit
+    : undefined;
+if (!runner) {
+  throw new Error("Unsupported test runner command: " + args.join(" "));
+}
+try {
+  await runner(args);
+} catch (error) {
+  const handled = error && typeof error === "object" && error.switchboardOutputHandled;
+  if (!handled) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("[switchboard] " + message);
+  }
+  process.exitCode = 1;
+}
+function positionalsFrom(argv) {
+  const out = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--") continue;
+    if (arg.startsWith("--")) {
+      const withoutPrefix = arg.slice(2);
+      if (!withoutPrefix.startsWith("no-") && !withoutPrefix.includes("=") && argv[index + 1] && !argv[index + 1].startsWith("-")) {
+        index += 1;
+      }
+      continue;
+    }
+    out.push(arg);
+  }
+  return out;
+}
+`;
 }
 
 async function startJsonServer(

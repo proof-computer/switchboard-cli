@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 
 import { runSwitchboardDeployResume, runSwitchboardDeployStatus } from "../cli/src/index.js";
@@ -626,8 +626,12 @@ function runCli(
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const [command, ...rest] = args;
-    const cliArgs = command ? [command, "--project-dir", cwd, ...rest] : args;
-    const child = spawn(process.execPath, ["--import", "tsx", cliPath, ...cliArgs], {
+    const cliArgs = command && (rest[0] === "resume" || rest[0] === "status")
+      ? [command, rest[0], "--project-dir", cwd, ...rest.slice(1)]
+      : command
+        ? [command, "--project-dir", cwd, ...rest]
+        : args;
+    const child = spawn(process.execPath, ["--import", "tsx", "--eval", runnerEvalScript(cliArgs)], {
       cwd: cliRoot,
       env: {
         ...process.env,
@@ -651,6 +655,48 @@ function runCli(
       });
     });
   });
+}
+
+function runnerEvalScript(args: string[]): string {
+  return `
+const module = await import(${JSON.stringify(pathToFileURL(cliPath).href)});
+const args = ${JSON.stringify(args)};
+const positionals = positionalsFrom(args);
+const runner = positionals[0] === "deploy" && positionals[1] === "resume"
+  ? module.runSwitchboardDeployResume
+  : positionals[0] === "deploy" && positionals[1] === "status"
+    ? module.runSwitchboardDeployStatus
+    : undefined;
+if (!runner) {
+  throw new Error("Unsupported test runner command: " + args.join(" "));
+}
+try {
+  await runner(args);
+} catch (error) {
+  const handled = error && typeof error === "object" && error.switchboardOutputHandled;
+  if (!handled) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("[switchboard] " + message);
+  }
+  process.exitCode = 1;
+}
+function positionalsFrom(argv) {
+  const out = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--") continue;
+    if (arg.startsWith("--")) {
+      const withoutPrefix = arg.slice(2);
+      if (!withoutPrefix.startsWith("no-") && !withoutPrefix.includes("=") && argv[index + 1] && !argv[index + 1].startsWith("-")) {
+        index += 1;
+      }
+      continue;
+    }
+    out.push(arg);
+  }
+  return out;
+}
+`;
 }
 
 function readRequestJson(request: IncomingMessage): Promise<Record<string, unknown>> {

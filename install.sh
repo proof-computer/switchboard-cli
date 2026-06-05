@@ -125,13 +125,13 @@ install_cli_package() {
   tmp="$(mktemp -d)"
   package_tgz="$tmp/switchboard-cli.tgz"
 
-  log "Downloading Switchboard CLI package from $SWITCHBOARD_CLI_PACKAGE_URL"
+  log "Downloading legacy Switchboard shared-runner package from $SWITCHBOARD_CLI_PACKAGE_URL"
   curl -fsSL "$SWITCHBOARD_CLI_PACKAGE_URL" -o "$package_tgz"
   if [ -n "${SWITCHBOARD_CLI_SHA256:-}" ]; then
     sha256_verify "$SWITCHBOARD_CLI_SHA256" "$package_tgz"
   fi
 
-  log "Installing Switchboard CLI under $SWITCHBOARD_NPM_PREFIX"
+  log "Installing legacy Switchboard shared-runner package under $SWITCHBOARD_NPM_PREFIX"
   PATH="$node_bin:$PATH" "$npm" uninstall --global --prefix "$SWITCHBOARD_NPM_PREFIX" --cache "$SWITCHBOARD_NPM_CACHE" switchboard-cli >/dev/null 2>&1 || true
   PATH="$node_bin:$PATH" "$npm" install --global --force --ignore-scripts --prefix "$SWITCHBOARD_NPM_PREFIX" --cache "$SWITCHBOARD_NPM_CACHE" --omit=dev --omit=optional "$package_tgz"
 
@@ -152,7 +152,7 @@ main() {
   write_wrapper "$node_bin" "$SWITCHBOARD_NPM_PREFIX" "$SWITCHBOARD_BIN_DIR"
 
   log ""
-  log "Switchboard CLI installed:"
+  log "Legacy Switchboard package installed:"
   "$SWITCHBOARD_BIN_DIR/switchboard" --help >/dev/null
   log "  $SWITCHBOARD_BIN_DIR/switchboard"
   log ""
@@ -163,7 +163,7 @@ main() {
       log "  export PATH=\"$SWITCHBOARD_BIN_DIR:\$PATH\""
       ;;
   esac
-  log "Run: switchboard --help"
+  log "User-facing commands now live in PROOF CLI. Run: proof switchboard --help"
 }
 
 main "$@"

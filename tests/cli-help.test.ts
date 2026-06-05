@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { assertNoRemovedPublicCommandFlags, printHelp, runSwitchboardCli, sanitizeOutputValue } from "../cli/src/index.js";
+import { assertNoRemovedPublicCommandFlags, printHelp, runStandaloneSwitchboardCli, sanitizeOutputValue } from "../cli/src/index.js";
 
 function captureHelp(options?: { advanced?: boolean }): string {
   const originalLog = console.log;
@@ -18,53 +18,25 @@ function captureHelp(options?: { advanced?: boolean }): string {
 }
 
 describe("switchboard help", () => {
-  it("shows gateway commands in default help while keeping PROOF admin commands advanced", () => {
+  it("prints the standalone migration handoff instead of command compatibility help", () => {
     const help = captureHelp();
 
-    assert.match(help, /gateway setup/);
-    assert.match(help, /gateway discover/);
-    assert.doesNotMatch(help, /operator setup/);
-    assert.doesNotMatch(help, /operator discover/);
-    assert.match(help, /launch-demo/);
-    assert.match(help, /deploy doctor/);
-    assert.match(help, /Deploy doctor:/);
-    assert.match(help, /Launch demo:/);
-    assert.match(help, /switchboard launch-demo --yes-spend/);
-    assert.match(help, /--max-cost-per-execution <n>\s+Default 40000000000/);
-    assert.match(help, /Acurast start delay\s+Fixed 3 minutes/);
-    assert.doesNotMatch(help, /^\s+logs$/m);
-    assert.doesNotMatch(help, /Decrypt encrypted job logs/);
-    assert.doesNotMatch(help, /log-sink/);
-    assert.match(help, /Gateway setup:/);
-    assert.match(help, /--generate-report-seed/);
-    assert.match(help, /--prepare-admission/);
-    assert.match(help, /--admission-file <path>/);
-    assert.match(help, /--payout-address <0xaddress>/);
-    assert.match(help, /--processor-file <path>/);
-    assert.match(help, /Gateway status and upgrade:/);
-    assert.match(help, /--capability-token-env <env>/);
-    assert.match(help, /PROOF-required and admin commands are hidden/);
+    assert.match(help, /standalone switchboard command router has moved/);
+    assert.match(help, /proof switchboard --help/);
+    assert.match(help, /command-specific shared runner exports/);
+    assert.doesNotMatch(help, /switchboard launch-demo --yes-spend/);
+    assert.doesNotMatch(help, /Gateway setup:/);
+  });
+
+  it("ignores old advanced help and keeps the migration handoff", () => {
+    const help = captureHelp({ advanced: true });
+
+    assert.match(help, /proof switchboard --help/);
     assert.doesNotMatch(help, /Advanced session commands:/);
-    assert.doesNotMatch(help, /PROOF ops commands:/);
     assert.doesNotMatch(help, /Admin relay commands:/);
   });
 
-  it("shows PROOF/admin namespaces with advanced help", () => {
-    const help = captureHelp({ advanced: true });
-
-    assert.match(help, /gateway setup/);
-    assert.doesNotMatch(help, /operator setup/);
-    assert.match(help, /Advanced session commands:/);
-    assert.match(help, /PROOF ops commands:/);
-    assert.match(help, /Admin relay commands:/);
-    const deployHelp = help.slice(help.indexOf("Deploy defaults:"));
-    assert.doesNotMatch(deployHelp, /--route-activation-mode/);
-    assert.doesNotMatch(deployHelp, /--record-fulfillment/);
-    assert.doesNotMatch(deployHelp, /--validator-mode/);
-    assert.doesNotMatch(help, /--control-plane-token-env/);
-  });
-
-  it("can run compatibility help through the exported CLI runner", async () => {
+  it("can run standalone migration help through the exported standalone runner", async () => {
     const originalLog = console.log;
     const lines: string[] = [];
     console.log = (line?: unknown) => {
@@ -72,17 +44,17 @@ describe("switchboard help", () => {
     };
 
     try {
-      await runSwitchboardCli(["--help"], { contextStorePath: "/tmp/switchboard-test-contexts.json" });
+      await runStandaloneSwitchboardCli(["--help"]);
     } finally {
       console.log = originalLog;
     }
 
     const help = lines.join("\n");
-    assert.match(help, /Switchboard, a PROOF project/);
-    assert.match(help, /switchboard launch-demo --yes-spend/);
+    assert.match(help, /proof switchboard --help/);
+    assert.match(help, /No standalone command compatibility/);
   });
 
-  it("can run gateway setup help through the exported CLI runner", async () => {
+  it("prints command-specific migration help for a retired standalone help request", async () => {
     const originalLog = console.log;
     const lines: string[] = [];
     console.log = (line?: unknown) => {
@@ -90,20 +62,21 @@ describe("switchboard help", () => {
     };
 
     try {
-      await runSwitchboardCli(["gateway", "setup", "--help"], { contextStorePath: "/tmp/switchboard-test-contexts.json" });
+      await runStandaloneSwitchboardCli(["gateway", "setup", "--help"]);
     } finally {
       console.log = originalLog;
     }
 
     const help = lines.join("\n");
-    assert.match(help, /Usage: switchboard gateway setup/);
-    assert.match(help, /--upstream-admission-url/);
+    assert.match(help, /Requested standalone command:/);
+    assert.match(help, /switchboard gateway setup --help/);
+    assert.match(help, /proof switchboard gateway setup --help/);
   });
 
-  it("rejects the removed operator command topic", async () => {
+  it("rejects migrated standalone command routing", async () => {
     await assert.rejects(
-      runSwitchboardCli(["operator", "setup", "--help"], { contextStorePath: "/tmp/switchboard-test-contexts.json" }),
-      /Unknown command: operator setup/
+      runStandaloneSwitchboardCli(["operator", "setup"]),
+      /SB_STANDALONE_SWITCHBOARD_MIGRATED:.*proof switchboard operator setup/
     );
   });
 

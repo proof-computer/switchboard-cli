@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 
 const cliRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -479,7 +479,7 @@ async function fileExists(filePath: string): Promise<boolean> {
 
 function runCli(args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["--import", "tsx", cliPath, ...args], {
+    const child = spawn(process.execPath, ["--import", "tsx", "--eval", runnerEvalScript(args)], {
       cwd: cliRoot,
       env: {
         ...process.env,
@@ -502,6 +502,23 @@ function runCli(args: string[]): Promise<{ code: number | null; stdout: string; 
       });
     });
   });
+}
+
+function runnerEvalScript(args: string[]): string {
+  return `
+const module = await import(${JSON.stringify(pathToFileURL(cliPath).href)});
+const args = ${JSON.stringify(args)};
+try {
+  await module.runSwitchboardProjectInit(args);
+} catch (error) {
+  const handled = error && typeof error === "object" && error.switchboardOutputHandled;
+  if (!handled) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("[switchboard] " + message);
+  }
+  process.exitCode = 1;
+}
+`;
 }
 
 function runGeneratedShellScript(

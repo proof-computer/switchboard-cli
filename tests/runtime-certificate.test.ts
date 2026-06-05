@@ -86,8 +86,16 @@ describe("Switchboard runtime certificate requests", () => {
 
   it("allows explicit local HTTP but rejects other URL schemes", async () => {
     const urls: string[] = [];
+    const progress: Array<{ stage: string; hostname: string }> = [];
     await requestCertificateWithRelay(
-      { ...exampleCertificateConfig(), relayUrl: "http://127.0.0.1:3000", allowInsecureHttp: true },
+      {
+        ...exampleCertificateConfig(),
+        relayUrl: "http://127.0.0.1:3000",
+        allowInsecureHttp: true,
+        onProgress: (event) => {
+          progress.push(event);
+        }
+      },
       async (url) => {
         urls.push(url.toString());
         return new Response(JSON.stringify({ certificatePem: "cert", issuer: "test" }), {
@@ -97,6 +105,7 @@ describe("Switchboard runtime certificate requests", () => {
       }
     );
     assert.deepEqual(urls, ["http://127.0.0.1:3000/v1/certificates"]);
+    assert.deepEqual(progress.map((event) => event.stage), ["request_signing", "relay_request", "relay_response"]);
 
     await assert.rejects(
       () => requestCertificateWithRelay(

@@ -113,7 +113,7 @@ export interface SwitchboardCertificateConfig {
 
 export type SwitchboardCertificateKeyAlgorithm = "ecdsa-p256" | "rsa-2048";
 
-export type SwitchboardCertificateRequestProgressStage = "csr_generation" | "request_signing" | "relay_request";
+export type SwitchboardCertificateRequestProgressStage = "csr_generation" | "request_signing" | "relay_request" | "relay_response";
 
 export interface SwitchboardCertificateRequestProgress {
   stage: SwitchboardCertificateRequestProgressStage;
@@ -187,6 +187,7 @@ export type SwitchboardCertificateFailureStage =
   | "csr_generation"
   | "request_signing"
   | "relay_request"
+  | "certificate_install"
   | "certificate_authorization"
   | "acme_issuance"
   | "relay_response";
@@ -497,6 +498,7 @@ export async function requestCertificateWithRelay(
   }
 
   const relayResponse = (await responseJsonOrText(response)) as SwitchboardCertificateResult["relayResponse"];
+  await config.onProgress?.({ stage: "relay_response", hostname: request.certificateRequest.hostname });
   if (!response.ok) {
     const hostname = config.hostname.trim().toLowerCase();
     throw new SwitchboardCertificateError(
