@@ -82,7 +82,14 @@ pnpm switchboard --help
 
 The PROOF umbrella CLI plugin calls command-specific shared runners from this
 package when available, falling back to the packaged `switchboard` binary for
-older installs. Relay inventory sync is exposed as
+older installs. Deploy, launch-demo, validator launch, relay DNS
+apply/remove, relay spec backfill, bootstrap, ops, and the read-only/local
+diagnostic surfaces are exported as Switchboard runners for native
+`proof switchboard ...` oclif commands. Acurast remains an implementation
+detail of those Switchboard runners rather than a separate public PROOF command
+namespace.
+
+Relay inventory sync is exposed as
 `runSwitchboardRelaySync(argv)` and preserves the existing local
 `switchboard relay sync` behavior: read signed discovery, write
 `relays/catalog.json`, create missing local stub specs, and preserve existing
@@ -109,6 +116,11 @@ Local relay catalog state mutation is exposed as
 `switchboard relay catalog set-state <relay-id> <state>` behavior: local
 relay catalog file updates, optional rebuild/signing, and no live relay
 publish, DNS, deploy, chain, or context mutation.
+
+Acurast deploy helper paths use `@acurast/sdk` for fee estimates, IPFS upload,
+and job environment updates. The CLI no longer shells out to `@acurast/cli`;
+third-party update banners or other child-process output should not leak into
+Switchboard command output.
 
 Build output is generated into `dist/`, with packaged validator job bundles
 under `assets/jobs/`. These generated files are ignored by Git; local installs,

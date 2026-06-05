@@ -8,7 +8,7 @@ import {
   normalizeIngressQuote,
   rebindIngressQuoteEndpoint,
   signIngressQuote
-} from "../../switchboard-sdk/src/funding.js";
+} from "@proofcomputer/switchboard-sdk/funding";
 import { INGRESS_REGISTRY_ABI } from "./ingress-contract.js";
 
 const ERC20_ABI = [

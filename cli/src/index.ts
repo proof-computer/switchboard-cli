@@ -31,10 +31,10 @@ import {
   type SwitchboardDeployWorkflowSnapshot,
   type WorkflowActionReceipt,
   type WorkflowRequiredAction
-} from "../../../switchboard-sdk/src/workflows.js";
-import { registerIngressWithRelay } from "../../../switchboard-sdk/src/index.js";
-import type { QuoteResponse } from "../../../switchboard-sdk/src/funding.js";
-import { SwitchboardControlPlaneClient, type DeploymentIntentBootstrap, type DeploymentIntentGroupBootstrap } from "../../../switchboard-sdk/src/control-plane.js";
+} from "@proofcomputer/switchboard-sdk/workflows";
+import { registerIngressWithRelay } from "@proofcomputer/switchboard-sdk";
+import type { QuoteResponse } from "@proofcomputer/switchboard-sdk/funding";
+import { SwitchboardControlPlaneClient, type DeploymentIntentBootstrap, type DeploymentIntentGroupBootstrap } from "@proofcomputer/switchboard-sdk/control-plane";
 import {
   discoverManagerProcessors,
   rpcForAcurastNetwork,
@@ -75,7 +75,7 @@ import { runRelaySync, type RunRelaySyncOptions } from "./relay/sync.js";
 import { runRelayList } from "./relay/list.js";
 import { runRelayCatalogBuild, type RunRelayCatalogBuildOptions } from "./relay/catalog-build-from-specs.js";
 import { runRelayDiff } from "./relay/diff.js";
-import { runRelayBackfillSpecs } from "./relay/backfill-specs.js";
+import { runRelayBackfillSpecs, type RunRelayBackfillSpecsOptions } from "./relay/backfill-specs.js";
 import { runRelayKeygen, type RunRelayKeygenOptions } from "./relay/keygen.js";
 import { runRelayPickProcessor, type RunRelayPickProcessorOptions } from "./relay/pick-processor.js";
 import { runRelayScaffold, type RunRelayScaffoldOptions } from "./relay/scaffold.js";
@@ -85,7 +85,7 @@ import { runRelayVerify } from "./relay/verify.js";
 import { runRelayBudget } from "./relay/budget.js";
 import { runRelayWhoami } from "./relay/whoami.js";
 import { runRelayDnsSubcommand, type RelayDnsSubcommandArgs } from "./relay/dns.js";
-import { runBootstrapSubcommand } from "./bootstrap/acurast.js";
+import { runBootstrapSubcommand, type BootstrapAcurastArgs } from "./bootstrap/acurast.js";
 import {
   runCatalogBuild,
   runCatalogInspect,
@@ -112,7 +112,7 @@ import {
   type GroupedDeployTranscriptWriter,
   type OutputRow
 } from "./output.js";
-import { printOpsUsage, runOpsSubcommand } from "./ops.js";
+import { printOpsUsage, runOpsSubcommand, type OpsSubcommandArgs } from "./ops.js";
 import {
   DEFAULT_SWITCHBOARD_OPS_PROFILE,
   SWITCHBOARD_CONTEXT_SECRET_FILE_ENV,
@@ -5003,6 +5003,22 @@ export async function runSwitchboardValidatorScript(
   await validatorScriptCommand(flags);
 }
 
+export async function runSwitchboardValidatorLaunch(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime
+): Promise<void> {
+  const normalized = argv[0] === "validator" && argv[1] === "launch" ? [...argv] : ["validator", "launch", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "validator-launch") {
+    throw new Error(`runSwitchboardValidatorLaunch expected validator launch args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await validatorLaunchCommand(flags, runtime);
+}
+
 export async function runSwitchboardCatalogInspect(
   argv: readonly string[] = process.argv.slice(2),
   runtimeOverride?: CliRuntime
@@ -5185,6 +5201,32 @@ export async function runSwitchboardRelayDiff(
   await runRelayDiff({ flags: withDiscoveryDefaults(flags), positionals: parsed.positionals });
 }
 
+type RelayBackfillSpecsRunnerOptions = Pick<RunRelayBackfillSpecsOptions, "cwd" | "env" | "io" | "fetchImpl">;
+
+export async function runSwitchboardRelayBackfillSpecs(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  backfillOptions: RelayBackfillSpecsRunnerOptions = {}
+): Promise<void> {
+  const normalized =
+    argv[0] === "relay" && argv[1] === "backfill-specs"
+      ? [...argv]
+      : ["relay", "backfill-specs", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-backfill-specs") {
+    throw new Error(`runSwitchboardRelayBackfillSpecs expected relay backfill-specs args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayBackfillSpecs({
+    flags: withDiscoveryDefaults(flags, backfillOptions.env),
+    positionals: parsed.positionals,
+    ...backfillOptions
+  });
+}
+
 type RelayKeygenRunnerOptions = Pick<RunRelayKeygenOptions, "io" | "createWallet">;
 
 export async function runSwitchboardRelayKeygen(
@@ -5319,6 +5361,23 @@ export async function runSwitchboardRelayDnsPlan(
   await runRelayDnsSubcommand({ flags, positionals: parsed.positionals, ...dnsOptions });
 }
 
+export async function runSwitchboardRelayDnsApply(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  dnsOptions: RelayDnsRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "dns" ? [...argv] : ["relay", "dns", "apply", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-dns" || parsed.positionals[2] !== "apply") {
+    throw new Error(`runSwitchboardRelayDnsApply expected relay dns apply args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayDnsSubcommand({ flags, positionals: parsed.positionals, ...dnsOptions });
+}
+
 export async function runSwitchboardRelayDnsVerify(
   argv: readonly string[] = process.argv.slice(2),
   runtimeOverride?: CliRuntime,
@@ -5328,6 +5387,23 @@ export async function runSwitchboardRelayDnsVerify(
   const parsed = parseArgs(normalized);
   if (parsed.command !== "relay-dns" || parsed.positionals[2] !== "verify") {
     throw new Error(`runSwitchboardRelayDnsVerify expected relay dns verify args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runRelayDnsSubcommand({ flags, positionals: parsed.positionals, ...dnsOptions });
+}
+
+export async function runSwitchboardRelayDnsRemove(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  dnsOptions: RelayDnsRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "relay" && argv[1] === "dns" ? [...argv] : ["relay", "dns", "remove", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "relay-dns" || parsed.positionals[2] !== "remove") {
+    throw new Error(`runSwitchboardRelayDnsRemove expected relay dns remove args, got ${normalized.join(" ")}`);
   }
   const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
   assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
@@ -5366,6 +5442,44 @@ export async function runSwitchboardRelayWhoami(
   assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
   const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
   await runRelayWhoami({ flags, positionals: parsed.positionals });
+}
+
+type BootstrapRunnerOptions = Pick<BootstrapAcurastArgs, "cwd" | "env" | "io" | "fetchImpl" | "now">;
+
+export async function runSwitchboardBootstrap(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  bootstrapOptions: BootstrapRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "bootstrap" ? [...argv] : ["bootstrap", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "bootstrap") {
+    throw new Error(`runSwitchboardBootstrap expected bootstrap args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runBootstrapSubcommand({ flags, positionals: parsed.positionals, ...bootstrapOptions });
+}
+
+type OpsRunnerOptions = Pick<OpsSubcommandArgs, "env" | "io">;
+
+export async function runSwitchboardOps(
+  argv: readonly string[] = process.argv.slice(2),
+  runtimeOverride?: CliRuntime,
+  opsOptions: OpsRunnerOptions = {}
+): Promise<void> {
+  const normalized = argv[0] === "ops" ? [...argv] : ["ops", ...argv];
+  const parsed = parseArgs(normalized);
+  if (parsed.command !== "ops") {
+    throw new Error(`runSwitchboardOps expected ops args, got ${normalized.join(" ")}`);
+  }
+  const runtime = runtimeOverride ?? await loadCliRuntime(parsed.flags, parsed.command);
+  assertNoLegacyPublicRuntimeConfig(parsed.command, runtime);
+  assertNoRemovedPublicCommandFlags(parsed.command, parsed.flags);
+  const flags = applyRuntimeDefaults(parsed.flags, runtime, parsed.command);
+  await runOpsSubcommand({ flags, positionals: parsed.positionals, ...opsOptions });
 }
 
 export async function runSwitchboardGatewaySetup(

@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 import "dotenv/config";
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ApiPromise, HttpProvider, WsProvider } from "@polkadot/api";
 import { Keyring } from "@polkadot/keyring";
 import type { KeyringPair } from "@polkadot/keyring/types";
+import { walletFromMnemonic, setEnvVars } from "@acurast/sdk/chain";
+import { uploadScript } from "@acurast/sdk/ipfs";
+import { getFeeAnalysis } from "@acurast/sdk/matcher";
 import { cryptoWaitReady, decodeAddress, encodeAddress, mnemonicValidate } from "@polkadot/util-crypto";
 import { build } from "esbuild";
 
@@ -24,7 +25,6 @@ interface HarnessConfig {
   stageDir: string;
   projectName: string;
   network: "mainnet" | "canary";
-  acurastCliPackage: string;
   npmCacheDir: string;
   profile: DeploymentProfile;
   mnemonicEnvName: string;
@@ -129,17 +129,13 @@ interface DirectDeploymentResult {
   deploymentId: string;
 }
 
-interface AcurastCliRunOptions {
-  resolveOnOutput?: RegExp;
-  killAfterResolveMs?: number;
-  timeoutMs?: number;
-}
-
 const rootDir = process.env.SWITCHBOARD_WORK_DIR
   ? path.resolve(process.env.SWITCHBOARD_WORK_DIR)
   : path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_MAINNET_RPC = "wss://archive.mainnet.acurast.com";
 const DEFAULT_CANARY_RPC = "wss://canarynet-ws-1.acurast-h-server-2.papers.tech";
+const DEFAULT_ACURAST_IPFS_URL = "https://ipfs-proxy.acurast.prod.gke.papers.tech";
+const DEFAULT_ACURAST_IPFS_API_KEY = "";
 const DIRECT_SCHEDULE_END_ENV = "ACURAST_SCHEDULE_END_MS";
 const USE_EXISTING_STAGE_ENV = "ACURAST_USE_EXISTING_STAGE";
 const REQUIRE_ENCRYPTED_BUNDLE_ENV = "ACURAST_REQUIRE_ENCRYPTED_BUNDLE";
@@ -160,12 +156,8 @@ async function main() {
     await mkdir(config.stageDir, { recursive: true });
     await writeAcurastConfig(config);
     await writeFile(path.join(config.stageDir, ".env"), buildAcurastEnv(config));
-    await auditDeploymentEnvForRuntime(config, deploymentId);
-    await runAcurastCli(config, ["deployments", deploymentId, "--network", config.network, "--update-env-vars"], {
-      resolveOnOutput: /(?:environment variables set|Transaction ID:)/,
-      killAfterResolveMs: 2_000,
-      timeoutMs: numberEnv("ACURAST_SET_ENV_TIMEOUT_MS", 120_000)
-    });
+    const result = await updateAcurastJobEnvWithSdk(config, deploymentId);
+    console.log(result.hash ? `Acurast environment variables set: tx=${result.hash}` : "Acurast environment variables set: no env vars configured");
     return;
   }
   const canUseExistingStage = parsed.command === "deploy-direct" || parsed.command === "upload-script";
@@ -231,19 +223,29 @@ async function main() {
   await validateAcurastAccount(config);
 
   if (parsed.command === "estimate-fee") {
-    await runAcurastCli(config, ["estimate-fee", config.projectName, "--output", jsonOutput(parsed.flags) ? "json" : "text"]);
+    const estimate = estimateAcurastFeeWithSdk(config);
+    writeOutput(parsed.flags, estimate, () => {
+      console.log(`Acurast estimate: ${estimate.estimatedFee} ${estimate.currency}`);
+      console.log(`Project: ${estimate.projectName}`);
+      console.log(`Replicas: ${estimate.replicas}`);
+      console.log(`Executions: ${estimate.executions}`);
+    });
     return;
   }
 
   if (parsed.command === "deploy-dry-run") {
-    await runAcurastCli(config, [
-      "deploy",
-      config.projectName,
-      "--dry-run",
-      "--non-interactive",
-      "--output",
-      jsonOutput(parsed.flags) ? "json" : "text"
-    ]);
+    const dryRun = buildAcurastDirectDryRun(config);
+    writeOutput(parsed.flags, dryRun, () => {
+      console.log("Acurast deploy dry run");
+      console.log(`Project: ${dryRun.projectName}`);
+      console.log(`Network: ${dryRun.network}`);
+      console.log(`Script: ${dryRun.registration.script}`);
+      console.log(
+        `Schedule: start=${new Date(dryRun.registration.schedule.startTime).toISOString()} end=${new Date(
+          dryRun.registration.schedule.endTime
+        ).toISOString()}`
+      );
+    });
     return;
   }
 
@@ -258,7 +260,7 @@ async function main() {
 
   if (parsed.command === "status") {
     const deploymentId = stringFlag(parsed.flags, "deployment-id") ?? process.env.ACURAST_DEPLOYMENT_ID ?? await latestDeploymentId(config);
-    await runAcurastCli(config, ["deployments", deploymentId, "--network", config.network]);
+    await inspectDeploymentCommand(config, parsed.flags, deploymentId);
     return;
   }
 
@@ -273,14 +275,7 @@ async function main() {
   }
 
   auditProjectEnvForRuntime();
-  await runAcurastCli(config, [
-    "deploy",
-    config.projectName,
-    "--non-interactive",
-    "--exit-early",
-    "--output",
-    jsonOutput(parsed.flags) ? "json" : "text"
-  ]);
+  await deployDirect(config, parsed.flags);
 }
 
 async function loadHarnessConfig(flags: Map<string, string | boolean>): Promise<HarnessConfig> {
@@ -299,7 +294,6 @@ async function loadHarnessConfig(flags: Map<string, string | boolean>): Promise<
     stageDir,
     network,
     projectName: stringFlag(flags, "project") ?? process.env.ACURAST_PROJECT_NAME ?? "switchboard-express",
-    acurastCliPackage: process.env.ACURAST_CLI_PACKAGE ?? "@acurast/cli@0.8.1",
     npmCacheDir: process.env.NPM_CONFIG_CACHE ?? process.env.npm_config_cache ?? "/tmp/codex-npm-cache",
     profile: deploymentProfile(flags),
     ...credentials
@@ -642,6 +636,44 @@ function buildAcurastConfig(config: HarnessConfig) {
   };
 }
 
+function estimateAcurastFeeWithSdk(config: HarnessConfig): Record<string, unknown> {
+  const project = (buildAcurastConfig(config).projects as any)[config.projectName];
+  const analysis = getFeeAnalysis(project);
+  const estimatedFee = analysis.maxTotalCostCACU.toString();
+  return {
+    ok: true,
+    mode: "acurast-sdk",
+    projectName: config.projectName,
+    network: config.network,
+    estimatedFee,
+    fee: estimatedFee,
+    cost: estimatedFee,
+    currency: "cACU",
+    executions: analysis.numberOfExecutions.toString(),
+    replicas: analysis.numberOfReplicas.toString(),
+    totalRuns: analysis.totalRuns.toString(),
+    maxCostPerExecution: analysis.maxCostPerExecution.toString(),
+    maxCostPerExecutionCACU: analysis.maxCostPerExecutionCACU.toString(),
+    maxTotalCostCACU: analysis.maxTotalCostCACU.toString(),
+    suggestedCostPerExecution: analysis.suggestedCostPerExecution.toString()
+  };
+}
+
+function buildAcurastDirectDryRun(config: HarnessConfig): Record<string, any> {
+  const scriptIpfs = process.env.ACURAST_SCRIPT_IPFS?.startsWith("ipfs://")
+    ? process.env.ACURAST_SCRIPT_IPFS
+    : "ipfs://dry-run-script";
+  const registration = buildDirectJobRegistration(config, scriptIpfs, Date.now());
+  return {
+    ok: true,
+    mode: "acurast-sdk-dry-run",
+    projectName: config.projectName,
+    network: config.network,
+    registration,
+    envKeys: projectEnvKeys()
+  };
+}
+
 async function deployDirect(config: HarnessConfig, flags: Map<string, string | boolean>): Promise<void> {
   const scriptIpfs = await resolveDirectScriptIpfs(config, flags);
   const rpcUrl = rpcForNetwork(config.network);
@@ -682,12 +714,8 @@ async function deployDirect(config: HarnessConfig, flags: Map<string, string | b
       );
     }
     if (!boolFlag(flags, "skip-env") && projectEnvKeys().length > 0) {
-      await auditDeploymentEnvForRuntime(config, result.deploymentId);
-      await runAcurastCli(config, ["deployments", result.deploymentId, "--network", config.network, "--update-env-vars"], {
-        resolveOnOutput: /(?:environment variables set|Transaction ID:)/,
-        killAfterResolveMs: 2_000,
-        timeoutMs: numberEnv("ACURAST_SET_ENV_TIMEOUT_MS", 120_000)
-      });
+      const envResult = await updateAcurastJobEnvWithSdk(config, result.deploymentId);
+      console.log(envResult.hash ? `Direct deploy env tx: ${envResult.hash}` : "Direct deploy env: no env vars configured");
     }
   } finally {
     await api.disconnect();
@@ -707,30 +735,17 @@ async function resolveDirectScriptIpfs(config: HarnessConfig, flags: Map<string,
     await assertStagedBundleIsEncryptedLoader(path.join(config.stageDir, "dist/bundle.cjs"));
   }
 
-  const output = await runAcurastCli(config, [
-    "deploy",
-    config.projectName,
-    "--only-upload",
-    "--non-interactive",
-    "--output",
-    jsonOutput(flags) ? "json" : "text"
-  ], {
-    resolveOnOutput: /ipfs:\/\/[A-Za-z0-9]+/,
-    killAfterResolveMs: 2_000,
-    timeoutMs: numberEnv("ACURAST_UPLOAD_TIMEOUT_MS", 120_000)
-  });
-
-  const outputScript = output.match(/ipfs:\/\/[A-Za-z0-9]+/)?.[0];
-  if (outputScript) {
-    return outputScript;
+  const script = await uploadScript(
+    { file: path.join(config.stageDir, "dist/bundle.cjs") },
+    {
+      endpoint: process.env.ACURAST_IPFS_URL ?? DEFAULT_ACURAST_IPFS_URL,
+      apiKey: process.env.ACURAST_IPFS_API_KEY ?? DEFAULT_ACURAST_IPFS_API_KEY
+    }
+  );
+  if (!script.startsWith("ipfs://")) {
+    throw new Error(`Acurast SDK upload returned an invalid script URI: ${script}`);
   }
-
-  const stagedScript = await latestStagedScriptIpfs(config);
-  if (!stagedScript) {
-    throw new Error("Acurast upload completed but no staged ipfs:// script was found");
-  }
-
-  return stagedScript;
+  return script;
 }
 
 async function latestStagedScriptIpfs(config: HarnessConfig): Promise<string | undefined> {
@@ -1233,21 +1248,11 @@ function auditProjectEnvForRuntime(): void {
 }
 
 async function readDeploymentEnvKeys(config: HarnessConfig, deploymentId: string): Promise<string[]> {
-  const deployDir = path.join(config.stageDir, ".acurast/deploy");
-  let files: string[];
-  try {
-    files = await readdir(deployDir);
-  } catch {
+  const record = await readDeploymentRecord(config, deploymentId);
+  if (!record) {
     return [];
   }
-  const filename = files.find((file) => file.endsWith(`-${deploymentId}.json`));
-  if (!filename) {
-    return [];
-  }
-  const parsed = JSON.parse(await readFile(path.join(deployDir, filename), "utf8")) as {
-    config?: { includeEnvironmentVariables?: unknown };
-  };
-  const keys = parsed.config?.includeEnvironmentVariables;
+  const keys = record.config?.includeEnvironmentVariables;
   return Array.isArray(keys) ? keys.filter((k): k is string => typeof k === "string") : [];
 }
 
@@ -1257,6 +1262,87 @@ async function auditDeploymentEnvForRuntime(config: HarnessConfig, deploymentId:
     return;
   }
   auditAcurastEnvSubmission(keys, `deployment file for ${deploymentId}`);
+}
+
+interface StoredDirectDeployment {
+  deploymentId?: unknown;
+  registration?: DirectJobRegistration;
+  config?: {
+    includeEnvironmentVariables?: unknown;
+  };
+}
+
+async function readDeploymentRecord(config: HarnessConfig, deploymentId: string): Promise<StoredDirectDeployment | undefined> {
+  const deployDir = path.join(config.stageDir, ".acurast/deploy");
+  let files: string[];
+  try {
+    files = await readdir(deployDir);
+  } catch {
+    return undefined;
+  }
+  const filename = files.find((file) => file.endsWith(`-${deploymentId}.json`));
+  if (!filename) {
+    return undefined;
+  }
+  return JSON.parse(await readFile(path.join(deployDir, filename), "utf8")) as StoredDirectDeployment;
+}
+
+async function updateAcurastJobEnvWithSdk(config: HarnessConfig, deploymentId: string): Promise<{ hash?: string }> {
+  await auditDeploymentEnvForRuntime(config, deploymentId);
+  const keys = await readDeploymentEnvKeys(config, deploymentId);
+  if (keys.length === 0) {
+    return {};
+  }
+  if (!config.mnemonic) {
+    throw new Error("Cannot update Acurast env vars without an Acurast mnemonic");
+  }
+  const record = await readDeploymentRecord(config, deploymentId);
+  const jobId = await deploymentJobIdForSdk(config, deploymentId, record);
+  const wallet = await walletFromMnemonic(config.mnemonic, { name: "switchboard-cli" });
+  return setEnvVars({
+    id: jobId,
+    envVars: keys.map((key) => ({ key, value: projectEnvValue(key) }))
+  } as any, {
+    wallet,
+    rpcEndpoint: rpcForNetwork(config.network)
+  });
+}
+
+async function deploymentJobIdForSdk(
+  config: HarnessConfig,
+  deploymentId: string,
+  record: StoredDirectDeployment | undefined
+): Promise<[{ acurast: string }, number]> {
+  const stored = record?.deploymentId;
+  if (Array.isArray(stored) && stored.length >= 2) {
+    const origin = stored[0] as Record<string, unknown>;
+    const acurast = typeof origin?.acurast === "string" ? origin.acurast : undefined;
+    const sequence = Number(stored[1]);
+    if (acurast && Number.isSafeInteger(sequence)) {
+      return [{ acurast }, sequence];
+    }
+  }
+  const sequence = Number(deploymentId);
+  if (!Number.isSafeInteger(sequence)) {
+    throw new Error(`deployment-id must be a safe numeric Acurast job sequence for SDK env update: ${deploymentId}`);
+  }
+  const origin = process.env.ACURAST_DEPLOYMENT_ORIGIN ?? config.expectedAddress ?? await deriveAcurastAddress(config);
+  return [{ acurast: origin }, sequence];
+}
+
+function projectEnvValue(key: string): string {
+  switch (key) {
+    case "PORT":
+      return process.env.PORT ?? "3000";
+    case "SWITCHBOARD_HOST":
+      return process.env.SWITCHBOARD_HOST ?? "0.0.0.0";
+    case "SWITCHBOARD_AUTO_REGISTER":
+      return process.env.SWITCHBOARD_AUTO_REGISTER ?? "false";
+    case "SESSION_ID":
+      return process.env.SESSION_ID ?? "acurast-harness-session";
+    default:
+      return process.env[key] ?? "";
+  }
 }
 
 function prebuiltJobBundlePath(): string | undefined {
@@ -1273,7 +1359,7 @@ function isTopLevelAwaitBuildError(error: unknown): boolean {
 
 async function validateAcurastAccount(config: HarnessConfig): Promise<void> {
   if (!config.mnemonic || !mnemonicValidate(config.mnemonic)) {
-    throw new Error("ACURAST_SEED must be a valid mnemonic phrase for @acurast/cli");
+    throw new Error("ACURAST_SEED must be a valid mnemonic phrase");
   }
   if (!config.expectedAddress) {
     return;
@@ -1669,158 +1755,6 @@ function providerForRpc(rpcUrl: string): WsProvider | HttpProvider {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function runAcurastCli(config: HarnessConfig, args: string[], options: AcurastCliRunOptions = {}): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let matchedOutput = false;
-    let timedOut = false;
-    let terminating = false;
-    let killTimer: NodeJS.Timeout | undefined;
-    let forceKillTimer: NodeJS.Timeout | undefined;
-    let abandonTimer: NodeJS.Timeout | undefined;
-    let timeoutTimer: NodeJS.Timeout | undefined;
-    let output = "";
-
-    const finish = (error?: Error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      if (killTimer) {
-        clearTimeout(killTimer);
-      }
-      if (forceKillTimer) {
-        clearTimeout(forceKillTimer);
-      }
-      if (abandonTimer) {
-        clearTimeout(abandonTimer);
-      }
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-      }
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(output);
-    };
-
-    const npx = resolveNpxCommand();
-    const child = spawn(npx.command, [...npx.args, "-y", config.acurastCliPackage, ...args], {
-      cwd: config.stageDir,
-      stdio: ["inherit", "pipe", "pipe"],
-      detached: process.platform !== "win32",
-      env: {
-        ...sanitizeChildEnv(process.env),
-        ...(config.mnemonic ? { ACURAST_MNEMONIC: config.mnemonic } : {}),
-        npm_config_cache: config.npmCacheDir,
-        NPM_CONFIG_CACHE: config.npmCacheDir
-      }
-    });
-
-    const signalChildTree = (signal: NodeJS.Signals) => {
-      if (!child.pid) {
-        return;
-      }
-      try {
-        if (process.platform === "win32") {
-          child.kill(signal);
-        } else {
-          process.kill(-child.pid, signal);
-        }
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "ESRCH") {
-          throw error;
-        }
-      }
-    };
-
-    const terminateChildTree = (reason: "matched_output" | "timeout") => {
-      if (terminating || settled) {
-        return;
-      }
-      terminating = true;
-      const forceKillAfterMs = numberEnv("ACURAST_CLI_TERMINATE_GRACE_MS", 5_000);
-      try {
-        signalChildTree("SIGTERM");
-      } catch (error) {
-        finish(error instanceof Error ? error : new Error(String(error)));
-        return;
-      }
-      forceKillTimer = setTimeout(() => {
-        try {
-          signalChildTree("SIGKILL");
-        } catch (error) {
-          finish(error instanceof Error ? error : new Error(String(error)));
-        }
-      }, forceKillAfterMs);
-      abandonTimer = setTimeout(() => {
-        if (reason === "timeout") {
-          finish(new Error(`Acurast CLI timed out after ${options.timeoutMs}ms: ${args.join(" ")}`));
-          return;
-        }
-        finish();
-      }, forceKillAfterMs + 1_000);
-    };
-
-    const handleOutput = (stream: NodeJS.WriteStream, chunk: Buffer) => {
-      stream.write(chunk);
-      output += chunk.toString("utf8");
-      if (!options.resolveOnOutput || matchedOutput || !options.resolveOnOutput.test(output)) {
-        return;
-      }
-
-      matchedOutput = true;
-      killTimer = setTimeout(() => {
-        terminateChildTree("matched_output");
-      }, options.killAfterResolveMs ?? 0);
-    };
-
-    child.stdout?.on("data", (chunk: Buffer) => handleOutput(process.stdout, chunk));
-    child.stderr?.on("data", (chunk: Buffer) => handleOutput(process.stderr, chunk));
-
-    if (options.timeoutMs) {
-      timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        terminateChildTree("timeout");
-      }, options.timeoutMs);
-    }
-
-    child.once("error", (error) => finish(error));
-    child.once("close", (code, signal) => {
-      if (timedOut && !matchedOutput) {
-        finish(new Error(`Acurast CLI timed out after ${options.timeoutMs}ms: ${args.join(" ")}`));
-        return;
-      }
-      if (code === 0) {
-        finish();
-        return;
-      }
-      if (matchedOutput) {
-        finish();
-        return;
-      }
-      finish(new Error(`Acurast CLI exited with code ${code ?? "unknown"}${signal ? ` signal ${signal}` : ""}`));
-    });
-  });
-}
-
-function resolveNpxCommand(): { command: string; args: string[] } {
-  if (process.env.NPX_BINARY) {
-    return { command: process.env.NPX_BINARY, args: [] };
-  }
-
-  const nodeBinDir = path.dirname(process.execPath);
-  for (const candidate of [path.join(nodeBinDir, "npx"), path.join(nodeBinDir, "npx.cmd")]) {
-    if (existsSync(candidate)) {
-      return { command: candidate, args: [] };
-    }
-  }
-
-  return { command: "npx", args: [] };
 }
 
 function sanitizeChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

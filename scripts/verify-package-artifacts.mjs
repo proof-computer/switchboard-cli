@@ -21,9 +21,12 @@ const requiredBundleMarkers = [
     markers: [
       "must declare signer or digest",
       "digest mismatch",
-      "Quote expectedJobSigner",
       "Active operator profiles require at least one report signer"
     ]
+  },
+  {
+    artifact: "dist/internal/hub-fund-native-asset-quote.js",
+    markers: ["Quote expectedJobSigner"]
   },
   {
     artifact: "dist/internal/route-validator.js",

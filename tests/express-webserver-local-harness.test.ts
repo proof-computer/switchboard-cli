@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -80,72 +80,40 @@ describe("express-webserver local Acurast harness", () => {
     }
   });
 
-  it("terminates hung Acurast CLI child trees after success output", async () => {
-    const workDir = await mkdtemp(path.join(tmpdir(), "switchboard-acurast-runner-"));
+  it("estimates fees through the Acurast SDK without invoking an Acurast CLI child", async () => {
+    const workDir = await mkdtemp(path.join(tmpdir(), "switchboard-acurast-sdk-estimate-"));
     const stageDir = path.join(workDir, "stage");
-    const bundlePath = path.join(workDir, "bundle.cjs");
-    const fakeNpx = path.join(workDir, "fake-npx.cjs");
-    const grandchildPidPath = path.join(workDir, "grandchild.pid");
-    let run: SpawnedProcess | undefined;
 
     try {
-      await writeFile(bundlePath, "console.log('prebuilt bundle');\n");
-      await writeFile(
-        fakeNpx,
-        `#!/usr/bin/env node
-const { spawn } = require("node:child_process");
-const { writeFileSync } = require("node:fs");
-const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{}); setInterval(()=>{}, 1000);"], {
-  stdio: "ignore"
-});
-if (process.env.FAKE_NPX_GRANDCHILD_PID) {
-  writeFileSync(process.env.FAKE_NPX_GRANDCHILD_PID, String(grandchild.pid));
-}
-process.on("SIGTERM", () => {});
-console.log("environment variables set");
-setInterval(() => {}, 1000);
-`.trimStart()
-      );
-      await chmod(fakeNpx, 0o755);
+      await mkdir(path.join(workDir, "src"), { recursive: true });
+      await writeFile(path.join(workDir, "src", "server.ts"), "console.log('sdk estimate test');\n");
 
-      run = spawnNode([
+      const run = spawnNode([
         "--import",
         "tsx",
         path.join(repoRoot, "scripts/acurast/express-harness.ts"),
-        "update-env",
-        "--deployment-id",
-        "123",
+        "estimate-fee",
+        "--json",
         "--stage-dir",
         stageDir
       ], {
+        ACURAST_ENTRYPOINT: "src/server.ts",
         ACURAST_CANARY_SEED: "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
-        ACURAST_CLI_PACKAGE: "fake-acurast-cli",
-        ACURAST_CLI_TERMINATE_GRACE_MS: "100",
-        FAKE_NPX_GRANDCHILD_PID: grandchildPidPath,
-        NPX_BINARY: fakeNpx,
-        SWITCHBOARD_PREBUILT_JOB_BUNDLE: bundlePath,
-        SWITCHBOARD_WORK_DIR: repoRoot,
-        ACURAST_EXPLICIT_ENV_ONLY: "true",
-        ACURAST_INCLUDE_ENV: "VALIDATOR_DEPLOYMENT_ID,VALIDATOR_ACURAST_JOB_ID",
-        VALIDATOR_DEPLOYMENT_ID: "123",
-        VALIDATOR_ACURAST_JOB_ID: "job-123"
+        ACURAST_INSTANT_MATCH_PROCESSORS: "5CC2LCutqJNFpc9oJaz1Lq8eUHnExFHz7MwuzWYyCApVQwmDm",
+        NPX_BINARY: path.join(workDir, "must-not-be-called"),
+        SWITCHBOARD_WORK_DIR: workDir
       });
-      const currentRun = run;
-      const exit = await waitForExit(currentRun, 12_000);
+      const exit = await run.exit;
 
-      assert.ok(exit, childOutput(currentRun));
-      assert.equal(exit.code, 0, childOutput(currentRun));
-      assert.match(childOutput(currentRun), /environment variables set/);
-      const stagedEnv = await readFile(path.join(stageDir, ".env"), "utf8");
-      assert.match(stagedEnv, /^VALIDATOR_DEPLOYMENT_ID="123"$/m);
-      assert.match(stagedEnv, /^VALIDATOR_ACURAST_JOB_ID="job-123"$/m);
-
-      const grandchildPid = Number((await readFile(grandchildPidPath, "utf8")).trim());
-      await waitFor(async () => !processAlive(grandchildPid), 3_000, () => childOutput(currentRun));
+      assert.equal(exit.code, 0, childOutput(run));
+      const output = JSON.parse(run.output.stdout) as Record<string, unknown>;
+      assert.equal(output.mode, "acurast-sdk");
+      assert.equal(output.projectName, "switchboard-express");
+      assert.equal(output.network, "canary");
+      assert.equal(output.currency, "cACU");
+      assert.equal(typeof output.estimatedFee, "string");
+      assert.doesNotMatch(childOutput(run), /Acurast CLI|new version|@acurast\/cli/i);
     } finally {
-      if (run) {
-        run.process.kill("SIGKILL");
-      }
       await rm(workDir, { recursive: true, force: true });
     }
   });
@@ -324,27 +292,6 @@ function baseChildEnv(): NodeJS.ProcessEnv {
   };
 }
 
-async function waitForExit(
-  child: SpawnedProcess,
-  timeoutMs: number
-): Promise<{ code: number | null; signal: NodeJS.Signals | null } | undefined> {
-  return Promise.race([
-    child.exit,
-    sleep(timeoutMs).then(() => undefined)
-  ]);
-}
-
-async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs: number, debug: () => string): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt <= timeoutMs) {
-    if (await condition()) {
-      return;
-    }
-    await sleep(25);
-  }
-  assert.fail(`Timed out waiting for local express job harness\n${debug()}`);
-}
-
 function childOutput(child: SpawnedProcess): string {
   return [
     "--- stdout ---",
@@ -352,15 +299,6 @@ function childOutput(child: SpawnedProcess): string {
     "--- stderr ---",
     child.output.stderr.trim()
   ].join("\n");
-}
-
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function readJsonBody(request: IncomingMessage): Promise<unknown> {
@@ -385,9 +323,6 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 interface SpawnedProcess {
   process: ChildProcess;
