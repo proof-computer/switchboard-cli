@@ -479,20 +479,43 @@ export async function requestCertificateWithRelay(
   try {
     request = await buildIngressCertificateRequestWithContext(config, timeoutContext);
     await config.onProgress?.({ stage: "relay_request", hostname: request.certificateRequest.hostname });
-    response = await runSwitchboardCertificateStage(timeoutContext, "relay_request", request.certificateRequest.hostname, (signal) =>
-      fetchImpl(new URL("/v1/certificates", relayUrl), {
-        method: "POST",
-        headers: {
-          "content-type": "application/json"
-        },
-        signal,
-        body: JSON.stringify({
-          certificateRequest: request.certificateRequest,
-          csrPem: request.csrPem,
-          signature: request.signature
+    try {
+      response = await runSwitchboardCertificateStage(timeoutContext, "relay_request", request.certificateRequest.hostname, (signal) =>
+        fetchImpl(new URL("/v1/certificates", relayUrl), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json"
+          },
+          signal,
+          body: JSON.stringify({
+            certificateRequest: request.certificateRequest,
+            csrPem: request.csrPem,
+            signature: request.signature
+          })
         })
-      })
-    );
+      );
+    } catch (error) {
+      if (error instanceof SwitchboardCertificateError) {
+        throw error;
+      }
+      const hostname = request.certificateRequest.hostname;
+      throw new SwitchboardCertificateError(
+        `Relay certificate request failed for ${hostname}: ${certificateFetchErrorMessage(error)}`,
+        {
+          stage: "relay_request",
+          hostname,
+          relayResponse: {
+            error: "runtime_fetch_aborted",
+            classification: "runtime_fetch_aborted"
+          },
+          details: {
+            classification: "runtime_fetch_aborted",
+            error: certificateFetchErrorDetails(error)
+          },
+          cause: error
+        }
+      );
+    }
   } finally {
     clearSwitchboardCertificateTimeoutContext(timeoutContext);
   }
@@ -645,6 +668,22 @@ function certificateFailureStageForRelayResponse(
     return "hostname_config";
   }
   return "relay_response";
+}
+
+function certificateFetchErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function certificateFetchErrorDetails(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message
+    };
+  }
+  return {
+    message: String(error)
+  };
 }
 
 async function responseJsonOrText(response: globalThis.Response): Promise<unknown> {
