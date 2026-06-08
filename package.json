@@ -17,7 +17,6 @@
     "assets",
     "dist/index.js",
     "dist/internal",
-    "install.sh",
     "README.md"
   ],
   "scripts": {

@@ -49,24 +49,13 @@ demo renderer.
 
 ## Install Details
 
-This legacy installer path is retained only for already-published standalone
-release assets and migration diagnostics. New installs should use
-`@proof-computer/proof-cli` plus `@proof-computer/proof-cli-switchboard`.
+There is no supported standalone `switchboard-cli` install path. New installs
+must use `@proof-computer/proof-cli` plus
+`@proof-computer/proof-cli-switchboard`.
 
-The installer downloads the `switchboard-cli.tgz` package from GitHub Releases,
-installs it into `~/.local/share/switchboard`, and writes a `switchboard`
-launcher into `~/.local/bin`. If the host does not already have Node 22 or
-newer, it installs a private Node runtime under
-`~/.local/share/switchboard/node` rather than changing system packages.
-
-Rerun the same command to upgrade an existing install. Each run downloads a
-fresh release package, replaces the installed `switchboard-cli` package under
-the install home, and rewrites the launcher.
-
-Pin a release with `SWITCHBOARD_CLI_VERSION=v0.1.7`, or override the package
-URL directly with `SWITCHBOARD_CLI_PACKAGE_URL`. The control-plane installer
-mirror at `https://control.switchboard.proof.computer/install.sh` serves the
-same installer after rollout.
+The historical `install.sh` release asset and control-plane installer mirror
+are retired. This package no longer ships `install.sh`, and relays no longer
+serve `/install.sh` or `/v1/install.sh`.
 
 The core CLI install does not install native Ledger HID packages. Polkadot
 Ledger signing lives under `src/ledger/` and is intended to move to a separate
@@ -138,12 +127,11 @@ directories such as `dist/acurast/` are ignored and must not be packaged.
 
 ## Package Shape
 
-The package includes the compiled CLI, internal runner bundles, generated
-validator job bundles, and gateway setup assets used by
-`switchboard gateway setup`. GitHub Release installs consume the generated
-package tarball. The package `prepare` script builds and verifies the
-generated artifacts, and
-`npm pack --dry-run --json` is the release-surface check.
+The package includes the compiled migration-handoff bin, internal runner
+bundles, generated validator job bundles, and gateway setup assets used by
+`proof switchboard gateway setup`. The package `prepare` script builds and
+verifies the generated artifacts, and `npm pack --dry-run --json` is the
+release-surface check.
 
 ## Trust Model
 
@@ -195,9 +183,9 @@ flags change the trust root for that command.
 This repository should not contain live credentials. Context files store env
 var names for secrets, not secret values, and local secrets live outside the
 repo under `~/.switchboard/`. Generated package artifacts are limited to the
-public CLI bundles and public job bundles. Local Acurast stage output, `.env`
-files, `.acurast/` directories, deploy receipts, and runtime keys must stay out
-of Git and out of npm package contents.
+legacy shared-runner bundles and public job bundles. Local Acurast stage
+output, `.env` files, `.acurast/` directories, deploy receipts, and runtime
+keys must stay out of Git and out of npm package contents.
 
 ## Export Note
 
